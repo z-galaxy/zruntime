@@ -36,7 +36,19 @@ windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
 uds_windows = "1.2.1"
 
 [dev-dependencies]
+criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }
 event-listener = "5.4.2"
 futures-lite = "2.6.1"
 ntest = "0.9.5"
 socket2 = { version = "0.6.5", features = ["all"] }
+
+[profile.bench]
+debug = true
+strip = "none"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "runtime"
+harness = false

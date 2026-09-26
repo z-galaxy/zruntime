@@ -50,6 +50,12 @@ cargo check --target aarch64-linux-android
 cargo doc --all-features
 ```
 
+### Benchmarks
+```bash
+# Run benchmarks
+cargo bench
+```
+
 ## Architecture Overview
 
 ```
