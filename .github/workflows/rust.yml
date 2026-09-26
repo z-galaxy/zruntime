@@ -1,0 +1,134 @@
+name: Lint, Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  MSRV:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      MSRV: 1.87.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: x86_64-pc-windows-gnu, x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, aarch64-linux-android
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check build with MSRV
+        run: |
+          cargo --locked check
+          cargo --locked check --target x86_64-pc-windows-gnu
+          cargo --locked check --target x86_64-apple-darwin
+          cargo --locked check --target x86_64-unknown-freebsd
+          cargo --locked check --target x86_64-unknown-netbsd
+          cargo --locked check --target aarch64-linux-android
+          cargo --locked check --no-default-features
+          cargo --locked check --no-default-features --target x86_64-pc-windows-gnu
+          cargo --locked check --no-default-features --target x86_64-apple-darwin
+          cargo --locked check --no-default-features --target x86_64-unknown-freebsd
+          cargo --locked check --no-default-features --target x86_64-unknown-netbsd
+          cargo --locked check --no-default-features --target aarch64-linux-android
+
+  fmt:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+      RUST_LOG: trace
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # We use some nightly fmt options.
+          toolchain: nightly
+          components: rustfmt
+          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, x86_64-pc-windows-gnu, aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: |
+          cargo --locked fmt -- --check
+          cargo --locked check --target x86_64-apple-darwin
+          cargo --locked check --target x86_64-unknown-freebsd
+          cargo --locked check --target x86_64-unknown-netbsd
+          cargo --locked check --target x86_64-pc-windows-gnu
+          cargo --locked check --target aarch64-linux-android
+
+  clippy:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+      RUST_LOG: trace
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, x86_64-pc-windows-gnu, aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Catch common mistakes and unwrap calls
+        run: |
+          cargo --locked clippy --all-targets
+          cargo --locked clippy --all-targets --target x86_64-apple-darwin
+          cargo --locked clippy --all-targets --target x86_64-unknown-freebsd
+          cargo --locked clippy --all-targets --target x86_64-unknown-netbsd
+          cargo --locked clippy --all-targets --target x86_64-pc-windows-gnu
+          cargo --locked clippy --all-targets --target aarch64-linux-android
+          cargo --locked clippy --all-targets --no-default-features
+          cargo --locked clippy --all-targets --no-default-features --target x86_64-apple-darwin
+          cargo --locked clippy --all-targets --no-default-features \
+            --target x86_64-unknown-freebsd
+          cargo --locked clippy --all-targets --no-default-features \
+            --target x86_64-unknown-netbsd
+          cargo --locked clippy --all-targets --no-default-features \
+            --target x86_64-pc-windows-gnu
+          cargo --locked clippy --all-targets --no-default-features \
+            --target aarch64-linux-android
+
+  test:
+    runs-on: ${{ matrix.os }}
+    needs: [fmt, clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+      RUST_LOG: trace
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Test with default features
+        run: cargo --locked test
+      - name: Test without default features
+        run: cargo --locked test --no-default-features
+
+  doc_build:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check documentation build
+        run: cargo --locked doc --all-features
+      - name: Check documentation build without default features
+        run: cargo --locked doc --no-default-features
+
+  # No semver-checks job yet: zruntime has no release on crates.io yet to compare against.
