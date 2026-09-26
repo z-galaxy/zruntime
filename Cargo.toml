@@ -39,6 +39,7 @@ uds_windows = "1.2.1"
 criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }
 event-listener = "5.4.2"
 futures-lite = "2.6.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 ntest = "0.9.5"
 socket2 = { version = "0.6.5", features = ["all"] }
 
@@ -51,4 +52,8 @@ bench = false
 
 [[bench]]
 name = "runtime"
+harness = false
+
+[[bench]]
+name = "connection"
 harness = false

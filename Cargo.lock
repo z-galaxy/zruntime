@@ -1034,6 +1034,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "event-listener",
  "futures-lite",
+ "futures-util",
  "ntest",
  "rustix",
  "socket2",
