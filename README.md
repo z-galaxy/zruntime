@@ -3,6 +3,7 @@
 [![CI Pipeline Status](https://github.com/z-galaxy/zruntime/actions/workflows/rust.yml/badge.svg)](https://github.com/z-galaxy/zruntime/actions/workflows/rust.yml)
 [![](https://docs.rs/zruntime/badge.svg)](https://docs.rs/zruntime/)
 [![](https://img.shields.io/crates/v/zruntime)](https://crates.io/crates/zruntime)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/zruntime?utm_source=badge)
 
 A simple, single-threaded Rust async runtime: a scheduler that holds tasks and hands them out to
 be polled, a `poll(2)`/`select` reactor that watches registered I/O sources and keeps timers, and

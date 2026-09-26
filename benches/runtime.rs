@@ -125,12 +125,17 @@ mod unix {
     /// bench routine trade turns with the reactor rather than one of them running to completion
     /// in a single syscall.
     const CHUNK: usize = 64 * 1024;
+    /// How many socket pairs `io/register-and-drop` makes ahead of each batch of iterations.
+    const REGISTER_BATCH: u64 = 64;
 
     pub(super) fn io_benches(c: &mut Criterion) {
         let runtime = runtime_handle();
         let mut group = c.benchmark_group("io");
         // A fresh pair for every iteration, made outside the timed routine, so that only
         // putting both ends under the reactor's watch and taking them off it again is timed.
+        // Every pair of a batch is made up front and held open until the batch is done, so the
+        // batch is kept to a fixed size: `SmallInput` scales it with the iteration count, and
+        // at tens of thousands of pairs it runs past a default limit of 1024 open descriptors.
         group.bench_function("register-and-drop", |b| {
             let runtime = &runtime;
             b.to_async(ZruntimeExecutor).iter_batched(
@@ -139,7 +144,7 @@ mod unix {
                     let registrations = (register(runtime, &local), register(runtime, &far));
                     drop(black_box(registrations));
                 },
-                BatchSize::SmallInput,
+                BatchSize::NumIterations(REGISTER_BATCH),
             );
         });
         {
