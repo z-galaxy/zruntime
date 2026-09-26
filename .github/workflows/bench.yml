@@ -16,6 +16,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+  # Lets the CodSpeed action authenticate the upload with GitHub's OIDC token instead of a secret.
+  id-token: write
+
 jobs:
   benchmarks:
     name: Run benchmarks
@@ -41,4 +46,3 @@ jobs:
         with:
           mode: walltime
           run: cargo codspeed run -m walltime
-          token: ${{ secrets.CODSPEED_TOKEN }} # optional for public repos
