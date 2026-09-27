@@ -1189,6 +1189,98 @@ fn a_core_block_on_inside_a_helper_block_on_panics_with_or_without_the_seat() {
     assert_eq!(LocalRuntime::new().unwrap().block_on(async { 7 }), 7);
 }
 
+/// A spawn on a runtime whose `block_on` a nested `block_on` keeps from its loop is run.
+///
+/// The outer call finds the helper in the seat, so it puts itself down as waiting and polls its
+/// future without the seat, which is what lets the free `block_on` be called inside it. The helper
+/// would give the seat up to that outer call and park, and the outer call cannot take the seat up
+/// until the nested one returns; a spawn on the outer call's runtime from inside the nested one
+/// would then take the parked helper for one about to be roused, and wait for ever. The nested
+/// call takes the outer one off the list instead, and the helper keeps the seat.
+#[test]
+#[timeout(15000)]
+fn a_block_on_nested_in_a_waiting_block_on_leaves_its_runtime_to_the_helper() {
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let answer = runtime.block_on(async {
+        crate::block_on(async {
+            // Looked at before the spawn, so that a helper that parks for the outer call has
+            // parked by the time of it, and that spawn is the one that finds it so.
+            assert!(the_helper_parked_or_nobody_waiting(&runtime));
+            runtime.spawn("an answer", async { 7 }).await.unwrap()
+        })
+    });
+
+    assert_eq!(answer, 7);
+}
+
+/// The same, with the nested call made on another runtime from `SharedRuntime::current`, whose
+/// seat it takes.
+#[test]
+#[timeout(15000)]
+fn a_block_on_on_another_runtime_nested_in_a_waiting_one_leaves_its_runtime_to_the_helper() {
+    let other = runtime();
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let answer = runtime.block_on(async {
+        other.block_on(async {
+            assert!(the_helper_parked_or_nobody_waiting(&runtime));
+            runtime.spawn("an answer", async { 7 }).await.unwrap()
+        })
+    });
+
+    assert_eq!(answer, 7);
+}
+
+/// The same, with the outer call one of the free `block_on`, driving the thread's own runtime.
+#[test]
+#[timeout(15000)]
+fn a_block_on_nested_in_a_waiting_free_block_on_leaves_the_own_runtime_to_the_helper() {
+    let other = runtime();
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let answer = drive(&runtime, async {
+        other.block_on(async {
+            assert!(the_helper_parked_or_nobody_waiting(&runtime));
+            runtime.spawn("an answer", async { 7 }).await.unwrap()
+        })
+    });
+
+    assert_eq!(answer, 7);
+}
+
+/// A `block_on` nested inside a waiting `block_on` on the very same runtime waits for that seat,
+/// and is given it by the helper.
+#[test]
+#[timeout(15000)]
+fn a_block_on_nested_in_a_waiting_block_on_on_the_same_runtime_takes_the_seat() {
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+    let (parked, watcher) = the_parked_helper_announced(&runtime);
+
+    let ran_on = runtime
+        .block_on(async {
+            runtime.block_on(async {
+                // Awaited before the spawn below, so that the spawn is made by a thread that has
+                // the seat: the helper gives it up to the nested call, and stays
+                // parked until it leaves.
+                parked.await;
+                runtime
+                    .spawn("a task that names the thread it runs on", async {
+                        thread::current().id()
+                    })
+                    .await
+            })
+        })
+        .unwrap();
+
+    assert!(watcher.join().unwrap());
+    assert_eq!(ran_on, thread::current().id());
+}
+
 /// A runtime of this test's own, with nothing to do and no thread until it is given something.
 fn runtime() -> SharedRuntime {
     SharedRuntime::from_inner(Core::with_seat().unwrap())
@@ -1274,6 +1366,17 @@ fn resolve_on_the_second_ask(runtime: &SharedRuntime) -> (Resolver, impl Drop) {
 
 /// What a `block_on` looks its runtime up through, boxed so that a test can hand it around.
 type Resolver = Box<dyn Fn() -> Option<Arc<Core<Shared>>>>;
+
+/// Whether, within a second, `runtime`'s helper has parked or nobody is down as waiting for its
+/// seat.
+///
+/// For the future of a `block_on` nested inside another on `runtime` that found the helper in the
+/// seat: the outer call is down as waiting, and the helper either parks for it or — where the
+/// nested call has taken it off the list — is left in the seat. Either way the helper is done
+/// deciding by the time this holds, so what follows sees it settled.
+fn the_helper_parked_or_nobody_waiting(runtime: &SharedRuntime) -> bool {
+    within_a_second(|| runtime.helper_parked() || waiting(runtime) == 0)
+}
 
 /// How many threads are down as waiting for `runtime`'s seat.
 fn waiting(runtime: &SharedRuntime) -> usize {

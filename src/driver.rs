@@ -204,16 +204,26 @@ impl Drop for Leaving<'_> {
         let Some(inner) = (self.resolve)() else {
             return;
         };
-        let mut seat = seat(&inner);
-        seat.stop_waiting();
-        // The helper gives the seat up to a call that asks for it and parks; a call that asks
-        // and then finds its future done without ever taking the seat up leaves nobody in it,
-        // and the helper is the one to rouse.
-        if matches!(seat.holder, Holder::Nobody { .. }) {
-            seat.rouse_helper();
-        }
-        hand_over(&inner, &mut seat);
+        stop_waiting_for(&inner);
     }
+}
+
+/// Takes the calling thread, which is not in `inner`'s seat, out of the list of those waiting
+/// for it, and leaves the work on `inner` to whoever else can run it: what a `block_on` that
+/// never took the seat does as it leaves, or as it is kept from its loop by a `block_on` nested
+/// inside its future.
+///
+/// The helper gives the seat up to a call that asks for it and parks; a call that asks and then
+/// stops asking without ever taking the seat up leaves nobody in it, and the helper is the one to
+/// rouse. Where no helper is up at all, the work this thread asked none for — on the promise that
+/// it would take the seat on the next turn of its loop — is handed on to one.
+fn stop_waiting_for(inner: &Arc<Core<Shared>>) {
+    let mut seat = seat(inner);
+    seat.stop_waiting();
+    if matches!(seat.holder, Holder::Nobody { .. }) {
+        seat.rouse_helper();
+    }
+    hand_over(inner, &mut seat);
 }
 
 /// Starts the helper for `inner`, where it has a seat, unless a thread is in the seat or about to
@@ -241,7 +251,9 @@ pub(crate) fn ensure_helper(inner: &Arc<Core<Shared>>) {
     }
     let mut seat = lock(seat);
     // Whoever is in the seat finds the work, and so does a helper parked with the seat left to
-    // nobody, which was roused as the seat was left.
+    // nobody, which was roused as the seat was left: by the call that freed it, or by the last
+    // call waiting for it as that call stopped waiting — as it left, or as a `block_on` nested
+    // inside its future took it away from its loop.
     if !matches!(
         seat.holder,
         Holder::Nobody {
@@ -426,7 +438,7 @@ where
 /// seat or a helper is up already. Under the seat lock, which `seat` is the guard of.
 ///
 /// Unlike [`ensure_helper`], this pays no heed to the caller being inside `block_on`: it is for
-/// the two places where a thread that was running the work stops being able to.
+/// the places where a thread that was running the work, or was about to, stops being able to.
 fn hand_over(inner: &Arc<Core<Shared>>, seat: &mut Seat) {
     if !matches!(
         seat.holder,
@@ -695,6 +707,9 @@ impl InBlockOn {
             "block_on called from a task this runtime is running: the call would wait for the \
              very thread it is on"
         );
+        if in_block_on() {
+            leave_the_outer_call(&target);
+        }
         IN_BLOCK_ON.with(|inside| inside.set(inside.get() + 1));
         let recorded = TARGETS
             .try_with(|targets| targets.borrow_mut().push(target))
@@ -702,6 +717,44 @@ impl InBlockOn {
 
         Self { recorded }
     }
+}
+
+/// Takes a thread about to enter a `block_on` nested inside the future of another off the list
+/// of those waiting for the seat the outer call drives, where the two drive different runtimes.
+/// For a thread inside a `block_on` and in no seat.
+///
+/// The outer call is in no seat, or the check before this would have turned the nested one away,
+/// so it may be down as waiting for its seat, with the helper about to give the seat up to it and
+/// park. It cannot take the seat up while the nested call has the thread, so the helper would be
+/// left parked with the seat free and nobody to rouse it: a spawn on that runtime from anywhere
+/// takes a parked helper for one somebody is about to rouse, and asks for no other. Taken off the
+/// list, the thread leaves the helper in the seat, or rouses it where it parked already; and work
+/// it handed that runtime before the nested call, asking for no helper on the promise of the next
+/// turn of its loop, is handed on to one where none is up. The outer call puts itself down again
+/// at that next turn, where it asks for the seat afresh.
+///
+/// A nested call on the very runtime the outer one drives waits for, or takes, that same seat, so
+/// the thread keeps its place in the list and the promise stands.
+fn leave_the_outer_call(target: &Target) {
+    // Both looked up before any seat lock is taken, because the thread's own registry is behind a
+    // lock of its own; and held until that lock is let go of, because either may be the last
+    // handle on its runtime.
+    let outer = match innermost() {
+        Target::Own => own(),
+        Target::Core(core) => Some(core),
+    };
+    let Some(outer) = outer else {
+        return;
+    };
+    let nested = match target {
+        Target::Own => own(),
+        Target::Core(core) => Some(core.clone()),
+    };
+    if nested.is_some_and(|nested| Arc::ptr_eq(&nested, &outer)) {
+        return;
+    }
+
+    stop_waiting_for(&outer);
 }
 
 impl Drop for InBlockOn {
