@@ -91,6 +91,12 @@ pub type SharedRuntime = Runtime<Shared>;
 ///
 /// `M` is the runtime's flavour: [`Local`], the default, for a runtime that stays on its thread,
 /// or [`Shared`] for one that may be reached from any thread.
+///
+/// Reach for [`Local`] unless a handle, a task or a future built on this runtime must cross
+/// threads or be polled by another executor: it is the cheaper of the two, with nothing behind
+/// atomics or locks beyond what a [`Waker`](std::task::Waker) forces. [`Shared`] costs an `Arc`
+/// and a `Mutex` where `Local` costs an `Rc` and a `RefCell`, and only runs `Send` futures, in
+/// return for being usable from, and drivable on, any thread.
 pub struct Runtime<M = Local>
 where
     M: Mode,
@@ -114,6 +120,10 @@ where
     /// such a task to completion, or keep its [`Task`] and cancel it by dropping that.
     ///
     /// What can fail is the reactor: it opens the channel a wait is broken through.
+    ///
+    /// Called as `Runtime::new()`, this leaves `M` for the compiler to guess at, which it cannot
+    /// do from an empty argument list: name [`LocalRuntime::new`] or [`SharedRuntime::new`]
+    /// instead, or give `new` a turbofish.
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             core: Core::<M>::new()?,

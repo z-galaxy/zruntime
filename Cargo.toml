@@ -21,7 +21,10 @@ targets = [
 
 [features]
 default = ["tracing"]
+# Logs through `tracing`; a build without it emits no log events.
 tracing = ["dep:tracing"]
+# Per-thread shared runtimes: `SharedRuntime::current()`, the free `block_on`, and the helper
+# thread that keeps their work moving in between `block_on` calls.
 helper = []
 
 [dependencies]
