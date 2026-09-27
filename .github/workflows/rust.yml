@@ -34,6 +34,12 @@ jobs:
           cargo --locked check --no-default-features --target x86_64-unknown-freebsd
           cargo --locked check --no-default-features --target x86_64-unknown-netbsd
           cargo --locked check --no-default-features --target aarch64-linux-android
+          cargo --locked check --all-features
+          cargo --locked check --all-features --target x86_64-pc-windows-gnu
+          cargo --locked check --all-features --target x86_64-apple-darwin
+          cargo --locked check --all-features --target x86_64-unknown-freebsd
+          cargo --locked check --all-features --target x86_64-unknown-netbsd
+          cargo --locked check --all-features --target aarch64-linux-android
 
   fmt:
     runs-on: ubuntu-latest
@@ -91,6 +97,13 @@ jobs:
             --target x86_64-pc-windows-gnu
           cargo --locked clippy --all-targets --no-default-features \
             --target aarch64-linux-android
+          cargo --locked clippy --all-targets --all-features
+          cargo --locked clippy --all-targets --all-features --target x86_64-apple-darwin
+          cargo --locked clippy --all-targets --all-features --target x86_64-unknown-freebsd
+          cargo --locked clippy --all-targets --all-features --target x86_64-unknown-netbsd
+          cargo --locked clippy --all-targets --all-features --target x86_64-pc-windows-gnu
+          cargo --locked clippy --all-targets --all-features --target aarch64-linux-android
+          cargo --locked clippy --all-targets --no-default-features --features helper
 
   test:
     runs-on: ${{ matrix.os }}
@@ -115,6 +128,10 @@ jobs:
         run: cargo --locked test
       - name: Test without default features
         run: cargo --locked test --no-default-features
+      - name: Test with all features
+        run: cargo --locked test --all-features
+      - name: Test the helper feature alone
+        run: cargo --locked test --no-default-features --features helper
 
   doc_build:
     runs-on: ubuntu-latest

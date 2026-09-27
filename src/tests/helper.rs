@@ -1,29 +1,39 @@
-//! Tests of a runtime as a whole: the helper thread that starts on the first piece of work
-//! handed to it from outside `block_on`, the `block_on` that runs the scheduler and the reactor
-//! on its own thread, and the hand-over between the two.
+//! Tests of the `helper` feature: the helper thread that starts on the first piece of work
+//! handed to a runtime with a seat from outside `block_on`, the `block_on` that runs the scheduler
+//! and the reactor on its own thread, the hand-over between the two, and the registries
+//! [`SharedRuntime::current`] hands runtimes out of.
+#![cfg(feature = "helper")]
 
 use std::{
     cell::RefCell,
-    future::{pending, poll_fn},
+    future::{Future, pending, poll_fn},
     io::Write,
     mem::MaybeUninit,
-    pin::pin,
-    sync::atomic::{AtomicBool, Ordering},
-    task::{Wake, Waker},
+    pin::{Pin, pin},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll, Wake, Waker},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use event_listener::{Event, EventListener};
 use futures_lite::future::{block_on, poll_once};
 use ntest::timeout;
-use socket2::{SockRef, Socket};
+use socket2::SockRef;
 
-use super::*;
+use super::core::pair;
+use crate::{
+    Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, driver,
+    runtime::{Core, lock},
+};
 
 /// What a handle is shared as: a task handle and a registration live in state that several threads
 /// reach, and a runtime handle is cloned into the tasks it spawns.
 #[test]
+#[timeout(15000)]
 fn handles_cross_threads() {
     fn shared<T>()
     where
@@ -36,10 +46,10 @@ fn handles_cross_threads() {
     {
     }
 
-    shared::<Runtime>();
-    shared::<Task<()>>();
-    shared::<Registration>();
-    sent::<Sleep>();
+    shared::<SharedRuntime>();
+    shared::<Task<(), Shared>>();
+    shared::<Registration<Shared>>();
+    sent::<Sleep<Shared>>();
 }
 
 #[test]
@@ -436,7 +446,7 @@ fn a_panic_in_a_futures_drop_leaves_the_helper_running() {
 fn a_cancelled_futures_drop_may_spawn_on_the_runtime() {
     /// Spawns a task of its own as it goes, through the runtime it holds.
     struct SpawnOnDrop {
-        runtime: Runtime,
+        runtime: SharedRuntime,
         ran: Arc<AtomicBool>,
     }
 
@@ -636,7 +646,7 @@ fn work_left_by_a_block_on_that_took_no_seat_goes_to_a_helper() {
     let (resolve, _own) = resolve_on_the_second_ask(&runtime);
     let mut task = None;
 
-    driver::block_on(&*resolve, async {
+    driver::block_on(driver::Target::Own, &*resolve, async {
         task = Some(runtime.spawn("a task that never finishes", pending::<()>()));
     });
 
@@ -658,7 +668,7 @@ fn work_left_by_a_block_on_that_panicked_without_the_seat_goes_to_a_helper() {
     let mut task = None;
 
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        driver::block_on(&*resolve, async {
+        driver::block_on(driver::Target::Own, &*resolve, async {
             task = Some(runtime.spawn("a task that never finishes", pending::<()>()));
             panic!("a future that panics once it has spawned");
         });
@@ -852,8 +862,8 @@ fn a_panic_in_the_future_frees_the_seat() {
 #[timeout(15000)]
 fn every_handle_in_a_registry_shares_one_runtime() {
     let registry = Mutex::new(Weak::new());
-    let first = Runtime::from_inner(Inner::shared_in(&registry).unwrap());
-    let second = Runtime::from_inner(Inner::shared_in(&registry).unwrap());
+    let first = SharedRuntime::from_inner(driver::shared_in(&registry).unwrap());
+    let second = SharedRuntime::from_inner(driver::shared_in(&registry).unwrap());
 
     assert!(Arc::ptr_eq(first.inner(), second.inner()));
 }
@@ -862,7 +872,7 @@ fn every_handle_in_a_registry_shares_one_runtime() {
 #[timeout(15000)]
 fn a_shared_runtime_goes_with_its_last_handle() {
     let registry = Mutex::new(Weak::new());
-    let handle = Runtime::from_inner(Inner::shared_in(&registry).unwrap());
+    let handle = SharedRuntime::from_inner(driver::shared_in(&registry).unwrap());
     let inner = Arc::downgrade(handle.inner());
 
     drop(handle);
@@ -870,7 +880,7 @@ fn a_shared_runtime_goes_with_its_last_handle() {
     // Nothing was spawned or registered, so no thread holds the runtime either.
     assert!(inner.upgrade().is_none());
     // And the next handle brings a fresh one into being.
-    let next = Runtime::from_inner(Inner::shared_in(&registry).unwrap());
+    let next = SharedRuntime::from_inner(driver::shared_in(&registry).unwrap());
     assert!(inner.upgrade().is_none());
     drop(next);
 }
@@ -878,17 +888,17 @@ fn a_shared_runtime_goes_with_its_last_handle() {
 #[test]
 #[timeout(15000)]
 fn each_thread_inside_block_on_has_a_runtime_of_its_own() {
-    // `Runtime::current` on a thread that is in no seat goes to that thread's own runtime. The
-    // two handles are held across the comparison, so that the second runtime cannot land on the
-    // address the first has given up.
-    let on_this_thread = super::block_on(async { Runtime::current().unwrap() });
-    let on_another = thread::spawn(|| super::block_on(async { Runtime::current().unwrap() }))
+    // `SharedRuntime::current` on a thread that is in no seat goes to that thread's own runtime.
+    // The two handles are held across the comparison, so that the second runtime cannot land on
+    // the address the first has given up.
+    let on_this_thread = crate::block_on(async { SharedRuntime::current().unwrap() });
+    let on_another = thread::spawn(|| crate::block_on(async { SharedRuntime::current().unwrap() }))
         .join()
         .unwrap();
 
     assert!(!Arc::ptr_eq(on_this_thread.inner(), on_another.inner()));
     // And the same thread gets the same runtime back for as long as it is alive.
-    let again = super::block_on(async { Runtime::current().unwrap() });
+    let again = crate::block_on(async { SharedRuntime::current().unwrap() });
     assert!(Arc::ptr_eq(again.inner(), on_this_thread.inner()));
 }
 
@@ -898,8 +908,8 @@ fn work_built_under_another_executor_shares_one_runtime() {
     // Built on threads that are inside no `block_on` and in no seat, as work some other executor
     // polls is: one runtime serves them all, and one helper runs it. The handles are held across
     // the comparison, so that the second cannot land on an address the first gave up.
-    let here = Runtime::current().unwrap();
-    let there = thread::spawn(|| Runtime::current().unwrap())
+    let here = SharedRuntime::current().unwrap();
+    let there = thread::spawn(|| SharedRuntime::current().unwrap())
         .join()
         .unwrap();
 
@@ -915,7 +925,7 @@ fn a_value_built_on_a_helper_thread_joins_the_runtime_the_helper_runs() {
     let expected = Arc::as_ptr(runtime.inner()) as usize;
 
     let built_on = runtime.spawn("a task that builds a handle", async {
-        Arc::as_ptr(Runtime::current().unwrap().inner()) as usize
+        Arc::as_ptr(SharedRuntime::current().unwrap().inner()) as usize
     });
 
     assert_eq!(block_on(built_on).unwrap(), expected);
@@ -933,7 +943,7 @@ fn a_spawn_from_inside_another_threads_block_on_starts_a_helper() {
     let mut task = None;
     {
         let ran = ran.clone();
-        driver::block_on(&|| None, async {
+        driver::block_on(driver::Target::Own, &|| None, async {
             task = Some(
                 runtime.spawn("a task of another thread's runtime", async move {
                     ran.store(true, Ordering::Release);
@@ -949,12 +959,12 @@ fn a_spawn_from_inside_another_threads_block_on_starts_a_helper() {
 
 /// A value built as its thread ends is run rather than a panic.
 ///
-/// `Runtime::current` looks a thread's own runtime up in two thread-locals, and a task spawned
-/// from the drop of another thread-local value — one stashed there, say — finds them gone. A
-/// thread past running anything of its own is one no `block_on` is inside of, so what it gets is
+/// `SharedRuntime::current` looks a thread's own runtime up in two thread-locals, and a task
+/// spawned from the drop of another thread-local value — one stashed there, say — finds them gone.
+/// A thread past running anything of its own is one no `block_on` is inside of, so what it gets is
 /// the runtime the process shares, and a helper runs its work.
 ///
-/// The value below is touched before the locals `Runtime::current` reaches, so that its drop
+/// The value below is touched before the locals `SharedRuntime::current` reaches, so that its drop
 /// runs after theirs: thread-local destructors run in reverse order of registration.
 #[test]
 #[timeout(15000)]
@@ -966,7 +976,7 @@ fn a_task_spawned_as_a_thread_ends_is_run_by_a_helper() {
             let Some(ran) = self.0.take() else {
                 return;
             };
-            Runtime::current()
+            SharedRuntime::current()
                 .unwrap()
                 .spawn("a task spawned as a thread ends", async move {
                     ran.notify(1);
@@ -985,8 +995,9 @@ fn a_task_spawned_as_a_thread_ends_is_run_by_a_helper() {
     let notified = ran.listen();
     let thread = thread::spawn(move || {
         BUILDS_AS_IT_GOES.with(|builds| builds.borrow_mut().0 = Some(ran));
-        // Which is what brings the locals `Runtime::current` reaches into being on this thread.
-        drop(Runtime::current().unwrap());
+        // Which is what brings the locals `SharedRuntime::current` reaches into being on this
+        // thread.
+        drop(SharedRuntime::current().unwrap());
     });
 
     assert!(thread.join().is_ok());
@@ -1008,7 +1019,7 @@ fn block_on_as_a_thread_ends_does_not_abort() {
 
     impl Drop for BlocksAsItGoes {
         fn drop(&mut self) {
-            super::block_on(async { drop(Runtime::current().unwrap()) });
+            crate::block_on(async { drop(SharedRuntime::current().unwrap()) });
         }
     }
 
@@ -1020,7 +1031,7 @@ fn block_on_as_a_thread_ends_does_not_abort() {
         BLOCKS_AS_IT_GOES.with(|_| ());
         // Which is what brings the locals a `block_on` reaches into being on this thread, the
         // thread's own registry among them: a thread that never had one has nothing to lose.
-        super::block_on(async { drop(Runtime::current().unwrap()) });
+        crate::block_on(async { drop(SharedRuntime::current().unwrap()) });
     });
 
     assert!(thread.join().is_ok());
@@ -1039,11 +1050,11 @@ fn block_on_as_a_thread_ends_does_not_abort() {
 #[timeout(15000)]
 fn a_block_on_taking_the_seat_as_a_thread_ends_does_not_abort() {
     /// Keeps a runtime alive past the thread that built it, and drives it once more as it goes.
-    struct DrivesAsItGoes(Option<Runtime>);
+    struct DrivesAsItGoes(Option<SharedRuntime>);
 
     impl Drop for DrivesAsItGoes {
         fn drop(&mut self) {
-            super::block_on(async { drop(Runtime::current().unwrap()) });
+            crate::block_on(async { drop(SharedRuntime::current().unwrap()) });
         }
     }
 
@@ -1053,33 +1064,238 @@ fn a_block_on_taking_the_seat_as_a_thread_ends_does_not_abort() {
     }
 
     let thread = thread::spawn(|| {
-        super::block_on(async {
+        crate::block_on(async {
             // Touched before the runtime is built, so that this value is destroyed after the
-            // local the lookup inside `Runtime::current` brings into being. The handle it keeps
-            // is what the registry's weak reference still resolves to as the thread ends.
+            // local the lookup inside `SharedRuntime::current` brings into being. The handle it
+            // keeps is what the registry's weak reference still resolves to as the
+            // thread ends.
             DRIVES_AS_IT_GOES
-                .with(|drives| drives.borrow_mut().0 = Some(Runtime::current().unwrap()));
+                .with(|drives| drives.borrow_mut().0 = Some(SharedRuntime::current().unwrap()));
         });
     });
 
     assert!(thread.join().is_ok());
 }
 
+#[test]
+#[timeout(15000)]
+fn a_runtime_made_by_new_starts_no_helper() {
+    let runtime = SharedRuntime::new().unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let task = {
+        let ran = ran.clone();
+        runtime.spawn("a task that names the thread it runs on", async move {
+            ran.store(true, Ordering::Release);
+            thread::current().id()
+        })
+    };
+    let (source, _peer) = pair();
+    let _registration = runtime.register(source).unwrap();
+
+    // Long enough that a helper, had one been started, would have run the task.
+    thread::sleep(Duration::from_millis(200));
+    assert!(!ran.load(Ordering::Acquire));
+
+    // The task waits for the next thread to drive the runtime, and runs on that thread.
+    assert_eq!(runtime.block_on(task).unwrap(), thread::current().id());
+    assert!(ran.load(Ordering::Acquire));
+}
+
+#[test]
+#[timeout(15000)]
+fn current_inside_a_local_block_on_is_run_by_a_helper() {
+    let local = LocalRuntime::new().unwrap();
+
+    // The local runtime's `block_on` drives that runtime alone, so what is built on the one
+    // `SharedRuntime::current` hands out here has a helper to run it rather than this thread.
+    let name = local
+        .block_on(async {
+            SharedRuntime::current()
+                .unwrap()
+                .spawn("a task that names the thread it runs on", async {
+                    thread::current().name().map(str::to_owned)
+                })
+                .await
+        })
+        .unwrap();
+
+    assert_eq!(name.as_deref(), Some("zruntime"));
+}
+
+/// What is built inside a `block_on` on a runtime that is not the thread's own goes on that
+/// runtime, even while another thread holds its seat.
+///
+/// The call finds the helper in the seat, so its first poll is made without it. Work built there
+/// on the thread's own runtime would ask for no helper, the thread being inside a `block_on`, and
+/// wait for a call on that runtime that never comes.
+#[test]
+#[timeout(15000)]
+fn work_built_in_a_block_on_on_another_runtime_goes_on_that_runtime() {
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let (built_on, answer) = runtime.block_on(async {
+        let built_on = SharedRuntime::current().unwrap();
+        let answer = built_on.spawn("an answer", async { 7 }).await.unwrap();
+
+        (built_on, answer)
+    });
+
+    assert!(Arc::ptr_eq(built_on.inner(), runtime.inner()));
+    assert_eq!(answer, 7);
+}
+
+/// Work handed to the thread's own runtime from inside a `block_on` on another runtime gets a
+/// helper.
+///
+/// The call drives the other runtime, and has no turn of its loop to spare for the thread's own:
+/// what is spawned there has nobody but a helper to run it.
+#[test]
+#[timeout(15000)]
+fn work_handed_to_the_own_runtime_inside_another_runtimes_block_on_goes_to_a_helper() {
+    let own = crate::block_on(async { SharedRuntime::current().unwrap() });
+    let runtime = runtime();
+
+    let name = runtime
+        .block_on(async {
+            own.spawn("a task that names the thread it runs on", async {
+                thread::current().name().map(str::to_owned)
+            })
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(name.as_deref(), Some("zruntime"));
+}
+
+/// A `block_on` on a runtime of no registry's panics inside the future of a `block_on` of the
+/// helper layer, whether or not that call holds its seat at the time.
+#[test]
+#[timeout(15000)]
+fn a_core_block_on_inside_a_helper_block_on_panics_with_or_without_the_seat() {
+    let nested = || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            LocalRuntime::new().unwrap().block_on(async {});
+        }))
+        .is_err()
+    };
+
+    // Nothing is alive for the thread's own registry to name, so the call polls without a seat.
+    assert!(crate::block_on(async { nested() }));
+    // A runtime the call resolves to from the start, whose seat it takes before its first poll.
+    let runtime = runtime();
+    assert!(drive(&runtime, async { nested() }));
+    // And the thread may drive the local runtime once it is out of both.
+    assert_eq!(LocalRuntime::new().unwrap().block_on(async { 7 }), 7);
+}
+
+/// A spawn on a runtime whose `block_on` a nested `block_on` keeps from its loop is run.
+///
+/// The outer call finds the helper in the seat, so it puts itself down as waiting and polls its
+/// future without the seat, which is what lets the free `block_on` be called inside it. The helper
+/// would give the seat up to that outer call and park, and the outer call cannot take the seat up
+/// until the nested one returns; a spawn on the outer call's runtime from inside the nested one
+/// would then take the parked helper for one about to be roused, and wait for ever. The nested
+/// call takes the outer one off the list instead, and the helper keeps the seat.
+#[test]
+#[timeout(15000)]
+fn a_block_on_nested_in_a_waiting_block_on_leaves_its_runtime_to_the_helper() {
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let answer = runtime.block_on(async {
+        crate::block_on(async {
+            // Looked at before the spawn, so that a helper that parks for the outer call has
+            // parked by the time of it, and that spawn is the one that finds it so.
+            assert!(the_helper_parked_or_nobody_waiting(&runtime));
+            runtime.spawn("an answer", async { 7 }).await.unwrap()
+        })
+    });
+
+    assert_eq!(answer, 7);
+}
+
+/// The same, with the nested call made on another runtime from `SharedRuntime::current`, whose
+/// seat it takes.
+#[test]
+#[timeout(15000)]
+fn a_block_on_on_another_runtime_nested_in_a_waiting_one_leaves_its_runtime_to_the_helper() {
+    let other = runtime();
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let answer = runtime.block_on(async {
+        other.block_on(async {
+            assert!(the_helper_parked_or_nobody_waiting(&runtime));
+            runtime.spawn("an answer", async { 7 }).await.unwrap()
+        })
+    });
+
+    assert_eq!(answer, 7);
+}
+
+/// The same, with the outer call one of the free `block_on`, driving the thread's own runtime.
+#[test]
+#[timeout(15000)]
+fn a_block_on_nested_in_a_waiting_free_block_on_leaves_the_own_runtime_to_the_helper() {
+    let other = runtime();
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+
+    let answer = drive(&runtime, async {
+        other.block_on(async {
+            assert!(the_helper_parked_or_nobody_waiting(&runtime));
+            runtime.spawn("an answer", async { 7 }).await.unwrap()
+        })
+    });
+
+    assert_eq!(answer, 7);
+}
+
+/// A `block_on` nested inside a waiting `block_on` on the very same runtime waits for that seat,
+/// and is given it by the helper.
+#[test]
+#[timeout(15000)]
+fn a_block_on_nested_in_a_waiting_block_on_on_the_same_runtime_takes_the_seat() {
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+    let (parked, watcher) = the_parked_helper_announced(&runtime);
+
+    let ran_on = runtime
+        .block_on(async {
+            runtime.block_on(async {
+                // Awaited before the spawn below, so that the spawn is made by a thread that has
+                // the seat: the helper gives it up to the nested call, and stays
+                // parked until it leaves.
+                parked.await;
+                runtime
+                    .spawn("a task that names the thread it runs on", async {
+                        thread::current().id()
+                    })
+                    .await
+            })
+        })
+        .unwrap();
+
+    assert!(watcher.join().unwrap());
+    assert_eq!(ran_on, thread::current().id());
+}
+
 /// A runtime of this test's own, with nothing to do and no thread until it is given something.
-fn runtime() -> Runtime {
-    Runtime::from_inner(Inner::new().unwrap())
+fn runtime() -> SharedRuntime {
+    SharedRuntime::from_inner(Core::with_seat().unwrap())
 }
 
 /// A `block_on` on `runtime`, resolving to that runtime and no other, with that runtime the
 /// calling thread's own for as long as the call lasts.
-fn drive<F>(runtime: &Runtime, future: F) -> F::Output
+fn drive<F>(runtime: &SharedRuntime, future: F) -> F::Output
 where
     F: Future,
 {
-    let _own = own_for_the_call(runtime.inner());
+    let _own = driver::own_for_the_call(runtime.inner());
     let inner = runtime.inner().clone();
 
-    driver::block_on(&move || Some(inner.clone()), future)
+    driver::block_on(driver::Target::Own, &move || Some(inner.clone()), future)
 }
 
 /// A task of `runtime`'s that never finishes, spawned from outside `block_on` and waited for
@@ -1089,7 +1305,7 @@ where
 /// moment to reach the seat. The task announces its first poll, which the helper makes from the
 /// seat, and this returns once that announcement is out: the helper is in the seat by then, and
 /// what keeps it there until the task is dropped is the task itself.
-fn held_by_the_helper(runtime: &Runtime) -> Task<()> {
+fn held_by_the_helper(runtime: &SharedRuntime) -> Task<(), Shared> {
     let announce = Arc::new(Event::new());
     let announced = announce.listen();
     let task = runtime.spawn("a task that never finishes", async move {
@@ -1108,7 +1324,9 @@ fn held_by_the_helper(runtime: &Runtime) -> Task<()> {
 /// for and has no poll to spare for the watching. The announcement is made whether or not the
 /// park is seen, so that a call awaiting it is never left waiting on one that did not happen;
 /// whether it did is what the thread hands back where it is joined.
-fn the_parked_helper_announced(runtime: &Runtime) -> (EventListener, thread::JoinHandle<bool>) {
+fn the_parked_helper_announced(
+    runtime: &SharedRuntime,
+) -> (EventListener, thread::JoinHandle<bool>) {
     let announce = Arc::new(Event::new());
     // Taken before the thread is started, so that the announcement cannot be missed.
     let announced = announce.listen();
@@ -1130,12 +1348,10 @@ fn the_parked_helper_announced(runtime: &Runtime) -> (EventListener, thread::Joi
 /// seat, and the work that poll leaves has nobody to run it. The task is spawned on the calling
 /// thread, so the runtime is that thread's own from the poll onwards and the spawn that poll
 /// makes asks for no helper.
-fn resolve_on_the_second_ask(
-    runtime: &Runtime,
-) -> (Box<dyn Fn() -> Option<Arc<Inner>>>, impl Drop) {
+fn resolve_on_the_second_ask(runtime: &SharedRuntime) -> (Resolver, impl Drop) {
     let inner = runtime.inner().clone();
     let looked = AtomicBool::new(false);
-    let own = own_for_the_call(runtime.inner());
+    let own = driver::own_for_the_call(runtime.inner());
 
     let resolve = Box::new(move || {
         if looked.swap(true, Ordering::AcqRel) {
@@ -1148,13 +1364,27 @@ fn resolve_on_the_second_ask(
     (resolve, own)
 }
 
+/// What a `block_on` looks its runtime up through, boxed so that a test can hand it around.
+type Resolver = Box<dyn Fn() -> Option<Arc<Core<Shared>>>>;
+
+/// Whether, within a second, `runtime`'s helper has parked or nobody is down as waiting for its
+/// seat.
+///
+/// For the future of a `block_on` nested inside another on `runtime` that found the helper in the
+/// seat: the outer call is down as waiting, and the helper either parks for it or — where the
+/// nested call has taken it off the list — is left in the seat. Either way the helper is done
+/// deciding by the time this holds, so what follows sees it settled.
+fn the_helper_parked_or_nobody_waiting(runtime: &SharedRuntime) -> bool {
+    within_a_second(|| runtime.helper_parked() || waiting(runtime) == 0)
+}
+
 /// How many threads are down as waiting for `runtime`'s seat.
-fn waiting(runtime: &Runtime) -> usize {
-    lock(&runtime.inner().seat).waiting()
+fn waiting(runtime: &SharedRuntime) -> usize {
+    driver::seat(runtime.inner()).waiting()
 }
 
 /// Whether `runtime`'s helper has gone within a second.
-fn helper_gone(runtime: &Runtime) -> bool {
+fn helper_gone(runtime: &SharedRuntime) -> bool {
     within_a_second(|| !runtime.helper_running())
 }
 
@@ -1170,72 +1400,4 @@ fn within_a_second(condition: impl Fn() -> bool) -> bool {
         }
         thread::sleep(Duration::from_millis(10));
     }
-}
-
-/// A source shareable between the registration a test makes and the reads or writes it makes
-/// directly: an owned descriptor of its own, rather than `Arc<dyn Source>`, so that registering a
-/// clone of it needs no unsized coercion of an already-erased source.
-#[cfg(unix)]
-type TestSource = Arc<std::os::fd::OwnedFd>;
-#[cfg(windows)]
-type TestSource = Arc<std::os::windows::io::OwnedSocket>;
-
-/// A connected pair: the source to register, and the far end to drive it from.
-fn pair() -> (TestSource, Socket) {
-    let (near, far) = connected();
-    near.set_nonblocking(true).unwrap();
-    far.set_nonblocking(true).unwrap();
-
-    (owned_source(near), far)
-}
-
-/// Wraps `socket` as a [`TestSource`]: one clone goes to [`Runtime::register`], the other is
-/// kept for the reads and writes the tests make directly.
-#[cfg(unix)]
-fn owned_source(socket: Socket) -> TestSource {
-    let owned: std::os::fd::OwnedFd = socket.into();
-
-    Arc::new(owned)
-}
-
-/// Wraps `socket` as a [`TestSource`]: one clone goes to [`Runtime::register`], the other is
-/// kept for the reads and writes the tests make directly.
-#[cfg(windows)]
-fn owned_source(socket: Socket) -> TestSource {
-    let owned: std::os::windows::io::OwnedSocket = socket.into();
-
-    Arc::new(owned)
-}
-
-/// Two sockets connected to one another.
-#[cfg(unix)]
-fn connected() -> (Socket, Socket) {
-    Socket::pair(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap()
-}
-
-/// Two sockets connected to one another.
-///
-/// Winsock has no socket pair, so this is a loopback connection which a listener of its own
-/// accepts and then has no further use for.
-#[cfg(windows)]
-fn connected() -> (Socket, Socket) {
-    use std::net::{TcpListener, TcpStream};
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let far = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let near = loop {
-        let (accepted, _) = listener.accept().unwrap();
-        // A loopback listener is reachable by anything else on the machine, so a connection that
-        // is not the one made just above is turned away rather than taken for it.
-        if accepted.peer_addr().unwrap() == far.local_addr().unwrap() {
-            break accepted;
-        }
-    };
-
-    // One-byte messages travel this pair, as they do the poller's wake pair, so neither end
-    // holds a send back for the peer's acknowledgement of the one before it.
-    near.set_nodelay(true).unwrap();
-    far.set_nodelay(true).unwrap();
-
-    (near.into(), far.into())
 }

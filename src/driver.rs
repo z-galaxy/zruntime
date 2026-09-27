@@ -1,7 +1,9 @@
-//! Who runs a runtime: the thread inside a [`block_on`](crate::block_on), or a helper thread
-//! where no such thread is there to do it.
+//! Who runs a runtime with a seat: the thread inside a [`block_on`](crate::block_on), or a
+//! helper thread where no such thread is there to do it.
 //!
-//! The scheduler and the reactor are run by one thread at a time, the one in the driver's seat.
+//! A shared runtime handed out by [`SharedRuntime::current`](crate::SharedRuntime::current), or
+//! built on by the free `block_on`, comes out of one of the registries below, and has a seat. The
+//! scheduler and the reactor are run by one thread at a time, the one in the driver's seat.
 //! A thread that enters `block_on` takes the seat if it is free and keeps it until its future is
 //! done: between two polls of that future it runs a batch of ready tasks and then waits on the
 //! reactor, so a program that drives its work through `block_on` runs it on its own thread and
@@ -15,32 +17,85 @@
 //! it, the helper parking until that call leaves, so that a program calling `block_on` once per
 //! operation runs each of them on its own thread rather than behind a thread of the runtime's
 //! own.
+//!
+//! Which runtime a thread is in the seat of is written down in the one place every runtime keeps
+//! that record, the marker [`set_driving`] writes, so that a wake on that thread spares itself the
+//! write that would break a wait the thread is not in, and a `block_on` there is turned away.
 
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     future::Future,
+    io,
     pin::pin,
-    ptr::NonNull,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     thread::{self, Thread, ThreadId},
-    time::Duration,
 };
 
-use super::{Inner, lock, reactor::Reactor};
-use crate::log::error;
+use crate::{
+    Shared,
+    runtime::{Core, drives, drives_a_runtime, lock, set_driving},
+};
 
-/// Whether the calling thread is in the seat of the runtime `reactor` belongs to.
+/// The runtime for what the calling thread builds, made here if none is alive: the one it is in
+/// the seat of, where it is in one; the one the innermost `block_on` it is inside drives, where
+/// it is inside one and so has a thread to run what it builds; and the process's otherwise.
 ///
-/// The reactor is named by its address, which stands for it alone while a thread is in its
-/// seat: that thread holds the runtime, so the reactor cannot be dropped and its place taken by
-/// another until the thread has left.
-pub(super) fn on_driver_thread(reactor: &Reactor) -> bool {
-    DRIVER_REACTOR.with(Cell::get) == Some(NonNull::from(reactor))
+/// The innermost call is the one that decides, because it is the one whose loop this thread is
+/// in: a call of the free `block_on` drives the thread's own runtime, and a call on a runtime
+/// handed out by `SharedRuntime::current` drives that runtime, which need not be the thread's
+/// own. Work built for the thread's own runtime inside the latter would wait for a call that is
+/// not coming.
+///
+/// Once this thread's `OWN` local is gone, there is no registry left to hold what it builds:
+/// inside a call of the free `block_on`, that goes on a runtime in no registry, which a helper
+/// thread runs; outside one, it still goes on the process's shared registry as before.
+pub(crate) fn current() -> io::Result<Arc<Core<Shared>>> {
+    if let Some(core) = driven() {
+        return Ok(core);
+    }
+    if !in_block_on() {
+        return shared_in(&SHARED);
+    }
+    if let Target::Core(core) = innermost() {
+        return Ok(core);
+    }
+    match OWN.try_with(shared_in) {
+        Ok(core) => core,
+        Err(_) => Core::with_seat(),
+    }
+}
+
+/// The calling thread's own runtime, if one is alive: what the free `block_on` resolves to.
+///
+/// Nothing, too, once this thread's `OWN` local is gone: a `block_on` from the destructor of
+/// another local then takes no seat, and polls and parks.
+pub(crate) fn own() -> Option<Arc<Core<Shared>>> {
+    OWN.try_with(|own| lock(own).upgrade()).ok().flatten()
+}
+
+/// Runs `future` to completion on the calling thread, running `core`, a runtime with a seat,
+/// alongside it whenever the seat is free.
+pub(crate) fn block_on_seated<F>(core: &Arc<Core<Shared>>, future: F) -> F::Output
+where
+    F: Future,
+{
+    let target = Target::Core(core.clone());
+    let core = core.clone();
+
+    block_on(target, &move || Some(core.clone()), future)
+}
+
+/// What a `block_on` drives: the calling thread's own runtime, or a given one.
+pub(crate) enum Target {
+    /// The runtime the thread's own registry names, which the free `block_on` drives.
+    Own,
+    /// A runtime with a seat, which a `block_on` on that very runtime drives.
+    Core(Arc<Core<Shared>>),
 }
 
 /// The runtime the calling thread is in the seat of, if it is in one.
@@ -48,39 +103,66 @@ pub(super) fn on_driver_thread(reactor: &Reactor) -> bool {
 /// Nothing, too, once this thread's `DRIVING` local is gone, even where the thread still holds the
 /// seat: a destructor can reach [`Driving::enter`] after `DRIVING` has been torn down, and takes
 /// the seat with nowhere left here to record it.
-pub(super) fn driven() -> Option<Arc<Inner>> {
+fn driven() -> Option<Arc<Core<Shared>>> {
     DRIVING
         .try_with(|driving| driving.borrow().upgrade())
         .ok()
         .flatten()
 }
 
-/// Whether the calling thread is inside a `block_on`, and so has a thread of its own for what it
-/// builds and for the work it hands over.
+/// Whether the calling thread is inside a `block_on` of this layer, and so has a thread of its
+/// own for what it builds and for the work it hands over.
 ///
 /// `false` on a thread whose locals are being destroyed, which is a thread outside `block_on`
 /// unless a `block_on` is what that destruction is running, and the count says so where it is.
-pub(super) fn in_block_on() -> bool {
+pub(crate) fn in_block_on() -> bool {
     IN_BLOCK_ON
         .try_with(Cell::get)
         .is_ok_and(|inside| inside > 0)
 }
 
+/// What the innermost `block_on` the calling thread is inside drives. For a thread inside one.
+///
+/// [`Target::Own`] where the record of what each call drives is gone, on a thread whose locals are
+/// being destroyed: what a call made there drives is looked up in the thread's own registry, as
+/// it was before calls kept that record.
+fn innermost() -> Target {
+    let top = TARGETS.try_with(|targets| match targets.borrow().last() {
+        Some(Target::Core(core)) => Some(core.clone()),
+        Some(Target::Own) | None => None,
+    });
+
+    match top {
+        Ok(Some(core)) => Target::Core(core),
+        Ok(None) | Err(_) => Target::Own,
+    }
+}
+
+/// Whether `inner` is what the innermost `block_on` the calling thread is inside drives, and so
+/// what that call takes the seat of on the next turn of its loop. For a thread inside one.
+fn drives_next(inner: &Arc<Core<Shared>>) -> bool {
+    match innermost() {
+        Target::Own => is_own(inner),
+        Target::Core(core) => Arc::ptr_eq(&core, inner),
+    }
+}
+
 /// The runtime a `block_on` is to drive, looked up afresh at each turn of its loop, because the
 /// future it polls may be the very thing that brings the runtime into being. Asked on the
 /// calling thread alone, so a lookup in that thread's own registry is what it is.
-pub(super) type Resolve<'a> = &'a dyn Fn() -> Option<Arc<Inner>>;
+pub(crate) type Resolve<'a> = &'a dyn Fn() -> Option<Arc<Core<Shared>>>;
 
 /// Runs `future` to completion on the calling thread, running the runtime `resolve` names
-/// alongside it whenever the seat is free.
+/// alongside it whenever the seat is free. `target` says which runtime that is, for what is built
+/// or handed over on this thread while the call lasts.
 ///
 /// Panics when called from a thread that is in the seat already, which is a call from inside a
 /// task the runtime is running: such a call could only wait for the thread it is on.
-pub(super) fn block_on<F>(resolve: Resolve<'_>, future: F) -> F::Output
+pub(crate) fn block_on<F>(target: Target, resolve: Resolve<'_>, future: F) -> F::Output
 where
     F: Future,
 {
-    let _inside = InBlockOn::enter();
+    let _inside = InBlockOn::enter(target);
     // The seat outlives the future, which [`drive`] drops as it returns: whatever that future
     // held — a task, a registration, a timer — is gone before the seat is given up, so only
     // work that outlives this call is handed on to a helper.
@@ -107,11 +189,11 @@ struct Leaving<'a> {
 impl Drop for Leaving<'_> {
     /// Gives the seat up and hands on what the call leaves behind.
     ///
-    /// A thread inside `block_on` asks for no helper for its own runtime, on the promise that it
-    /// takes the seat on the next turn of its loop and runs the work itself. A thread that leaves
-    /// without ever having taken the seat has no next turn to keep that promise on, so what its
-    /// last poll handed over is handed on here; one that had the seat did as much where it gave
-    /// it up.
+    /// A thread inside `block_on` asks for no helper for the runtime that call drives, on the
+    /// promise that it takes the seat on the next turn of its loop and runs the work itself. A
+    /// thread that leaves without ever having taken the seat has no next turn to keep that
+    /// promise on, so what its last poll handed over is handed on here; one that had the seat
+    /// did as much where it gave it up.
     ///
     /// The thread is taken out of the list of those waiting for the seat either way: where it
     /// had the seat, freeing it empties that list; where it had not, it is taken out here.
@@ -122,37 +204,62 @@ impl Drop for Leaving<'_> {
         let Some(inner) = (self.resolve)() else {
             return;
         };
-        let mut seat = lock(&inner.seat);
-        seat.stop_waiting();
-        // The helper gives the seat up to a call that asks for it and parks; a call that asks
-        // and then finds its future done without ever taking the seat up leaves nobody in it,
-        // and the helper is the one to rouse.
-        if matches!(seat.holder, Holder::Nobody { .. }) {
-            seat.rouse_helper();
-        }
-        hand_over(&inner, &mut seat);
+        stop_waiting_for(&inner);
     }
 }
 
-/// Starts the helper unless a thread is in the seat or about to take it. Called after the work
-/// it is to see is in place (a task queued, a source registered, a deadline stored), never
-/// before.
+/// Takes the calling thread, which is not in `inner`'s seat, out of the list of those waiting
+/// for it, and leaves the work on `inner` to whoever else can run it: what a `block_on` that
+/// never took the seat does as it leaves, or as it is kept from its loop by a `block_on` nested
+/// inside its future.
+///
+/// The helper gives the seat up to a call that asks for it and parks; a call that asks and then
+/// stops asking without ever taking the seat up leaves nobody in it, and the helper is the one to
+/// rouse. Where no helper is up at all, the work this thread asked none for — on the promise that
+/// it would take the seat on the next turn of its loop — is handed on to one.
+fn stop_waiting_for(inner: &Arc<Core<Shared>>) {
+    let mut seat = seat(inner);
+    seat.stop_waiting();
+    if matches!(seat.holder, Holder::Nobody { .. }) {
+        seat.rouse_helper();
+    }
+    hand_over(inner, &mut seat);
+}
+
+/// Starts the helper for `inner`, where it has a seat, unless a thread is in the seat or about to
+/// take it. Called after the work it is to see is in place (a task queued, a source registered, a
+/// deadline stored), never before.
+///
+/// A runtime with no seat is run by the threads inside `block_on` on it alone: it has no helper
+/// to start.
 ///
 /// That order is what makes the hand-off safe either way round: a helper that starts here finds
 /// the work, and a thread in the seat either sees it in the round it is in or finds it where it
 /// decides whether to leave, which it does under this very lock. A thread inside `block_on`
 /// takes the seat on the next turn of its loop and finds the work then.
-pub(super) fn ensure_helper(inner: &Arc<Inner>) {
-    // A thread inside `block_on` on its own runtime asks for no helper: it takes the seat on the
-    // next turn of its loop and runs the work itself. Work handed to another thread's runtime
-    // gets a helper as from any thread outside `block_on`, because this thread will never sit in
-    // that seat.
-    if in_block_on() && Inner::is_own(inner) {
+pub(crate) fn ensure_helper(inner: &Arc<Core<Shared>>) {
+    let Some(seat) = &inner.seat else {
+        return;
+    };
+    // A thread in the seat of this very runtime — a `block_on` spawning from its future, or a task
+    // it or the helper is running — finds the work in the round it is in, or where it decides
+    // whether to leave: the same answer the lock below would give, for one thread-local read.
+    if drives(&inner.remote) {
         return;
     }
-    let mut seat = lock(&inner.seat);
+    // A thread inside `block_on` on the very runtime the work is handed to asks for no helper: it
+    // takes the seat on the next turn of its loop and runs the work itself. Work handed to any
+    // other runtime — another thread's, or this thread's own while its innermost call drives a
+    // different one — gets a helper as from any thread outside `block_on`, because this thread
+    // is not about to sit in that seat.
+    if in_block_on() && drives_next(inner) {
+        return;
+    }
+    let mut seat = lock(seat);
     // Whoever is in the seat finds the work, and so does a helper parked with the seat left to
-    // nobody, which was roused as the seat was left.
+    // nobody, which was roused as the seat was left: by the call that freed it, or by the last
+    // call waiting for it as that call stopped waiting — as it left, or as a `block_on` nested
+    // inside its future took it away from its loop.
     if !matches!(
         seat.holder,
         Holder::Nobody {
@@ -165,7 +272,10 @@ pub(super) fn ensure_helper(inner: &Arc<Inner>) {
 }
 
 /// Who is running a runtime, and who is waiting to.
-pub(super) struct Seat {
+///
+/// Public in name only, in a module nobody outside can reach, because the sealed trait behind
+/// [`Mode`](crate::Mode) names it.
+pub struct Seat {
     holder: Holder,
     /// The threads parked in `block_on` for want of the seat, unparked whenever it is freed.
     ///
@@ -178,7 +288,7 @@ pub(super) struct Seat {
 
 impl Seat {
     /// A seat nobody is in.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             holder: Holder::Nobody {
                 parked_helper: None,
@@ -188,19 +298,20 @@ impl Seat {
     }
 
     /// Whether the helper thread is up, in the seat or parked.
-    pub(super) fn helper_running(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn helper_running(&self) -> bool {
         matches!(self.holder, Holder::Helper) || self.parked_helper().is_some()
     }
 
     /// Whether the helper thread is up and parked, having left the seat to a `block_on`.
     #[cfg(test)]
-    pub(super) fn helper_parked(&self) -> bool {
+    pub(crate) fn helper_parked(&self) -> bool {
         self.parked_helper().is_some()
     }
 
     /// How many threads are down as waiting for the seat.
     #[cfg(test)]
-    pub(super) fn waiting(&self) -> usize {
+    pub(crate) fn waiting(&self) -> usize {
         self.waiting.len()
     }
 
@@ -220,7 +331,7 @@ impl Seat {
             Holder::Helper => None,
         };
         self.holder = Holder::Nobody { parked_helper };
-        DRIVER_REACTOR.with(|reactor| reactor.set(None));
+        set_driving(None);
         // Gone already on a thread whose locals are being destroyed, which [`Driving::take`]
         // leaves nothing in for that very reason.
         let _ = DRIVING.try_with(|driving| *driving.borrow_mut() = Weak::new());
@@ -333,8 +444,8 @@ where
 /// seat or a helper is up already. Under the seat lock, which `seat` is the guard of.
 ///
 /// Unlike [`ensure_helper`], this pays no heed to the caller being inside `block_on`: it is for
-/// the two places where a thread that was running the work stops being able to.
-fn hand_over(inner: &Arc<Inner>, seat: &mut Seat) {
+/// the places where a thread that was running the work, or was about to, stops being able to.
+fn hand_over(inner: &Arc<Core<Shared>>, seat: &mut Seat) {
     if !matches!(
         seat.holder,
         Holder::Nobody {
@@ -348,7 +459,7 @@ fn hand_over(inner: &Arc<Inner>, seat: &mut Seat) {
 }
 
 /// Starts the helper thread. Under the seat lock, which `seat` is the guard of.
-fn spawn_helper(inner: &Arc<Inner>, seat: &mut Seat) {
+fn spawn_helper(inner: &Arc<Core<Shared>>, seat: &mut Seat) {
     let inner = inner.clone();
     thread::Builder::new()
         .name(THREAD_NAME.into())
@@ -362,7 +473,7 @@ fn spawn_helper(inner: &Arc<Inner>, seat: &mut Seat) {
 }
 
 /// The name the helper thread carries: eight bytes, which fits the fifteen Linux keeps for one.
-pub(super) const THREAD_NAME: &str = "zruntime";
+const THREAD_NAME: &str = "zruntime";
 
 /// What the helper thread does: the seat, and rounds until nothing is left.
 ///
@@ -371,7 +482,7 @@ pub(super) const THREAD_NAME: &str = "zruntime";
 /// wait until something comes along to tell it what it could have worked out for itself. Where
 /// something is, the round ends in one wait on the reactor — unless a `block_on` is waiting for
 /// the seat, in which case the seat is that call's and this thread parks until it is free again.
-fn helper(inner: Arc<Inner>) {
+fn helper(inner: Arc<Core<Shared>>) {
     let mut failed_waits = 0u32;
     // The seat was made this thread's by whoever started it.
     let mut driving = Some(Driving::enter(inner.clone(), Driver::Helper));
@@ -398,7 +509,7 @@ fn helper(inner: Arc<Inner>) {
 
 /// A thread's time in the seat: taken here, given up when this is dropped.
 struct Driving {
-    inner: Arc<Inner>,
+    inner: Arc<Core<Shared>>,
     who: Driver,
     /// Whether the seat has been given up already, which [`Driving::leave_if_idle`] and
     /// [`Driving::yield_if_wanted`] are the two things that do before the drop.
@@ -416,8 +527,8 @@ impl Driving {
     /// A helper that finds the seat taken parks rather than leaves, and puts itself down as
     /// parked under the very lock the seat's holder frees the seat under: whoever is in the
     /// seat rouses it as it goes.
-    fn take(inner: Arc<Inner>, who: Driver) -> Option<Self> {
-        let mut seat = lock(&inner.seat);
+    fn take(inner: Arc<Core<Shared>>, who: Driver) -> Option<Self> {
+        let mut seat = seat(&inner);
         match (&mut seat.holder, who) {
             (Holder::Nobody { parked_helper }, Driver::BlockOn) => {
                 let parked_helper = parked_helper.take();
@@ -443,7 +554,7 @@ impl Driving {
                 seat.waiting.insert(thread.id(), thread);
                 if helper_in_seat {
                     drop(seat);
-                    inner.reactor.notify();
+                    inner.remote.notify();
                 }
 
                 return None;
@@ -456,8 +567,8 @@ impl Driving {
 
     /// Marks the calling thread as the one in the seat of `inner`, which the caller has made it:
     /// [`Driving::take`] under the seat lock, or the spawn of the helper thread.
-    fn enter(inner: Arc<Inner>, who: Driver) -> Self {
-        DRIVER_REACTOR.with(|reactor| reactor.set(Some(NonNull::from(&inner.reactor))));
+    fn enter(inner: Arc<Core<Shared>>, who: Driver) -> Self {
+        set_driving(Some(&*inner.remote));
         // Written down where there is still somewhere to write it: a thread whose locals are
         // being destroyed reaches here from the destructor of one of them, and the order those
         // run in is not this runtime's to choose. Nothing built on a thread on its way out looks
@@ -472,54 +583,29 @@ impl Driving {
         }
     }
 
-    /// Polls up to `BATCH` ready tasks.
+    /// Polls up to a batch of ready tasks.
     fn run_batch(&self) {
-        for _ in 0..BATCH {
-            if !self.inner.scheduler.run_one() {
-                break;
-            }
-        }
+        self.inner.run_batch();
     }
 
     /// One round for `block_on`: a batch, then one wait on the reactor, which waits for nothing
-    /// where the future this thread is polling has been woken in the meantime, so that the poll
-    /// of it comes next and what a source has for the tasks is reported all the same.
+    /// where the future this thread is polling has been woken in the meantime.
     fn round(&self, woken: &AtomicBool, failed_waits: &mut u32) {
-        self.run_batch();
-        // Read before the wait, so a wake that already landed is passed on as `at_once`.
-        let woken = woken.load(Ordering::Acquire);
-
-        self.wait(woken, failed_waits);
+        self.inner.round(woken, failed_waits);
     }
 
     /// One wait on the reactor: bounded by no time at all where a task is ready or `at_once`
-    /// says the caller has something of its own to get back to, so that the round after it polls
-    /// what is ready, and by nothing where neither holds, so that the thread sleeps until a
-    /// source, a deadline or a notification has something for it.
-    ///
-    /// `failed_waits` counts the failures in a row, for the pause that keeps a wait which fails
-    /// every time from becoming a spin; every waiter retries its own operation and sees its own
-    /// error.
+    /// says the caller has something of its own to get back to, and by nothing where neither
+    /// holds.
     fn wait(&self, at_once: bool, failed_waits: &mut u32) {
-        let at_most = (at_once || self.inner.scheduler.has_ready()).then_some(Duration::ZERO);
-        match self.inner.reactor.wait(at_most) {
-            Ok(()) => *failed_waits = 0,
-            Err(e) => {
-                *failed_waits += 1;
-                if *failed_waits == 1 {
-                    error!("The runtime's wait failed: {}", e);
-                }
-                self.inner.reactor.wake_everything();
-                thread::sleep(Duration::from_millis(1 << (*failed_waits).min(10)));
-            }
-        }
+        self.inner.wait(at_once, failed_waits);
     }
 
     /// Gives the seat up if nothing is left to run, watch or time; what the helper does before
     /// each wait. Under the seat lock, so that a spawn or a registration racing with it either
     /// is seen here or starts a helper itself once the lock is released.
     fn leave_if_idle(&self) -> bool {
-        let mut seat = lock(&self.inner.seat);
+        let mut seat = seat(&self.inner);
         if self.inner.is_busy() {
             return false;
         }
@@ -536,7 +622,7 @@ impl Driving {
     /// rouse, and marked parked after: a rouse of this very thread would only cut short the park
     /// it is about to make.
     fn yield_if_wanted(&self) -> bool {
-        let mut seat = lock(&self.inner.seat);
+        let mut seat = seat(&self.inner);
         if seat.waiting.is_empty() {
             return false;
         }
@@ -549,10 +635,6 @@ impl Driving {
         true
     }
 }
-
-/// How many ready tasks run between two looks at the reactor, so a busy task queue cannot
-/// starve a socket or a timer.
-const BATCH: usize = 32;
 
 impl Drop for Driving {
     /// Gives the seat up, unless [`Driving::leave_if_idle`] or [`Driving::yield_if_wanted`] did
@@ -567,7 +649,7 @@ impl Drop for Driving {
         if self.left.get() {
             return;
         }
-        let mut seat = lock(&self.inner.seat);
+        let mut seat = seat(&self.inner);
         seat.free();
         if self.who == Driver::BlockOn {
             hand_over(&self.inner, &mut seat);
@@ -589,7 +671,7 @@ struct Signal {
     woken: AtomicBool,
     /// The runtime the thread is in the seat of, set by that thread as it takes the seat: a wake
     /// may come from any thread, and only the driving thread knows which runtime's wait it is in.
-    runtime: Mutex<Weak<Inner>>,
+    runtime: Mutex<Weak<Core<Shared>>>,
 }
 
 impl Wake for Signal {
@@ -604,50 +686,193 @@ impl Wake for Signal {
     fn wake_by_ref(self: &Arc<Self>) {
         self.woken.swap(true, Ordering::AcqRel);
         self.thread.unpark();
-        if let Some(inner) = lock(&self.runtime).upgrade() {
-            inner.reactor.notify();
+        // Bound first, so that the lock is let go of before the runtime is reached: the handle
+        // taken here may be the last one, and the runtime it drops wakes whatever it held.
+        let runtime = lock(&self.runtime).upgrade();
+        if let Some(inner) = runtime {
+            inner.remote.notify();
         }
     }
 }
 
-/// What says a thread is inside `block_on`, for as long as it is.
-struct InBlockOn;
+/// What says a thread is inside `block_on`, and what that call drives, for as long as it is.
+struct InBlockOn {
+    /// Whether the call's target went on the thread's record, which it cannot once that record
+    /// is gone, on a thread whose locals are being destroyed.
+    recorded: bool,
+}
 
 impl InBlockOn {
-    /// Marks the calling thread as inside `block_on`.
+    /// Marks the calling thread as inside a `block_on` that drives `target`.
     ///
     /// Panics where the thread is in a seat already: the call comes from inside a task the
     /// runtime is running on this thread, and could only ever wait for itself.
-    fn enter() -> Self {
+    fn enter(target: Target) -> Self {
         assert!(
-            DRIVER_REACTOR.with(Cell::get).is_none(),
+            !drives_a_runtime(),
             "block_on called from a task this runtime is running: the call would wait for the \
              very thread it is on"
         );
+        if in_block_on() {
+            leave_the_outer_call(&target);
+        }
         IN_BLOCK_ON.with(|inside| inside.set(inside.get() + 1));
+        let recorded = TARGETS
+            .try_with(|targets| targets.borrow_mut().push(target))
+            .is_ok();
 
-        Self
+        Self { recorded }
     }
+}
+
+/// Takes a thread about to enter a `block_on` nested inside the future of another off the list
+/// of those waiting for the seat the outer call drives, where the two drive different runtimes.
+/// For a thread inside a `block_on` and in no seat.
+///
+/// The outer call is in no seat, or the check before this would have turned the nested one away,
+/// so it may be down as waiting for its seat, with the helper about to give the seat up to it and
+/// park. It cannot take the seat up while the nested call has the thread, so the helper would be
+/// left parked with the seat free and nobody to rouse it: a spawn on that runtime from anywhere
+/// takes a parked helper for one somebody is about to rouse, and asks for no other. Taken off the
+/// list, the thread leaves the helper in the seat, or rouses it where it parked already; and work
+/// it handed that runtime before the nested call, asking for no helper on the promise of the next
+/// turn of its loop, is handed on to one where none is up. The outer call puts itself down again
+/// at that next turn, where it asks for the seat afresh.
+///
+/// A nested call on the very runtime the outer one drives waits for, or takes, that same seat, so
+/// the thread keeps its place in the list and the promise stands.
+fn leave_the_outer_call(target: &Target) {
+    // Both looked up before any seat lock is taken, because the thread's own registry is behind a
+    // lock of its own; and held until that lock is let go of, because either may be the last
+    // handle on its runtime.
+    let outer = match innermost() {
+        Target::Own => own(),
+        Target::Core(core) => Some(core),
+    };
+    let Some(outer) = outer else {
+        return;
+    };
+    let nested = match target {
+        Target::Own => own(),
+        Target::Core(core) => Some(core.clone()),
+    };
+    if nested.is_some_and(|nested| Arc::ptr_eq(&nested, &outer)) {
+        return;
+    }
+
+    stop_waiting_for(&outer);
 }
 
 impl Drop for InBlockOn {
     fn drop(&mut self) {
+        if self.recorded {
+            let popped = TARGETS.try_with(|targets| targets.borrow_mut().pop());
+            // Clear of the borrow: the handle it holds may be the last one on its runtime.
+            drop(popped);
+        }
         IN_BLOCK_ON.with(|inside| inside.set(inside.get() - 1));
     }
 }
 
 thread_local! {
-    /// The reactor of the runtime this thread is in the seat of, and nothing on a thread that
-    /// is in no seat at all.
-    static DRIVER_REACTOR: Cell<Option<NonNull<Reactor>>> = const { Cell::new(None) };
-
     /// The runtime this thread is in the seat of, for whatever is built on this thread while it
     /// is: a task run by a helper thread builds its own tasks, timers and registrations on the
     /// runtime the helper runs.
-    static DRIVING: RefCell<Weak<Inner>> = const { RefCell::new(Weak::new()) };
+    ///
+    /// Beside the marker [`set_driving`] writes rather than in its place: that one names the
+    /// runtime by an address, which is all a wake needs, while what is built here needs a
+    /// runtime to build on.
+    static DRIVING: RefCell<Weak<Core<Shared>>> = const { RefCell::new(Weak::new()) };
 
     /// How many `block_on` calls this thread is inside of, in the seat or waiting for it. A
     /// count rather than a flag, so that one call returning does not unmark the call it was
     /// made from.
+    ///
+    /// Kept beside [`TARGETS`] rather than read off its length: a count needs no destructor, so
+    /// it outlives every other local of the thread and says so even for a call made from the
+    /// destructor of one of them.
     static IN_BLOCK_ON: Cell<u32> = const { Cell::new(0) };
+
+    /// What each `block_on` this thread is inside of drives, the innermost last: what is built on
+    /// this thread goes on the runtime the innermost call drives, and work handed to that runtime
+    /// needs no helper while the call lasts.
+    static TARGETS: RefCell<Vec<Target>> = const { RefCell::new(Vec::new()) };
 }
+
+/// The lock around `core`'s seat.
+///
+/// For a runtime the calling code knows has one: every runtime a `block_on` here resolves to or
+/// a helper runs came out of a registry, or was made with a seat of its own.
+pub(crate) fn seat(core: &Core<Shared>) -> MutexGuard<'_, Seat> {
+    let Some(seat) = &core.seat else {
+        unreachable!("a runtime the seat machinery runs has a seat");
+    };
+
+    lock(seat)
+}
+
+impl Core<Shared> {
+    /// Whether anything is left to run, watch or time.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.remote.has_ready() || self.scheduler.live_tasks() > 0 || !self.reactor.is_idle()
+    }
+}
+
+/// Whether `inner` is the calling thread's own runtime, the one the free `block_on` drives.
+///
+/// Nothing is a thread's own once its locals are gone, so work handed over then gets a helper,
+/// as work handed to any runtime the caller does not drive does.
+fn is_own(inner: &Arc<Core<Shared>>) -> bool {
+    OWN.try_with(|own| std::ptr::eq(lock(own).as_ptr(), Arc::as_ptr(inner)))
+        .unwrap_or(false)
+}
+
+/// The runtime `registry` names, made here if none is alive.
+pub(crate) fn shared_in(registry: &Mutex<Weak<Core<Shared>>>) -> io::Result<Arc<Core<Shared>>> {
+    let mut shared = lock(registry);
+    if let Some(core) = shared.upgrade() {
+        return Ok(core);
+    }
+    let core = Core::with_seat()?;
+    *shared = Arc::downgrade(&core);
+
+    Ok(core)
+}
+
+/// Makes `core` the calling thread's own runtime until the value handed back is dropped, which
+/// puts back whatever was there before, whether the call returns or unwinds.
+///
+/// For a test that drives a runtime of its own making: the runtime a `block_on` resolves to is
+/// always the one its thread builds on, so a spawn from inside such a call asks for no helper,
+/// and a test that drives a runtime nobody's registry names would be told otherwise.
+#[cfg(test)]
+pub(crate) fn own_for_the_call(core: &Arc<Core<Shared>>) -> impl Drop {
+    struct Restore(Weak<Core<Shared>>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OWN.with(|own| *lock(own) = std::mem::take(&mut self.0));
+        }
+    }
+
+    OWN.with(|own| Restore(std::mem::replace(&mut *lock(own), Arc::downgrade(core))))
+}
+
+thread_local! {
+    /// This thread's runtime, if one is alive: the one a `block_on` on this thread drives, and
+    /// the one work built inside such a call goes on.
+    ///
+    /// A `Weak`, so that the runtime and the two descriptors its reactor holds go once the last
+    /// handle and any thread running it are gone, and the next handle brings a fresh one. A
+    /// thread that ends with work alive leaves it to the helper thread that took it over when
+    /// its last `block_on` returned.
+    static OWN: Mutex<Weak<Core<Shared>>> = const { Mutex::new(Weak::new()) };
+}
+
+/// The runtime for work built on a thread that is inside no `block_on` and in no seat: work some
+/// other executor polls, wherever in the process it is built.
+///
+/// Such work has no thread of its own to look to, so a helper runs it, and one runtime for all
+/// of it is one helper and one pair of descriptors rather than a set per thread. A `Weak`, for
+/// the same reason [`OWN`] is.
+static SHARED: Mutex<Weak<Core<Shared>>> = Mutex::new(Weak::new());

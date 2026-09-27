@@ -39,8 +39,10 @@ jobs:
           # the cache its x86_64 runs saved under the same key, and never save an arm64 one.
           cache-extra-identifier: ${{ runner.arch }}
           bins: cargo-codspeed
+      # The benchmarks measure the helper layer (`block_on` per operation, the runtime of
+      # `SharedRuntime::current`), which is behind the `helper` feature.
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -m walltime
+        run: cargo codspeed build -m walltime --features helper
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
         with:

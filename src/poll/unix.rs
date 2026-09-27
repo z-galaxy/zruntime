@@ -1,6 +1,10 @@
 //! The wait on unix: `poll(2)` over the sources' descriptors and a pipe that breaks the wait.
 
-use std::{io, os::fd::OwnedFd, sync::Arc, time::Duration};
+use std::{
+    io,
+    os::fd::{BorrowedFd, OwnedFd},
+    time::Duration,
+};
 
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -8,7 +12,6 @@ use rustix::{
 };
 
 use super::{Ready, Want};
-use crate::Source;
 
 pub(crate) struct Poller {
     wake_read: OwnedFd,
@@ -37,9 +40,12 @@ impl Poller {
     /// Waits until a wanted source is ready, `notify` is called or `timeout` passes; `None`
     /// waits without limit. The sources are held for the whole call, so no descriptor in the
     /// set can close under it.
-    pub(crate) fn wait(
+    ///
+    /// `as_source` borrows the descriptor of each source for the call.
+    pub(crate) fn wait<S>(
         &self,
-        sources: &[(Arc<dyn Source>, Want)],
+        sources: &[(S, Want)],
+        as_source: impl Fn(&S) -> BorrowedFd<'_>,
         timeout: Option<Duration>,
     ) -> io::Result<Vec<Ready>> {
         let mut fds = Vec::with_capacity(sources.len() + 1);
@@ -52,7 +58,7 @@ impl Poller {
             if want.writable {
                 flags |= PollFlags::OUT;
             }
-            fds.push(PollFd::new(source, flags));
+            fds.push(PollFd::from_borrowed_fd(as_source(source), flags));
         }
         // A duration too long for a `Timespec` is as good as no limit.
         let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());

@@ -1,266 +1,719 @@
-//! The tasks of one runtime, and the queue of those that are ready to be polled.
+//! The tasks of one runtime, and the polling of those that are ready.
 //!
-//! A scheduler holds every task spawned on it and hands them out one at a time to be polled, on
-//! whichever thread calls [`Scheduler::run_one`]. It has no thread of its own: the thread
-//! running the runtime calls that method for as long as there is anything to run.
+//! A scheduler holds every task spawned on it and hands them out a batch at a time to be polled,
+//! on whichever thread calls [`Scheduler::run_batch`]. It has no thread of its own: the thread
+//! driving the runtime calls that method for as long as there is anything to run.
 //!
-//! Every task lives in a cell that holds its future, and each cell with something to do sits in
-//! the ready queue. Waking a task, from any thread, puts its cell on that queue and calls the
-//! `notify` hook the scheduler was built with, which is how a thread waiting with nothing to do
-//! learns that it has a task to poll. A wake for a cell that is already queued, or whose future
-//! has gone, does nothing, so a task woken three times is polled once; a wake that arrives while
-//! the task is being polled is remembered and queues the cell again once that poll returns.
+//! Every task lives in a slot of the scheduler's own, under an id that is never handed out
+//! again, and holds its future there while it waits. Waking a task, from any thread, puts its id
+//! on the runtime's ready queue and breaks the wait of the thread driving the runtime, which is
+//! how a thread waiting with nothing to do learns that it has a task to poll. The waker holds the
+//! id rather than the task's future: a waker has to be `Send` and `Sync`, and the future need be
+//! neither. A wake for a task that is already queued does nothing, so a task woken three times is
+//! polled once; the task is marked unqueued right before it is polled, so a wake that arrives
+//! during the poll queues it again. An id whose task has gone by the time it comes up is skipped.
 //!
-//! [`Inner::spawn`] hands back a handle that resolves to what the task produced. Dropping
-//! the handle cancels the task: the future is dropped there and then if nobody is polling it,
-//! and by the poll under way otherwise. A task whose outcome is of no further interest is
-//! detached instead, and runs until it ends.
+//! The waker is made once, as the task is spawned, and waits in the slot beside the future, both
+//! taken out for a poll and put back after it. On a shared runtime it points at what the task and
+//! its handle share, which is `Send` and `Sync` there, rather than at an allocation of its own: a
+//! spawn that allocates twice rather than three times is most of what spawning costs.
+//!
+//! [`spawn`] hands back a handle that resolves to what the task produced. The task's future is
+//! wrapped before it is stored, and the wrapper is what hands the outcome over: the future's
+//! output, or an error where it panicked, or — through a guard it holds, as it is dropped
+//! unfinished — an error where the runtime went away with it. Dropping the handle cancels the
+//! task: the future is dropped there and then if nobody is polling it, and by the poll under way
+//! otherwise. A task whose outcome is of no further interest is detached instead, and runs until
+//! it ends.
 //!
 //! A task that panics takes nothing with it. The panic is caught where the task is polled, the
 //! task ends there, its handle reports the failure, and the thread that polled it carries on
 //! with the next task.
 //!
-//! A cell's lock guards both what its task is up to and the waker of whoever is joining it — one
-//! lock for both, so a poll that has just returned settles both from a single consistent view of
-//! the wake, the cancellation and the join that may have arrived while it ran. That lock is
-//! always taken before the scheduler's own, never the other way round, and neither is held while
-//! a future is polled or dropped, nor while a waker of either kind is woken, because all three
-//! run code that may spawn a task, cancel one or wake another on this very scheduler — the
-//! destructor of a future is where its last piece of work is handed off — and that code takes
-//! the locks that would be held.
+//! No lock is held while a future is polled or dropped, nor while a waker is woken or dropped,
+//! because all of these run code that may spawn a task, cancel one or wake another on this very
+//! scheduler — the destructor of a future is where its last piece of work is handed off — and
+//! that code takes the locks that would be held. On a local runtime the locks are `RefCell`s, and
+//! the same rule is what keeps a borrow from ever finding another one out. The table of tasks and
+//! the outcome a handle waits on each have a lock of their own, and neither is ever taken while
+//! the other is held.
 
 use std::{
-    any::Any,
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
+    borrow::{Borrow, Cow},
+    collections::HashMap,
     fmt,
-    future::Future,
+    future::{Future, poll_fn},
     hash::{BuildHasherDefault, Hasher},
     io, mem,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    pin::{Pin, pin},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Wake, Waker},
+    thread,
 };
 
-use crate::log::error;
+use crate::{
+    Local, Mode, Shared,
+    log::error,
+    mode::sealed::Lock,
+    runtime::{Core, Remote},
+};
 
-use super::Inner;
-
-/// The tasks of one runtime: what has been spawned on it, and what is ready to be polled.
-pub(super) struct Scheduler {
-    state: Mutex<State>,
-    /// Called, from any thread, whenever the thread running the runtime has something new to
-    /// look at.
-    notify: Box<dyn Fn() + Send + Sync>,
+/// The tasks of one runtime: what has been spawned on it and has not ended yet.
+pub(crate) struct Scheduler<M>
+where
+    M: Mode,
+{
+    tasks: M::Lock<Tasks<M>>,
+    /// Where the ids of the tasks ready to be polled are queued.
+    remote: Arc<Remote>,
 }
 
-impl Scheduler {
-    /// An empty scheduler, which calls `notify` whenever a task becomes ready to be polled.
-    pub(super) fn new(notify: impl Fn() + Send + Sync + 'static) -> Self {
+impl<M> Scheduler<M>
+where
+    M: Mode,
+{
+    /// An empty scheduler, which queues its tasks on `remote`.
+    pub(crate) fn new(remote: Arc<Remote>) -> Self {
         Self {
-            state: Mutex::new(State {
-                ready: VecDeque::new(),
-                live: HashMap::default(),
+            tasks: Lock::new(Tasks {
+                slots: HashMap::default(),
                 next_id: 0,
             }),
-            notify: Box::new(notify),
+            remote,
+        }
+    }
+
+    /// Polls up to `ids.len()` ready tasks, whose ids are taken off the queue into `ids` under one
+    /// lock rather than one apiece.
+    ///
+    /// An id whose task has gone since it was queued counts as one polled: it took its place in
+    /// the queue, and the batch it was taken in is that much closer to its end.
+    ///
+    /// The ids taken are this call's alone until it has polled them: a task among them that is
+    /// woken meanwhile is still marked queued, and the poll it comes up for sees what the wake was
+    /// for, while one cancelled meanwhile is skipped as it comes up. Nobody misses them in the
+    /// queue: the thread driving the runtime looks at it between batches, not during one, and
+    /// whether a runtime has work left counts the tasks that are alive as well as the ids that
+    /// are queued.
+    pub(crate) fn run_batch(&self, ids: &mut [u64]) {
+        let mut budget = ids.len();
+        // Taken again once those in hand are polled, so that a task those polls woke runs in this
+        // batch, as it would where ids were taken one at a time, rather than after a wait.
+        while budget > 0 {
+            let taken = self.remote.take_ready(&mut ids[..budget]);
+            if taken == 0 {
+                break;
+            }
+            budget -= taken;
+            let mut left = Requeue {
+                remote: &self.remote,
+                ids: &ids[..taken],
+            };
+            while let Some((&id, rest)) = left.ids.split_first() {
+                left.ids = rest;
+                self.run(id);
+            }
         }
     }
 
     /// Polls one ready task. `false` when the queue was empty.
-    pub(super) fn run_one(&self) -> bool {
-        let Some(cell) = lock(&self.state).ready.pop_front() else {
+    #[cfg(test)]
+    pub(crate) fn run_one(&self) -> bool {
+        let Some(id) = self.remote.next_ready() else {
             return false;
         };
-        cell.run(self);
+        self.run(id);
 
         true
     }
 
-    /// Whether a task is waiting to be polled.
-    pub(super) fn has_ready(&self) -> bool {
-        !lock(&self.state).ready.is_empty()
+    /// Polls the task `id`, taken off the ready queue, unless it is gone.
+    fn run(&self, id: u64) {
+        let taken = {
+            let mut tasks = self.tasks.lock();
+            tasks.slots.get_mut(&id).and_then(|slot| {
+                match mem::replace(slot, Slot::Running { cancelled: false }) {
+                    Slot::Idle { future, waker } => Some((future, waker)),
+                    // Nothing to poll: the future is already out of its slot. Only a poll takes
+                    // it out, and nothing polls from inside a poll, but an entry like that is
+                    // put back rather than trusted to be impossible.
+                    running => {
+                        *slot = running;
+
+                        None
+                    }
+                }
+            })
+        };
+        // A task that is gone — finished, or cancelled while it waited — leaves its id behind in
+        // the queue.
+        let Some((mut future, waker)) = taken else {
+            return;
+        };
+
+        // The queue entry this was taken off is spent by the wrapper's poll, which marks the task
+        // unqueued before it polls the task's own future (see [`task`]). The wrapper catches the
+        // panics of the task's own future, so what is caught here is what lies outside that: the
+        // wake of whoever joins the task, say.
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut future).poll(&mut Context::from_waker(&waker))
+        }));
+        let ended = match polled {
+            Ok(Poll::Ready(())) => true,
+            Ok(Poll::Pending) => false,
+            Err(payload) => {
+                error!("A task panicked outside its own future");
+                // Nothing carries the panic any further, so its payload ends here. The payload's
+                // destructor is the task's code as much as the future is, and is contained the
+                // same way.
+                dispose(payload);
+
+                true
+            }
+        };
+
+        // A future that is finished with is taken out of its slot here and dropped below, with
+        // no lock held, and its waker with it.
+        let finished = {
+            let mut tasks = self.tasks.lock();
+            let Some(slot) = tasks.slots.get_mut(&id) else {
+                unreachable!("a task being polled keeps its slot");
+            };
+            let Slot::Running { cancelled } = *slot else {
+                unreachable!("only this call takes a slot out of `Running`");
+            };
+            if ended || cancelled {
+                tasks.slots.remove(&id);
+
+                Some((future, waker))
+            } else {
+                *slot = Slot::Idle { future, waker };
+
+                None
+            }
+        };
+        if let Some((future, waker)) = finished {
+            // A destructor is free to panic and free to spawn, so it runs here: caught, and clear
+            // of every lock a spawn of its own would take. The waker may be the last hold on what
+            // the task and its handle share, and so on the output of a detached task.
+            dispose(future);
+            dispose(waker);
+        }
     }
 
     /// How many spawned futures have neither finished nor been cancelled.
-    pub(super) fn live_tasks(&self) -> usize {
-        lock(&self.state).live.len()
+    #[cfg(any(test, feature = "helper"))]
+    pub(crate) fn live_tasks(&self) -> usize {
+        self.tasks.lock().slots.len()
     }
-}
 
-impl Inner {
-    /// Queues `future` and hands back the handle that joins or cancels it.
-    ///
-    /// `name` says what the task is there for. It is for diagnostics alone: the message a
-    /// panicking task logs, and the handle's [`Debug`](fmt::Debug).
-    pub(super) fn spawn<T>(
-        self: &Arc<Self>,
-        name: impl Into<Cow<'static, str>>,
-        future: impl Future<Output = T> + Send + 'static,
-    ) -> JoinHandle<T>
-    where
-        T: Send + 'static,
-    {
-        let cell = {
-            let mut state = lock(&self.scheduler.state);
-            let id = state.next_id;
-            state.next_id += 1;
-            let cell = Arc::new(TaskCell {
-                id,
-                name: name.into(),
-                runtime: Arc::downgrade(self),
-                guarded: Mutex::new(Guarded {
-                    state: CellState::Idle {
-                        future: Box::pin(future),
-                        queued: true,
-                    },
-                    join_waker: None,
-                }),
-            });
-            // Queued directly here, under the same lock that registers the cell in `live`,
-            // rather than through a wake: the cell is reachable by nobody else yet, so it is
-            // safe to know without asking that it is idle and not already queued.
-            state.live.insert(id, cell.clone());
-            state.ready.push_back(cell.clone());
-
-            cell
-        };
-        (self.scheduler.notify)();
-
-        JoinHandle {
-            cell,
-            detached: false,
+    /// The waker of the task `id`, which is waiting to be polled.
+    #[cfg(test)]
+    pub(crate) fn waker(&self, id: u64) -> Waker {
+        match &self.tasks.lock().slots[&id] {
+            Slot::Idle { waker, .. } => waker.clone(),
+            Slot::Running { .. } => unreachable!("the task is not being polled"),
         }
     }
 }
 
-impl Drop for Scheduler {
+impl<M> Drop for Scheduler<M>
+where
+    M: Mode,
+{
     fn drop(&mut self) {
-        // A cell outlives the scheduler wherever something holds a waker of it, so every future
-        // is taken out here rather than left to go with the last of those wakers.
-        let cells: Vec<Arc<dyn Runnable>> = {
-            let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-            state
-                .ready
-                .drain(..)
-                .chain(state.live.drain().map(|(_, cell)| cell))
-                .collect()
-        };
-        // Every cell is closed — its handle failed, unless it already had output waiting — before
-        // any future is disposed of, with no lock held: a destructor that spawns or joins reaches
-        // a scheduler whose every cell already has its final word.
-        let futures: Vec<Box<dyn Any + Send>> =
-            cells.iter().filter_map(|cell| cell.close()).collect();
-        for future in futures {
-            dispose(future);
+        // Nothing can reach the scheduler any more, so its table is emptied without a lock, and
+        // each future is dropped with no borrow of it out. Dropping a future unfinished is what
+        // fails its handle: the guard the task's wrapper holds sees to it as it goes.
+        let slots: Vec<Slot<M>> = self
+            .tasks
+            .get_mut()
+            .slots
+            .drain()
+            .map(|(_, slot)| slot)
+            .collect();
+        for slot in slots {
+            dispose(slot);
         }
     }
+}
+
+/// Queues `future` on the local runtime `core`, as a task named `name`, and hands back the handle
+/// that joins or cancels it.
+pub(crate) fn spawn_local<F>(
+    core: &Rc<Core<Local>>,
+    name: Cow<'static, str>,
+    future: F,
+) -> JoinHandle<F::Output, Local>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    spawn(core, move |task_waker| {
+        let (join, wrapper) = task::<Local, _>(name, task_waker, future);
+        let waker = Waker::from(join.waker.clone());
+        let wrapper: Pin<Box<dyn Future<Output = ()>>> = Box::pin(wrapper);
+
+        (join, waker, wrapper)
+    })
+}
+
+/// Queues `future` on the shared runtime `core`, as a task named `name`, and hands back the
+/// handle that joins or cancels it.
+pub(crate) fn spawn_shared<F>(
+    core: &Arc<Core<Shared>>,
+    name: Cow<'static, str>,
+    future: F,
+) -> JoinHandle<F::Output, Shared>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn(core, move |task_waker| {
+        let (join, wrapper) = task::<Shared, _>(name, task_waker, future);
+        // What the task and its handle share is what its waker points at, so that one allocation
+        // serves both.
+        let waker = Waker::from(join.clone());
+        let wrapper: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(wrapper);
+
+        (join, waker, wrapper)
+    })
+}
+
+/// Queues the task `make` builds on `core`, and hands back the handle that joins or cancels it.
+///
+/// `make` is handed the state of the task's waker, id and all, and makes of it what the task and
+/// its handle share, the task's waker, and its future, wrapped by [`task`] and boxed as the
+/// runtime's flavour takes it.
+fn spawn<M, T>(
+    core: &M::Ptr<Core<M>>,
+    make: impl FnOnce(TaskWaker) -> (M::Ptr<Join<M, T>>, Waker, M::BoxFuture),
+) -> JoinHandle<T, M>
+where
+    M: Mode,
+{
+    let (id, join) = {
+        let mut tasks = core.scheduler.tasks.lock();
+        let id = tasks.next_id;
+        tasks.next_id += 1;
+        // Made under the lock, which the id is minted under, rather than after a second one:
+        // nothing of the caller's runs here, only the move of its future into place.
+        let (join, waker, future) = make(TaskWaker {
+            id,
+            // Queued directly below rather than through a wake: the task is reachable by nobody
+            // else yet, so it is safe to know without asking that it is not already queued.
+            queued: AtomicBool::new(true),
+            remote: core.remote.clone(),
+        });
+        tasks.slots.insert(id, Slot::Idle { future, waker });
+
+        (id, join)
+    };
+    core.remote.schedule(id);
+
+    JoinHandle {
+        id,
+        core: M::downgrade(core),
+        join,
+        detached: false,
+    }
+}
+
+/// The ids a batch has taken off the ready queue and not polled yet, put back at its head should
+/// the batch unwind: a poll contains every panic of the task it polls, but a task whose id went
+/// missing would never be polled again, so none is left to that.
+struct Requeue<'a> {
+    remote: &'a Remote,
+    ids: &'a [u64],
+}
+
+impl Drop for Requeue<'_> {
+    fn drop(&mut self) {
+        if !self.ids.is_empty() {
+            self.remote.requeue(self.ids);
+        }
+    }
+}
+
+/// Wraps `future` as a task named `name`, whose waker is `task_waker`: the future to store, and
+/// what its handle and it share.
+///
+/// The wrapper marks the task unqueued before each poll of `future`, polls it with its panics
+/// caught, drops it once it is done with, and hands its outcome over to the handle: the output,
+/// or an error where it panicked. It holds a guard that hands an error over instead, should the
+/// wrapper itself be dropped unfinished.
+///
+/// The future is left unerased, so that the caller, which knows the concrete type and so whether
+/// it is `Send`, boxes it as its runtime's flavour takes it.
+fn task<M, F>(
+    name: Cow<'static, str>,
+    task_waker: TaskWaker,
+    future: F,
+) -> (
+    M::Ptr<Join<M, F::Output>>,
+    impl Future<Output = ()> + 'static,
+)
+where
+    M: Mode,
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    let join = M::new_ptr(Join {
+        name,
+        waker: task_waker.into(),
+        state: Lock::new(JoinState {
+            output: None,
+            done: false,
+            join_waker: None,
+        }),
+    });
+    let guard = CompleteOnDrop::<M, F::Output>(join.clone());
+    let wrapper = async move {
+        // Moved in first, so that it is dropped last: a task cancelled while it waits drops its
+        // future before the guard hears of it, as a task that ends does.
+        let guard = guard;
+        let mut future = pin!(Some(future));
+        let polled = catch_unwind_polls(guard.0.task_waker(), future.as_mut()).await;
+        // Done with, and dropped here, before the handle hears of the outcome: whoever joins the
+        // task finds whatever the future held already gone. The value is moved out of `polled`
+        // ahead of the drop, so a future whose destructor panics still hands its value back.
+        let dropped = catch_unwind(AssertUnwindSafe(|| future.set(None)));
+        let output = match polled {
+            Ok(value) => Ok(value),
+            Err(payload) => {
+                error!("The task `{}` panicked", guard.0.name);
+                // Nothing carries the panic any further, so its payload ends here. That
+                // payload's destructor is the task's code as much as the future is, and is
+                // contained the same way.
+                dispose(payload);
+
+                Err(io::Error::other("the task panicked"))
+            }
+        };
+        if let Err(payload) = dropped {
+            dispose(payload);
+        }
+
+        guard.complete(output);
+    };
+
+    (join, wrapper)
 }
 
 /// Joins a spawned task, and cancels it when dropped unless [`JoinHandle::detach`] was called.
-pub(super) struct JoinHandle<T> {
-    cell: Arc<TaskCell<T>>,
+pub(crate) struct JoinHandle<T, M>
+where
+    M: Mode,
+{
+    id: u64,
+    /// Weakly, so that a handle nobody polls keeps nothing of a runtime alive but the outcome it
+    /// is waiting on.
+    core: M::Weak<Core<M>>,
+    join: M::Ptr<Join<M, T>>,
     detached: bool,
 }
 
-impl<T> JoinHandle<T> {
+impl<T, M> JoinHandle<T, M>
+where
+    M: Mode,
+{
     /// Lets the task run to completion on its own.
-    pub(super) fn detach(mut self) {
+    ///
+    /// Marks the outcome settled, so that the task drops its output as it hands it over rather
+    /// than leave it with what the task and its handle share: on a shared runtime, the task's
+    /// waker holds that too, and a waker somebody kept would keep the output alive with it.
+    pub(crate) fn detach(mut self) {
         self.detached = true;
+        let (output, join_waker) = {
+            let mut state = self.join.state.lock();
+            state.done = true;
+
+            (state.output.take(), state.join_waker.take())
+        };
+        // Clear of the lock: an output's destructor is the task's code, and a waker's somebody
+        // else's.
+        drop(output);
+        drop(join_waker);
     }
-}
 
-impl<T> Future for JoinHandle<T> {
-    type Output = io::Result<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut guard = lock(&self.cell.guarded);
-        if let CellState::Done { output } = &mut guard.state {
-            if let Some(output) = output.take() {
+    /// The task's outcome, once it has one; a wake of `cx`'s waker once it does, otherwise.
+    pub(crate) fn poll_join(&self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
+        // to run with a lock of this runtime's held.
+        let waker = cx.waker().clone();
+        let replaced = {
+            let mut state = self.join.state.lock();
+            if let Some(output) = state.output.take() {
                 return Poll::Ready(output);
             }
-        }
-        guard.join_waker = Some(cx.waker().clone());
+
+            state.join_waker.replace(waker)
+        };
+        // Clear of the lock, for the same reason.
+        drop(replaced);
 
         Poll::Pending
     }
 }
 
-impl<T> Drop for JoinHandle<T> {
+impl<T, M> Drop for JoinHandle<T, M>
+where
+    M: Mode,
+{
     fn drop(&mut self) {
         if self.detached {
             return;
         }
-        let runtime = self.cell.runtime.upgrade();
-        let scheduler = runtime.as_ref().map(|runtime| &runtime.scheduler);
-        let (future, join_waker) = {
-            let mut guard = lock(&self.cell.guarded);
-            match mem::replace(&mut guard.state, CellState::Done { output: None }) {
-                CellState::Idle { future, .. } => {
-                    if let Some(scheduler) = &scheduler {
-                        lock(&scheduler.state).live.remove(&self.cell.id);
-                    }
+        // Marked done first, so that the guard in the wrapper finds nobody left to tell when the
+        // future goes, here or after the poll under way.
+        let join_waker = {
+            let mut state = self.join.state.lock();
+            // Finished, or failed as its runtime went: nothing to take back. An output nobody
+            // collected is let go of here all the same, on the thread that let the handle go,
+            // rather than left to whoever drops the last clone of the task's waker, which on a
+            // shared runtime holds the output alongside it.
+            if state.done {
+                let settled = (state.output.take(), state.join_waker.take());
+                drop(state);
+                // Clear of the lock: an output's destructor is the task's code, and a waker's
+                // somebody else's.
+                drop(settled);
 
-                    (Some(future), guard.join_waker.take())
-                }
-                // Whoever is polling the task drops the future once that poll returns.
-                CellState::Running { woken, .. } => {
-                    guard.state = CellState::Running {
-                        woken,
-                        cancelled: true,
-                    };
-
-                    (None, guard.join_waker.take())
-                }
-                // Finished, or cancelled by an earlier drop: nothing to take back, nobody to
-                // tell.
-                done @ CellState::Done { .. } => {
-                    guard.state = done;
-
-                    return;
-                }
+                return;
             }
+            state.done = true;
+
+            state.join_waker.take()
+        };
+        let Some(core) = M::upgrade(&self.core) else {
+            // The runtime is on its way out, and its future with it.
+            if let Some(waker) = join_waker {
+                waker.wake();
+            }
+
+            return;
+        };
+        let removed = {
+            let mut tasks = core.scheduler.tasks.lock();
+            let running = match tasks.slots.get_mut(&self.id) {
+                // Whoever is polling the task drops the future once that poll returns.
+                Some(Slot::Running { cancelled }) => {
+                    *cancelled = true;
+
+                    true
+                }
+                Some(_) => false,
+                // Gone already: it finished while the handle was marked done above.
+                None => true,
+            };
+
+            (!running).then(|| tasks.slots.remove(&self.id)).flatten()
         };
         // On the thread that let the handle go, with no lock held: a destructor that panics
         // here panics where the handle was dropped, and one that spawns is served as any other
         // caller is.
-        let dropped = future.map(|future| catch_unwind(AssertUnwindSafe(move || drop(future))));
+        let dropped = removed.map(|slot| catch_unwind(AssertUnwindSafe(move || drop(slot))));
         if let Some(waker) = join_waker {
             // Outside the lock: whoever registered it, polling this very handle earlier and
             // getting `Pending`, may be polled to completion right here.
             waker.wake();
         }
-        if let Some(scheduler) = scheduler {
-            // Even where nothing was queued: a thread waiting with this as its last task learns
-            // from it that it can retire.
-            (scheduler.notify)();
-        }
+        // Even where nothing was queued: a thread waiting with this as its last task learns
+        // from it that it has nothing left to wait for, and a helper thread that it can retire.
+        core.remote.notify();
         // Carried on from here, so that the panic is still the caller's to see while the task it
         // belonged to is closed off either way: the notification above is what lets an idle
-        // thread retire, and somebody's destructor panicking is no reason to leave one up.
+        // helper retire, and somebody's destructor panicking is no reason to leave one up.
         if let Some(Err(payload)) = dropped {
             resume_unwind(payload);
         }
     }
 }
 
-impl<T> fmt::Debug for JoinHandle<T> {
+impl<T, M> fmt::Debug for JoinHandle<T, M>
+where
+    M: Mode,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JoinHandle")
-            .field("task", &self.cell.name)
+            .field("task", &self.join.name)
             .field("detached", &self.detached)
             .finish_non_exhaustive()
     }
 }
 
-struct State {
-    ready: VecDeque<Arc<dyn Runnable>>,
-    /// Every cell that holds a future: spawned, and neither finished, cancelled nor panicked.
-    ///
+/// What a task and its handle share: the task's name, its waker's state, and the outcome the
+/// handle waits on.
+pub(crate) struct Join<M, T>
+where
+    M: Mode,
+{
+    /// What the task is there for. It is for diagnostics alone: the message a panicking task
+    /// logs, and the handle's [`Debug`](fmt::Debug).
+    name: Cow<'static, str>,
+    /// Behind an `Arc` of its own on a local runtime, and in place on a shared one, where this is
+    /// what the task's waker points at.
+    waker: M::HeldWaker,
+    state: M::Lock<JoinState<T>>,
+}
+
+impl<M, T> Join<M, T>
+where
+    M: Mode,
+{
+    /// The state of the task's waker.
+    fn task_waker(&self) -> &TaskWaker {
+        self.waker.borrow()
+    }
+}
+
+/// The waker of a task on a shared runtime: what the task and its handle share, which is `Send`
+/// and `Sync` there, so that a spawn allocates no waker of its own.
+///
+/// A waker somebody keeps keeps all of that alive with it, output included where the task has
+/// one and nobody took it; a handle that is detached or dropped settles the outcome, so that the
+/// task drops its output as it hands it over instead.
+impl<T> Wake for Join<Shared, T>
+where
+    T: Send + 'static,
+{
+    fn wake(self: Arc<Self>) {
+        self.waker.wake();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.waker.wake();
+    }
+}
+
+/// The outcome of a task, and the waker of whoever is joining it.
+struct JoinState<T> {
+    /// The task's output, until the handle that joins it takes it.
+    output: Option<io::Result<T>>,
+    /// Whether the task's outcome is settled: an output handed over, or the handle gone and so
+    /// nobody left to hand one to.
+    done: bool,
+    /// Registered by a poll of the [`JoinHandle`] that found no output waiting yet.
+    join_waker: Option<Waker>,
+}
+
+/// Hands the outcome of a task over to its handle: the one it is given, or, where it is dropped
+/// with none given, the error of a task whose runtime went away with it.
+///
+/// Dropped unfinished, a task's wrapper is either cancelled, and its handle gone and marked done
+/// already, or dropped with the runtime it was on, which is what the error says.
+struct CompleteOnDrop<M, T>(M::Ptr<Join<M, T>>)
+where
+    M: Mode;
+
+impl<M, T> CompleteOnDrop<M, T>
+where
+    M: Mode,
+{
+    /// Hands `output` over, unless the handle is gone and has nobody to hand it to.
+    fn complete(&self, output: io::Result<T>) {
+        let (unwanted, join_waker) = {
+            let mut state = self.0.state.lock();
+            if state.done {
+                (Some(output), None)
+            } else {
+                state.done = true;
+                state.output = Some(output);
+
+                (None, state.join_waker.take())
+            }
+        };
+        // Clear of the lock: an output's destructor is the task's code.
+        drop(unwanted);
+        if let Some(waker) = join_waker {
+            // Outside the lock: the handle may be polled to completion on this very thread.
+            waker.wake();
+        }
+    }
+}
+
+impl<M, T> Drop for CompleteOnDrop<M, T>
+where
+    M: Mode,
+{
+    fn drop(&mut self) {
+        let join_waker = {
+            let mut state = self.0.state.lock();
+            if state.done {
+                return;
+            }
+            state.done = true;
+            state.output = Some(Err(io::Error::other("the task's runtime is gone")));
+
+            state.join_waker.take()
+        };
+        if let Some(waker) = join_waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Polls the future in `future` until it is done, with every panic a poll of it raises caught
+/// and handed back in place of its output, marking the task `task_waker` wakes unqueued before
+/// each poll.
+///
+/// The future sits in an `Option` so that the caller can drop it once this is done, in place and
+/// with its own panics caught, before anybody hears of the outcome.
+fn catch_unwind_polls<'a, F>(
+    task_waker: &'a TaskWaker,
+    mut future: Pin<&'a mut Option<F>>,
+) -> impl Future<Output = thread::Result<F::Output>> + 'a
+where
+    F: Future + 'a,
+{
+    poll_fn(move |cx| {
+        // The queue entry this poll was taken off is spent by this: a wake that arrives from here
+        // on, the poll below included, queues the task afresh. A swap rather than a store, so
+        // that the poll sees what the wakes turned away since the entry was queued were for.
+        // Here rather than in the scheduler, which holds the task's waker only as a `Waker`.
+        task_waker.queued.swap(false, Ordering::AcqRel);
+        let Some(future) = future.as_mut().as_pin_mut() else {
+            unreachable!("the future is polled until it is done, and dropped only then");
+        };
+        match catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    })
+}
+
+/// Drops `value` with every panic its destructor raises contained.
+///
+/// A task's panic is contained per task: the destructor of its payload, and of that payload's
+/// own payload should it have one, is part of that same task rather than of whoever polls it.
+fn dispose<T>(value: T) {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) else {
+        return;
+    };
+    // A payload whose own destructor panics is leaked rather than dropped a third time: the
+    // panic is contained either way, and a chain of destructors that each panic with the next
+    // is not one the scheduler should follow to its end.
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        mem::forget(payload);
+    }
+}
+
+/// The tasks spawned on a scheduler that have not ended yet, under their ids.
+struct Tasks<M>
+where
+    M: Mode,
+{
     /// Keyed, rather than a list to scan: a server handing each request a task of its own would
     /// make a scan per completion quadratic under a burst of them.
-    live: HashMap<u64, Arc<dyn Runnable>, BuildHasherDefault<IdHasher>>,
+    slots: HashMap<u64, Slot<M>, BuildHasherDefault<IdHasher>>,
+    /// The id the next task gets. Never handed out twice, so that a stale id in the ready queue
+    /// can only ever name a task that is gone, never a newer one in its place.
     next_id: u64,
 }
 
@@ -287,251 +740,69 @@ impl Hasher for IdHasher {
     }
 }
 
-/// A task, polled without the scheduler knowing what it produces.
-///
-/// The ready queue and the live map hold tasks of every type spawned on the scheduler side by
-/// side, so both reach a task through this rather than through [`TaskCell<T>`] directly.
-trait Runnable: Send + Sync {
-    /// Polls this task, taken off `scheduler`'s ready queue, once.
-    fn run(self: Arc<Self>, scheduler: &Scheduler);
-
-    /// Marks the task done, whatever it was doing, and hands back its future for whoever calls
-    /// this to dispose of.
-    ///
-    /// Used only as the scheduler is dropped: a task already done keeps the output its handle is
-    /// yet to collect, and one that was not is failed instead, having no output left to give.
-    fn close(&self) -> Option<Box<dyn Any + Send>>;
-}
-
-impl<T> Runnable for TaskCell<T>
+/// One task, and what it is up to.
+enum Slot<M>
 where
-    T: Send + 'static,
+    M: Mode,
 {
-    fn run(self: Arc<Self>, scheduler: &Scheduler) {
-        let mut future = {
-            let mut guard = lock(&self.guarded);
-            match mem::replace(
-                &mut guard.state,
-                CellState::Running {
-                    woken: false,
-                    cancelled: false,
-                },
-            ) {
-                // The queue entry popped in `Scheduler::run_one` is spent by this replacement:
-                // `Running` carries no `queued` flag, so a wake that arrives during the poll
-                // queues the cell afresh rather than reusing that entry.
-                CellState::Idle { future, .. } => future,
-                // Nothing to poll: the future is either gone or already out of its cell. A
-                // cancelled cell may still sit in the queue as `Done`, so a stale entry like
-                // that is accepted here rather than treated as a bug.
-                state => {
-                    guard.state = state;
-
-                    return;
-                }
-            }
-        };
-
-        let waker = Waker::from(self.clone());
-        let polled = catch_unwind(AssertUnwindSafe(|| {
-            future.as_mut().poll(&mut Context::from_waker(&waker))
-        }));
-        // The value is moved out of `polled` ahead of the future's drop below, so a future whose
-        // destructor panics still hands its value back.
-        let panicked = polled.is_err();
-        let (value, payload) = match polled {
-            Ok(Poll::Ready(value)) => (Some(value), None),
-            Ok(Poll::Pending) => (None, None),
-            Err(payload) => (None, Some(payload)),
-        };
-        let ready = value.is_some();
-
-        // A future that is finished with is taken out of its cell here and dropped below, with
-        // no lock held.
-        let (finished, join_waker) = {
-            let mut guard = lock(&self.guarded);
-            let CellState::Running { woken, cancelled } = guard.state else {
-                unreachable!("only this call takes a cell out of `Running`");
-            };
-            if ready || panicked || cancelled {
-                let output = if panicked {
-                    Some(Err(io::Error::other("the task panicked")))
-                } else {
-                    value.map(Ok)
-                };
-                guard.state = CellState::Done { output };
-                lock(&scheduler.state).live.remove(&self.id);
-
-                (Some(future), guard.join_waker.take())
-            } else {
-                guard.state = CellState::Idle {
-                    future,
-                    queued: woken,
-                };
-                if woken {
-                    lock(&scheduler.state).ready.push_back(self.clone());
-                }
-
-                (None, None)
-            }
-        };
-
-        if let Some(payload) = payload {
-            error!("The task `{}` panicked", self.name);
-            // Nothing carries the panic any further, so its payload ends here: once the task is
-            // marked done and taken off the live map, so that a payload whose own destructor
-            // panics cannot leave the task behind with nobody to finish it. That destructor is
-            // the task's code as much as the future is, and is contained the same way.
-            dispose(payload);
-        }
-        if let Some(future) = finished {
-            // A destructor is free to panic and free to spawn, so it runs here: caught, and
-            // clear of every lock a spawn of its own would take.
-            dispose(future);
-        }
-        if let Some(waker) = join_waker {
-            // Outside every lock: the handle may be polled to completion on this very thread.
-            waker.wake();
-        }
-    }
-
-    fn close(&self) -> Option<Box<dyn Any + Send>> {
-        let (future, join_waker) = {
-            let mut guard = lock(&self.guarded);
-            match mem::replace(
-                &mut guard.state,
-                CellState::Done {
-                    output: Some(Err(io::Error::other("the task's runtime is gone"))),
-                },
-            ) {
-                CellState::Idle { future, .. } => (Some(future), guard.join_waker.take()),
-                CellState::Running { .. } => (None, guard.join_waker.take()),
-                // Already finished, or cancelled: the output already there, or already given
-                // up, is left exactly as it was.
-                done @ CellState::Done { .. } => {
-                    guard.state = done;
-
-                    return None;
-                }
-            }
-        };
-        if let Some(waker) = join_waker {
-            waker.wake();
-        }
-
-        future.map(|future| Box::new(future) as Box<dyn Any + Send>)
-    }
-}
-
-/// Drops `value` with every panic its destructor raises contained.
-///
-/// A task's panic is contained per task: the destructor of its payload, and of that payload's
-/// own payload should it have one, is part of that same task rather than of whoever polls it.
-fn dispose<T>(value: T) {
-    let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) else {
-        return;
-    };
-    // A payload whose own destructor panics is leaked rather than dropped a third time: the
-    // panic is contained either way, and a chain of destructors that each panic with the next
-    // is not one the scheduler should follow to its end.
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
-        mem::forget(payload);
-    }
-}
-
-impl<T> Wake for TaskCell<T>
-where
-    T: Send + 'static,
-{
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            // The runtime is gone, and with it the queue this cell would go on.
-            return;
-        };
-        let scheduler = &runtime.scheduler;
-        let mut guard = lock(&self.guarded);
-        match &mut guard.state {
-            // The future is out of its cell; the poll it is out for queues the cell again.
-            CellState::Running { woken, .. } => {
-                *woken = true;
-
-                return;
-            }
-            // There is nothing left to poll.
-            CellState::Done { .. } => return,
-            CellState::Idle { queued: true, .. } => return,
-            CellState::Idle { queued, .. } => *queued = true,
-        }
-        lock(&scheduler.state).ready.push_back(self.clone());
-        drop(guard);
-
-        // Clear of both locks: whoever is running the runtime may pick the task up on another
-        // thread the moment it hears of it, and what it does there takes them.
-        (scheduler.notify)();
-    }
-}
-
-/// One task: the cell that holds its future and state, and what the scheduler and its handle
-/// need to know about it beyond that.
-struct TaskCell<T> {
-    id: u64,
-    name: Cow<'static, str>,
-    runtime: Weak<Inner>,
-    /// What the task is up to, and the waker of whoever is joining it, behind the one lock that
-    /// guards both.
-    guarded: Mutex<Guarded<T>>,
-}
-
-/// What a cell is up to, and the waker of whoever is joining it.
-struct Guarded<T> {
-    state: CellState<T>,
-    /// Registered by a poll of the [`JoinHandle`] that found no output waiting yet.
-    join_waker: Option<Waker>,
-}
-
-/// A spawned future, boxed so that a cell can hold one without being generic over its concrete
-/// type.
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
-
-/// What a cell holding a task is up to.
-enum CellState<T> {
-    /// Waiting to be polled, with its future in hand.
-    Idle {
-        /// The task's future.
-        future: BoxFuture<T>,
-        /// Whether the cell sits in the ready queue.
-        queued: bool,
-    },
-    /// Out of its cell, being polled.
+    /// Waiting to be polled, with its future in hand, and its waker, made once as it was spawned:
+    /// both are moved out for a poll and back after it, so a poll clones nothing.
+    Idle { future: M::BoxFuture, waker: Waker },
+    /// Out of its slot, being polled.
     Running {
-        /// Whether a wake arrived while the task was being polled, so it is to be polled again.
-        woken: bool,
         /// Whether the handle was dropped while the task was being polled, so the future is to
         /// be dropped once that poll returns.
         cancelled: bool,
     },
-    /// Gone: the task finished, was cancelled or panicked.
-    Done {
-        /// The task's output, until the handle that joins it takes it. `None` once taken, or if
-        /// the task was cancelled and so never had one to give.
-        output: Option<io::Result<T>>,
-    },
 }
 
-/// The value behind a lock, taken whether or not a panic poisoned it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+/// The state of one task's waker: its id, and the queue it goes on when woken.
+///
+/// Holds nothing of the task's future, which may not leave the thread its runtime is on, so that
+/// it can be woken from any thread whatever the runtime's flavour.
+///
+/// Public in name only, in a module nobody outside can reach, because the sealed trait behind
+/// [`Mode`] names it.
+pub struct TaskWaker {
+    id: u64,
+    /// Whether the task's id sits in the ready queue, so that a wake which finds it there leaves
+    /// it at that. Cleared right before the task's own future is polled.
+    queued: AtomicBool,
+    remote: Arc<Remote>,
+}
+
+impl TaskWaker {
+    /// Queues the task, unless it is queued already.
+    fn wake(&self) {
+        // A previous `true` means the task is queued already, and the poll that entry leads to
+        // sees what this wake was for: it acquires this very swap as it clears the flag.
+        if self.queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.remote.schedule(self.id);
+    }
+}
+
+/// The waker of a task on a local runtime, whose shared state is not `Sync` and so cannot be
+/// what the waker points at.
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        TaskWaker::wake(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        TaskWaker::wake(self);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
         sync::atomic::{AtomicBool, Ordering},
         thread,
+        time::Duration,
     };
 
     use event_listener::Event;
@@ -539,23 +810,24 @@ mod tests {
     use ntest::timeout;
 
     use super::*;
+    use crate::{LocalRuntime, Task};
 
     #[test]
     #[timeout(15000)]
     fn a_spawned_task_runs_and_hands_its_output_back() {
-        let (runtime, _) = runtime();
+        let runtime = runtime();
         let handle = runtime.spawn("an answer", async { 42 });
 
-        drive(&runtime.scheduler);
+        drive(&runtime);
 
         assert_eq!(block_on(handle).unwrap(), 42);
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 0);
     }
 
     #[test]
     #[timeout(15000)]
-    fn a_wake_from_another_thread_notifies_the_worker() {
-        let (runtime, notifications) = runtime();
+    fn a_wake_from_another_thread_notifies_the_driver() {
+        let runtime = runtime();
         let event = Arc::new(Event::new());
         let handle = {
             let event = event.clone();
@@ -566,9 +838,9 @@ mod tests {
         };
 
         // Polled here, so that it is waiting for the event rather than for its first poll.
-        drive(&runtime.scheduler);
-        assert!(!runtime.scheduler.has_ready());
-        let before = *lock(&notifications);
+        drive(&runtime);
+        assert!(!runtime.core.remote.has_ready());
+        take_wake_up(&runtime);
 
         thread::spawn(move || {
             event.notify(1);
@@ -576,9 +848,9 @@ mod tests {
         .join()
         .unwrap();
 
-        assert_eq!(*lock(&notifications), before + 1);
-        assert!(runtime.scheduler.has_ready());
-        drive(&runtime.scheduler);
+        assert!(runtime.core.remote.wake_pending());
+        assert!(runtime.core.remote.has_ready());
+        drive(&runtime);
         assert_eq!(block_on(handle).unwrap(), "woken");
     }
 
@@ -601,20 +873,51 @@ mod tests {
             }
         }
 
-        let (runtime, _) = runtime();
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
         let handle = runtime.spawn("a self-waking task", WakeOnce(false));
 
-        assert!(runtime.scheduler.run_one());
-        assert!(runtime.scheduler.has_ready());
-        assert!(runtime.scheduler.run_one());
-        assert!(!runtime.scheduler.run_one());
+        assert!(scheduler.run_one());
+        assert!(runtime.core.remote.has_ready());
+        assert!(scheduler.run_one());
+        assert!(!scheduler.run_one());
         assert!(block_on(handle).is_ok());
+    }
+
+    /// A task that a poll of a batch woke runs again in that batch, budget permitting, rather
+    /// than after the wait on the reactor that follows it.
+    #[test]
+    #[timeout(15000)]
+    fn a_task_woken_during_a_batch_runs_again_in_it() {
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
+        let handle = runtime.spawn("a task that yields once", async {
+            yield_now().await;
+            5
+        });
+
+        // A budget of one poll leaves the task queued again once that poll woke it.
+        scheduler.run_batch(&mut [0; 1]);
+        assert_eq!(runtime.core.remote.ready_len(), 1);
+        scheduler.run_batch(&mut [0; 1]);
+        assert_eq!(scheduler.live_tasks(), 0);
+
+        let handle_2 = runtime.spawn("another task that yields once", async {
+            yield_now().await;
+            6
+        });
+        scheduler.run_batch(&mut [0; 2]);
+
+        assert_eq!(scheduler.live_tasks(), 0);
+        assert!(!runtime.core.remote.has_ready());
+        assert_eq!(block_on(handle).unwrap(), 5);
+        assert_eq!(block_on(handle_2).unwrap(), 6);
     }
 
     #[test]
     #[timeout(15000)]
     fn dropping_the_handle_cancels_and_drops_the_future() {
-        let (runtime, _) = runtime();
+        let runtime = runtime();
         let dropped = Arc::new(AtomicBool::new(false));
         let handle = {
             let marker = SetOnDrop(dropped.clone());
@@ -625,33 +928,58 @@ mod tests {
         };
 
         // Polled here, so that the cancellation finds it idle rather than merely queued.
-        drive(&runtime.scheduler);
+        drive(&runtime);
         assert!(!dropped.load(Ordering::Acquire));
 
         drop(handle);
 
         assert!(dropped.load(Ordering::Acquire));
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 0);
+    }
+
+    /// A task cancelled while it waits in the queue leaves its id behind, which is skipped.
+    ///
+    /// The id counts as one polled, so that a batch taking it moves on, and nothing is polled for
+    /// it: the task it named is gone, and ids are never handed out again, so no newer task can
+    /// have taken its place.
+    #[test]
+    #[timeout(15000)]
+    fn a_task_cancelled_while_queued_leaves_an_id_that_is_skipped() {
+        let runtime = runtime();
+        let polled = Rc::new(Cell::new(false));
+        let handle = {
+            let polled = polled.clone();
+            runtime.spawn("a task that is never polled", async move {
+                polled.set(true);
+            })
+        };
+
+        drop(handle);
+
+        assert_eq!(runtime.core.remote.ready_len(), 1);
+        assert!(runtime.core.scheduler.run_one());
+        assert!(!runtime.core.scheduler.run_one());
+        assert!(!polled.get());
     }
 
     #[test]
     #[timeout(15000)]
-    fn cancelling_notifies_the_worker() {
-        let (runtime, notifications) = runtime();
+    fn cancelling_notifies_the_driver() {
+        let runtime = runtime();
         let handle = runtime.spawn("a task that never finishes", std::future::pending::<()>());
 
-        drive(&runtime.scheduler);
-        let before = *lock(&notifications);
+        drive(&runtime);
+        take_wake_up(&runtime);
 
         drop(handle);
 
-        assert_eq!(*lock(&notifications), before + 1);
+        assert!(runtime.core.remote.wake_pending());
     }
 
     #[test]
     #[timeout(15000)]
     fn a_detached_task_runs_to_completion() {
-        let (runtime, _) = runtime();
+        let runtime = runtime();
         let ran = Arc::new(AtomicBool::new(false));
         {
             let ran = ran.clone();
@@ -663,25 +991,25 @@ mod tests {
                 .detach();
         }
 
-        drive(&runtime.scheduler);
+        drive(&runtime);
 
         assert!(ran.load(Ordering::Acquire));
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 0);
     }
 
     #[test]
     #[timeout(15000)]
     fn a_panicking_task_fails_its_handle_and_is_forgotten() {
-        let (runtime, _) = runtime();
+        let runtime = runtime();
         let handle = runtime.spawn("a task that panics", async {
             panic!("the task panicked on purpose");
         });
 
-        drive(&runtime.scheduler);
+        drive(&runtime);
 
         let error = block_on(handle).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 0);
     }
 
     /// A panic whose payload panics as it goes takes its task down with it all the same.
@@ -700,16 +1028,17 @@ mod tests {
             }
         }
 
-        let (runtime, _) = runtime();
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
         let handle = runtime.spawn("a task that panics with a payload of its own", async {
             std::panic::panic_any(PanickingPayload);
         });
 
-        assert!(runtime.scheduler.run_one());
+        assert!(scheduler.run_one());
 
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(scheduler.live_tasks(), 0);
         assert_eq!(block_on(handle).unwrap_err().kind(), io::ErrorKind::Other);
-        assert!(!runtime.scheduler.run_one());
+        assert!(!scheduler.run_one());
     }
 
     /// Cancelling a task from inside its own poll, whose future's drop panics with a payload
@@ -734,18 +1063,19 @@ mod tests {
             }
         }
 
-        let (runtime, _) = runtime();
-        let own_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
+        let own_handle: Rc<RefCell<Option<Task<()>>>> = Rc::new(RefCell::new(None));
         let dropped_from_inside = own_handle.clone();
         let handle = runtime.spawn(
             "a task that cancels itself from within its own poll",
             async move {
                 let _marker = PanicsWithAPayloadWhenDropped;
-                lock(&dropped_from_inside).take();
+                dropped_from_inside.borrow_mut().take();
                 std::future::pending::<()>().await;
             },
         );
-        *lock(&own_handle) = Some(handle);
+        *own_handle.borrow_mut() = Some(handle);
 
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
@@ -753,12 +1083,12 @@ mod tests {
             flag.store(true, Ordering::Release);
         });
 
-        assert!(runtime.scheduler.run_one());
-        assert!(runtime.scheduler.run_one());
+        assert!(scheduler.run_one());
+        assert!(scheduler.run_one());
 
         assert!(ran.load(Ordering::Acquire));
         assert!(block_on(other).is_ok());
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(scheduler.live_tasks(), 0);
     }
 
     /// A panic payload whose own drop panics with a further payload, whose drop panics too, is
@@ -782,18 +1112,19 @@ mod tests {
             }
         }
 
-        let (runtime, _) = runtime();
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
         let handle = runtime.spawn("a task whose panic payload panics twice over", async {
             std::panic::panic_any(Outer);
         });
 
-        assert!(runtime.scheduler.run_one());
+        assert!(scheduler.run_one());
 
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(scheduler.live_tasks(), 0);
         assert_eq!(block_on(handle).unwrap_err().kind(), io::ErrorKind::Other);
 
         let next = runtime.spawn("the task after it", async { 7 });
-        drive(&runtime.scheduler);
+        drive(&runtime);
         assert_eq!(block_on(next).unwrap(), 7);
     }
 
@@ -816,22 +1147,22 @@ mod tests {
             }
         }
 
-        let (runtime, _) = runtime();
+        let runtime = runtime();
         let handle = runtime.spawn("a task that panics as it goes", PanicOnDrop);
 
-        assert!(runtime.scheduler.run_one());
+        assert!(runtime.core.scheduler.run_one());
         assert!(block_on(handle).is_ok());
 
         let next = runtime.spawn("the task after it", async { 7 });
-        drive(&runtime.scheduler);
+        drive(&runtime);
         assert_eq!(block_on(next).unwrap(), 7);
     }
 
     /// A cancellation whose future panics as it goes notifies all the same.
     ///
-    /// The notification is what lets a thread waiting with this as its last task work out that it
-    /// can retire, and a thread left up for the life of the process is too high a price for a
-    /// destructor of somebody else's that panicked.
+    /// The notification is what tells a thread waiting with this as its last task that it has
+    /// nothing left to wait for, and a destructor of somebody else's that panicked is no reason
+    /// to leave that thread waiting.
     #[test]
     #[timeout(15000)]
     fn a_panic_in_a_cancelled_futures_drop_still_notifies() {
@@ -843,7 +1174,7 @@ mod tests {
             }
         }
 
-        let (runtime, notifications) = runtime();
+        let runtime = runtime();
         let handle = {
             let marker = PanicOnDrop;
             runtime.spawn("a task that never finishes", async move {
@@ -853,40 +1184,40 @@ mod tests {
         };
         // Polled here, so that the cancellation finds the future idle and the drop of it is this
         // thread's to make.
-        drive(&runtime.scheduler);
-        let before = *lock(&notifications);
+        drive(&runtime);
+        take_wake_up(&runtime);
 
         let cancelled = catch_unwind(AssertUnwindSafe(|| drop(handle)));
 
         // The panic is the caller's to see, where the handle was let go of.
         assert!(cancelled.is_err());
-        assert_eq!(*lock(&notifications), before + 1);
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert!(runtime.core.remote.wake_pending());
+        assert_eq!(runtime.core.scheduler.live_tasks(), 0);
     }
 
     #[test]
     #[timeout(15000)]
     fn a_ready_task_is_queued_once_however_often_it_is_woken() {
-        let (runtime, notifications) = runtime();
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
         let handle = runtime.spawn("a task that never finishes", std::future::pending::<()>());
-        let waker = Waker::from(handle.cell.clone());
+        let waker = scheduler.waker(handle.0.id);
 
         for _ in 0..3 {
             waker.wake_by_ref();
         }
 
-        assert_eq!(*lock(&notifications), 1);
-        assert!(runtime.scheduler.has_ready());
-        assert!(runtime.scheduler.run_one());
-        assert!(!runtime.scheduler.run_one());
+        assert_eq!(runtime.core.remote.ready_len(), 1);
+        assert!(scheduler.run_one());
+        assert!(!scheduler.run_one());
     }
 
     #[test]
     #[timeout(15000)]
     fn a_cancelled_futures_drop_may_spawn_on_the_scheduler() {
         struct SpawnOnDrop {
-            runtime: Arc<Inner>,
-            ran: Arc<AtomicBool>,
+            runtime: LocalRuntime,
+            ran: Rc<Cell<bool>>,
         }
 
         impl Drop for SpawnOnDrop {
@@ -894,14 +1225,14 @@ mod tests {
                 let ran = self.ran.clone();
                 self.runtime
                     .spawn("a task spawned from a drop", async move {
-                        ran.store(true, Ordering::Release);
+                        ran.set(true);
                     })
                     .detach();
             }
         }
 
-        let (runtime, _) = runtime();
-        let ran = Arc::new(AtomicBool::new(false));
+        let runtime = runtime();
+        let ran = Rc::new(Cell::new(false));
         let handle = {
             let spawner = SpawnOnDrop {
                 runtime: runtime.clone(),
@@ -913,58 +1244,59 @@ mod tests {
             })
         };
 
-        drive(&runtime.scheduler);
+        drive(&runtime);
         drop(handle);
 
-        assert!(!ran.load(Ordering::Acquire));
-        drive(&runtime.scheduler);
-        assert!(ran.load(Ordering::Acquire));
+        assert!(!ran.get());
+        drive(&runtime);
+        assert!(ran.get());
     }
 
     #[test]
     #[timeout(15000)]
     fn live_tasks_counts_unfinished_futures_only() {
-        let (runtime, _) = runtime();
+        let runtime = runtime();
         let done = runtime.spawn("a task that finishes at once", async {});
         let pending = runtime.spawn("a task that never finishes", std::future::pending::<()>());
-        assert_eq!(runtime.scheduler.live_tasks(), 2);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 2);
 
-        drive(&runtime.scheduler);
+        drive(&runtime);
 
-        assert_eq!(runtime.scheduler.live_tasks(), 1);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 1);
         assert!(block_on(done).is_ok());
 
         drop(pending);
 
-        assert_eq!(runtime.scheduler.live_tasks(), 0);
+        assert_eq!(runtime.core.scheduler.live_tasks(), 0);
     }
 
     #[test]
     #[timeout(15000)]
-    fn dropping_the_scheduler_fails_pending_joins() {
-        let (runtime, _) = runtime();
+    fn dropping_the_runtime_fails_pending_joins() {
+        let runtime = runtime();
         let handle = runtime.spawn("a task that never finishes", std::future::pending::<()>());
 
-        drive(&runtime.scheduler);
+        drive(&runtime);
         drop(runtime);
 
         assert!(block_on(handle).is_err());
     }
 
-    /// Polls ready tasks until none is left, the way the thread in the runtime's seat does.
-    fn drive(scheduler: &Scheduler) {
-        while scheduler.run_one() {}
+    /// Polls ready tasks until none is left, the way the thread driving the runtime does.
+    fn drive(runtime: &LocalRuntime) {
+        while runtime.core.scheduler.run_one() {}
     }
 
-    /// A scheduler, and the count of the notifications it has sent.
-    fn runtime() -> (Arc<Inner>, Arc<Mutex<usize>>) {
-        let notifications = Arc::new(Mutex::new(0));
-        let counter = notifications.clone();
+    /// Takes the wake-up the runtime has written, if any, out of its channel, so that the next
+    /// one a test looks for is one written after this.
+    fn take_wake_up(runtime: &LocalRuntime) {
+        runtime.core.reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert!(!runtime.core.remote.wake_pending());
+    }
 
-        (
-            Inner::with_notify(move || *lock(&counter) += 1),
-            notifications,
-        )
+    /// A runtime of the test's own, driven by nobody but the test.
+    fn runtime() -> LocalRuntime {
+        LocalRuntime::new().unwrap()
     }
 
     /// Sets the flag it holds when it is dropped.
