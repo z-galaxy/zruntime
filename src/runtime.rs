@@ -114,11 +114,7 @@ where
 
     /// Polls up to `BATCH` ready tasks.
     pub(crate) fn run_batch(&self) {
-        for _ in 0..BATCH {
-            if !self.scheduler.run_one() {
-                break;
-            }
-        }
+        self.scheduler.run_batch(&mut [0; BATCH]);
     }
 
     /// One wait on the reactor: bounded by no time at all where a task is ready or `at_once`
@@ -197,7 +193,9 @@ const BATCH: usize = 32;
 ///
 /// The poller lives here, both halves of its channel together, rather than with the scheduler and
 /// the reactor: a wake may come after the runtime is gone, and a channel whose read half went with
-/// the runtime would turn the write that wake makes into a broken pipe.
+/// the runtime would turn the write that wake makes into a broken pipe. A waker that outlives the
+/// runtime keeps the channel open for as long as it lives, and so does a task's handle, which
+/// holds the state its task's waker is made from.
 pub(crate) struct Remote {
     /// The ids of the tasks ready to be polled, in the order they became ready.
     ///
@@ -226,7 +224,27 @@ impl Remote {
         self.notify();
     }
 
+    /// Takes up to `ids.len()` of the ids queued, oldest first, into `ids`, and says how many.
+    pub(crate) fn take_ready(&self, ids: &mut [u64]) -> usize {
+        let mut ready = lock(&self.ready);
+        let taken = ready.len().min(ids.len());
+        for (slot, id) in ids.iter_mut().zip(ready.drain(..taken)) {
+            *slot = id;
+        }
+
+        taken
+    }
+
+    /// Puts `ids`, taken off the queue and not polled, back at its head, in the order given.
+    pub(crate) fn requeue(&self, ids: &[u64]) {
+        let mut ready = lock(&self.ready);
+        for &id in ids.iter().rev() {
+            ready.push_front(id);
+        }
+    }
+
     /// The id of the next task to poll, if any is ready.
+    #[cfg(test)]
     pub(crate) fn next_ready(&self) -> Option<u64> {
         lock(&self.ready).pop_front()
     }
@@ -249,7 +267,7 @@ impl Remote {
     /// unwritten: a burst of spawns, or a task cancelled alongside them, costs one write between
     /// two waits rather than one apiece.
     pub(crate) fn notify(&self) {
-        if DRIVING.with(Cell::get) == Some(NonNull::from(self)) {
+        if drives(self) {
             return;
         }
         // A previous `true` means a wake-up is on its way already, so this call is turned away
@@ -379,6 +397,11 @@ impl Wake for Signal {
 /// thread drives, whichever of the two made it.
 pub(crate) fn set_driving(remote: Option<&Remote>) {
     DRIVING.with(|driving| driving.set(remote.map(NonNull::from)));
+}
+
+/// Whether the calling thread drives the runtime `remote` belongs to.
+pub(crate) fn drives(remote: &Remote) -> bool {
+    DRIVING.with(Cell::get) == Some(NonNull::from(remote))
 }
 
 /// Whether the calling thread drives a runtime, so that a `block_on` there, which could only wait

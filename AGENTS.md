@@ -99,7 +99,8 @@ the single place that names which: everything else in `scheduler.rs`, `reactor.r
 `Send + Sync` even for a `Local` task, whose future is not, so a task's waker never holds the
 future — it holds an id into the scheduler's task map plus an `Arc<Remote>` (an atomic-backed
 ready queue and the poller's notify half). This is the one place a `Local` runtime pays for
-atomics; everywhere else it is a plain `Rc`/`RefCell`/`Cell` structure.
+atomics; everywhere else it is a plain `Rc`/`RefCell`/`Cell` structure. On a `Shared` runtime the
+waker lives inside the task's join state instead, saving an allocation per task.
 
 **Single-threaded, seat-based driving (the `helper` feature)**: on top of `Runtime<Shared>`,
 `driver.rs` gives a runtime made through the per-thread registries (`SharedRuntime::current()`,

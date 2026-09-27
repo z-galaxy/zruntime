@@ -1,17 +1,22 @@
 //! The tasks of one runtime, and the polling of those that are ready.
 //!
-//! A scheduler holds every task spawned on it and hands them out one at a time to be polled, on
-//! whichever thread calls [`Scheduler::run_one`]. It has no thread of its own: the thread driving
-//! the runtime calls that method for as long as there is anything to run.
+//! A scheduler holds every task spawned on it and hands them out a batch at a time to be polled,
+//! on whichever thread calls [`Scheduler::run_batch`]. It has no thread of its own: the thread
+//! driving the runtime calls that method for as long as there is anything to run.
 //!
 //! Every task lives in a slot of the scheduler's own, under an id that is never handed out
 //! again, and holds its future there while it waits. Waking a task, from any thread, puts its id
 //! on the runtime's ready queue and breaks the wait of the thread driving the runtime, which is
 //! how a thread waiting with nothing to do learns that it has a task to poll. The waker holds the
-//! id rather than the task: a waker has to be `Send` and `Sync`, and the task's future need be
+//! id rather than the task's future: a waker has to be `Send` and `Sync`, and the future need be
 //! neither. A wake for a task that is already queued does nothing, so a task woken three times is
 //! polled once; the task is marked unqueued right before it is polled, so a wake that arrives
 //! during the poll queues it again. An id whose task has gone by the time it comes up is skipped.
+//!
+//! The waker is made once, as the task is spawned, and waits in the slot beside the future, both
+//! taken out for a poll and put back after it. On a shared runtime it points at what the task and
+//! its handle share, which is `Send` and `Sync` there, rather than at an allocation of its own: a
+//! spawn that allocates twice rather than three times is most of what spawning costs.
 //!
 //! [`spawn`] hands back a handle that resolves to what the task produced. The task's future is
 //! wrapped before it is stored, and the wrapper is what hands the outcome over: the future's
@@ -34,7 +39,7 @@
 //! the other is held.
 
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     collections::HashMap,
     fmt,
     future::{Future, poll_fn},
@@ -42,6 +47,7 @@ use std::{
     io, mem,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::{Pin, pin},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -51,7 +57,7 @@ use std::{
 };
 
 use crate::{
-    Mode,
+    Local, Mode, Shared,
     log::error,
     mode::sealed::Lock,
     runtime::{Core, Remote},
@@ -82,24 +88,62 @@ where
         }
     }
 
-    /// Polls one ready task. `false` when the queue was empty.
+    /// Polls up to `ids.len()` ready tasks, whose ids are taken off the queue into `ids` under one
+    /// lock rather than one apiece.
     ///
     /// An id whose task has gone since it was queued counts as one polled: it took its place in
     /// the queue, and the batch it was taken in is that much closer to its end.
+    ///
+    /// The ids taken are this call's alone until it has polled them: a task among them that is
+    /// woken meanwhile is still marked queued, and the poll it comes up for sees what the wake was
+    /// for, while one cancelled meanwhile is skipped as it comes up. Nobody misses them in the
+    /// queue: the thread driving the runtime looks at it between batches, not during one, and
+    /// whether a runtime has work left counts the tasks that are alive as well as the ids that
+    /// are queued.
+    pub(crate) fn run_batch(&self, ids: &mut [u64]) {
+        let mut budget = ids.len();
+        // Taken again once those in hand are polled, so that a task those polls woke runs in this
+        // batch, as it would where ids were taken one at a time, rather than after a wait.
+        while budget > 0 {
+            let taken = self.remote.take_ready(&mut ids[..budget]);
+            if taken == 0 {
+                break;
+            }
+            budget -= taken;
+            let mut left = Requeue {
+                remote: &self.remote,
+                ids: &ids[..taken],
+            };
+            while let Some((&id, rest)) = left.ids.split_first() {
+                left.ids = rest;
+                self.run(id);
+            }
+        }
+    }
+
+    /// Polls one ready task. `false` when the queue was empty.
+    #[cfg(test)]
     pub(crate) fn run_one(&self) -> bool {
         let Some(id) = self.remote.next_ready() else {
             return false;
         };
+        self.run(id);
+
+        true
+    }
+
+    /// Polls the task `id`, taken off the ready queue, unless it is gone.
+    fn run(&self, id: u64) {
         let taken = {
             let mut tasks = self.tasks.lock();
             tasks.slots.get_mut(&id).and_then(|slot| {
-                match mem::replace(&mut slot.state, SlotState::Running { cancelled: false }) {
-                    SlotState::Idle(future) => Some((future, slot.waker.clone())),
+                match mem::replace(slot, Slot::Running { cancelled: false }) {
+                    Slot::Idle { future, waker } => Some((future, waker)),
                     // Nothing to poll: the future is already out of its slot. Only a poll takes
                     // it out, and nothing polls from inside a poll, but an entry like that is
                     // put back rather than trusted to be impossible.
                     running => {
-                        slot.state = running;
+                        *slot = running;
 
                         None
                     }
@@ -108,17 +152,14 @@ where
         };
         // A task that is gone — finished, or cancelled while it waited — leaves its id behind in
         // the queue.
-        let Some((mut future, task_waker)) = taken else {
-            return true;
+        let Some((mut future, waker)) = taken else {
+            return;
         };
 
-        // The queue entry popped above is spent by this: a wake that arrives from here on, the
-        // poll below included, queues the task afresh. A swap rather than a store, so that the
-        // poll sees what the wakes turned away since the entry was queued were for.
-        task_waker.queued.swap(false, Ordering::AcqRel);
-        let waker = Waker::from(task_waker);
-        // The wrapper catches the panics of the task's own future, so what is caught here is what
-        // lies outside that: the wake of whoever joins the task, say.
+        // The queue entry this was taken off is spent by the wrapper's poll, which marks the task
+        // unqueued before it polls the task's own future (see [`task`]). The wrapper catches the
+        // panics of the task's own future, so what is caught here is what lies outside that: the
+        // wake of whoever joins the task, say.
         let polled = catch_unwind(AssertUnwindSafe(|| {
             Pin::new(&mut future).poll(&mut Context::from_waker(&waker))
         }));
@@ -137,31 +178,32 @@ where
         };
 
         // A future that is finished with is taken out of its slot here and dropped below, with
-        // no lock held.
+        // no lock held, and its waker with it.
         let finished = {
             let mut tasks = self.tasks.lock();
             let Some(slot) = tasks.slots.get_mut(&id) else {
                 unreachable!("a task being polled keeps its slot");
             };
-            let SlotState::Running { cancelled } = slot.state else {
+            let Slot::Running { cancelled } = *slot else {
                 unreachable!("only this call takes a slot out of `Running`");
             };
             if ended || cancelled {
-                tasks.slots.remove(&id).map(|slot| (slot, future))
+                tasks.slots.remove(&id);
+
+                Some((future, waker))
             } else {
-                slot.state = SlotState::Idle(future);
+                *slot = Slot::Idle { future, waker };
 
                 None
             }
         };
-        if let Some((slot, future)) = finished {
+        if let Some((future, waker)) = finished {
             // A destructor is free to panic and free to spawn, so it runs here: caught, and clear
-            // of every lock a spawn of its own would take.
+            // of every lock a spawn of its own would take. The waker may be the last hold on what
+            // the task and its handle share, and so on the output of a detached task.
             dispose(future);
-            drop(slot);
+            dispose(waker);
         }
-
-        true
     }
 
     /// How many spawned futures have neither finished nor been cancelled.
@@ -170,10 +212,13 @@ where
         self.tasks.lock().slots.len()
     }
 
-    /// The waker of the task `id`.
+    /// The waker of the task `id`, which is waiting to be polled.
     #[cfg(test)]
     pub(crate) fn waker(&self, id: u64) -> Waker {
-        Waker::from(self.tasks.lock().slots[&id].waker.clone())
+        match &self.tasks.lock().slots[&id] {
+            Slot::Idle { waker, .. } => waker.clone(),
+            Slot::Running { .. } => unreachable!("the task is not being polled"),
+        }
     }
 }
 
@@ -198,16 +243,116 @@ where
     }
 }
 
-/// Wraps `future` as a task named `name`: the future to store, and what its handle and it share.
+/// Queues `future` on the local runtime `core`, as a task named `name`, and hands back the handle
+/// that joins or cancels it.
+pub(crate) fn spawn_local<F>(
+    core: &Rc<Core<Local>>,
+    name: Cow<'static, str>,
+    future: F,
+) -> JoinHandle<F::Output, Local>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    spawn(core, move |task_waker| {
+        let (join, wrapper) = task::<Local, _>(name, task_waker, future);
+        let waker = Waker::from(join.waker.clone());
+        let wrapper: Pin<Box<dyn Future<Output = ()>>> = Box::pin(wrapper);
+
+        (join, waker, wrapper)
+    })
+}
+
+/// Queues `future` on the shared runtime `core`, as a task named `name`, and hands back the
+/// handle that joins or cancels it.
+pub(crate) fn spawn_shared<F>(
+    core: &Arc<Core<Shared>>,
+    name: Cow<'static, str>,
+    future: F,
+) -> JoinHandle<F::Output, Shared>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn(core, move |task_waker| {
+        let (join, wrapper) = task::<Shared, _>(name, task_waker, future);
+        // What the task and its handle share is what its waker points at, so that one allocation
+        // serves both.
+        let waker = Waker::from(join.clone());
+        let wrapper: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(wrapper);
+
+        (join, waker, wrapper)
+    })
+}
+
+/// Queues the task `make` builds on `core`, and hands back the handle that joins or cancels it.
 ///
-/// The wrapper polls `future` with its panics caught, drops it once it is done with, and hands
-/// its outcome over to the handle: the output, or an error where it panicked. It holds a guard
-/// that hands an error over instead, should the wrapper itself be dropped unfinished.
+/// `make` is handed the state of the task's waker, id and all, and makes of it what the task and
+/// its handle share, the task's waker, and its future, wrapped by [`task`] and boxed as the
+/// runtime's flavour takes it.
+fn spawn<M, T>(
+    core: &M::Ptr<Core<M>>,
+    make: impl FnOnce(TaskWaker) -> (M::Ptr<Join<M, T>>, Waker, M::BoxFuture),
+) -> JoinHandle<T, M>
+where
+    M: Mode,
+{
+    let (id, join) = {
+        let mut tasks = core.scheduler.tasks.lock();
+        let id = tasks.next_id;
+        tasks.next_id += 1;
+        // Made under the lock, which the id is minted under, rather than after a second one:
+        // nothing of the caller's runs here, only the move of its future into place.
+        let (join, waker, future) = make(TaskWaker {
+            id,
+            // Queued directly below rather than through a wake: the task is reachable by nobody
+            // else yet, so it is safe to know without asking that it is not already queued.
+            queued: AtomicBool::new(true),
+            remote: core.remote.clone(),
+        });
+        tasks.slots.insert(id, Slot::Idle { future, waker });
+
+        (id, join)
+    };
+    core.remote.schedule(id);
+
+    JoinHandle {
+        id,
+        core: M::downgrade(core),
+        join,
+        detached: false,
+    }
+}
+
+/// The ids a batch has taken off the ready queue and not polled yet, put back at its head should
+/// the batch unwind: a poll contains every panic of the task it polls, but a task whose id went
+/// missing would never be polled again, so none is left to that.
+struct Requeue<'a> {
+    remote: &'a Remote,
+    ids: &'a [u64],
+}
+
+impl Drop for Requeue<'_> {
+    fn drop(&mut self) {
+        if !self.ids.is_empty() {
+            self.remote.requeue(self.ids);
+        }
+    }
+}
+
+/// Wraps `future` as a task named `name`, whose waker is `task_waker`: the future to store, and
+/// what its handle and it share.
+///
+/// The wrapper marks the task unqueued before each poll of `future`, polls it with its panics
+/// caught, drops it once it is done with, and hands its outcome over to the handle: the output,
+/// or an error where it panicked. It holds a guard that hands an error over instead, should the
+/// wrapper itself be dropped unfinished.
 ///
 /// The future is left unerased, so that the caller, which knows the concrete type and so whether
 /// it is `Send`, boxes it as its runtime's flavour takes it.
-pub(crate) fn task<M, F>(
+fn task<M, F>(
     name: Cow<'static, str>,
+    task_waker: TaskWaker,
     future: F,
 ) -> (
     M::Ptr<Join<M, F::Output>>,
@@ -220,6 +365,7 @@ where
 {
     let join = M::new_ptr(Join {
         name,
+        waker: task_waker.into(),
         state: Lock::new(JoinState {
             output: None,
             done: false,
@@ -232,7 +378,7 @@ where
         // future before the guard hears of it, as a task that ends does.
         let guard = guard;
         let mut future = pin!(Some(future));
-        let polled = catch_unwind_polls(future.as_mut()).await;
+        let polled = catch_unwind_polls(guard.0.task_waker(), future.as_mut()).await;
         // Done with, and dropped here, before the handle hears of the outcome: whoever joins the
         // task finds whatever the future held already gone. The value is moved out of `polled`
         // ahead of the drop, so a future whose destructor panics still hands its value back.
@@ -259,47 +405,6 @@ where
     (join, wrapper)
 }
 
-/// Queues `future`, wrapped by [`task`] around `join`, on `core`, and hands back the handle that
-/// joins or cancels it.
-pub(crate) fn spawn<M, T>(
-    core: &M::Ptr<Core<M>>,
-    join: M::Ptr<Join<M, T>>,
-    future: M::BoxFuture,
-) -> JoinHandle<T, M>
-where
-    M: Mode,
-{
-    let id = {
-        let mut tasks = core.scheduler.tasks.lock();
-        let id = tasks.next_id;
-        tasks.next_id += 1;
-        let waker = Arc::new(TaskWaker {
-            id,
-            // Queued directly below rather than through a wake: the task is reachable by nobody
-            // else yet, so it is safe to know without asking that it is not already queued.
-            queued: AtomicBool::new(true),
-            remote: core.remote.clone(),
-        });
-        tasks.slots.insert(
-            id,
-            Slot {
-                waker,
-                state: SlotState::Idle(future),
-            },
-        );
-
-        id
-    };
-    core.remote.schedule(id);
-
-    JoinHandle {
-        id,
-        core: M::downgrade(core),
-        join,
-        detached: false,
-    }
-}
-
 /// Joins a spawned task, and cancels it when dropped unless [`JoinHandle::detach`] was called.
 pub(crate) struct JoinHandle<T, M>
 where
@@ -318,8 +423,22 @@ where
     M: Mode,
 {
     /// Lets the task run to completion on its own.
+    ///
+    /// Marks the outcome settled, so that the task drops its output as it hands it over rather
+    /// than leave it with what the task and its handle share: on a shared runtime, the task's
+    /// waker holds that too, and a waker somebody kept would keep the output alive with it.
     pub(crate) fn detach(mut self) {
         self.detached = true;
+        let (output, join_waker) = {
+            let mut state = self.join.state.lock();
+            state.done = true;
+
+            (state.output.take(), state.join_waker.take())
+        };
+        // Clear of the lock: an output's destructor is the task's code, and a waker's somebody
+        // else's.
+        drop(output);
+        drop(join_waker);
     }
 
     /// The task's outcome, once it has one; a wake of `cx`'s waker once it does, otherwise.
@@ -354,8 +473,17 @@ where
         // future goes, here or after the poll under way.
         let join_waker = {
             let mut state = self.join.state.lock();
-            // Finished, or failed as its runtime went: nothing to take back.
+            // Finished, or failed as its runtime went: nothing to take back. An output nobody
+            // collected is let go of here all the same, on the thread that let the handle go,
+            // rather than left to whoever drops the last clone of the task's waker, which on a
+            // shared runtime holds the output alongside it.
             if state.done {
+                let settled = (state.output.take(), state.join_waker.take());
+                drop(state);
+                // Clear of the lock: an output's destructor is the task's code, and a waker's
+                // somebody else's.
+                drop(settled);
+
                 return;
             }
             state.done = true;
@@ -374,10 +502,7 @@ where
             let mut tasks = core.scheduler.tasks.lock();
             let running = match tasks.slots.get_mut(&self.id) {
                 // Whoever is polling the task drops the future once that poll returns.
-                Some(Slot {
-                    state: SlotState::Running { cancelled },
-                    ..
-                }) => {
+                Some(Slot::Running { cancelled }) => {
                     *cancelled = true;
 
                     true
@@ -422,7 +547,8 @@ where
     }
 }
 
-/// What a task and its handle share: the task's name, and the outcome the handle waits on.
+/// What a task and its handle share: the task's name, its waker's state, and the outcome the
+/// handle waits on.
 pub(crate) struct Join<M, T>
 where
     M: Mode,
@@ -430,7 +556,39 @@ where
     /// What the task is there for. It is for diagnostics alone: the message a panicking task
     /// logs, and the handle's [`Debug`](fmt::Debug).
     name: Cow<'static, str>,
+    /// Behind an `Arc` of its own on a local runtime, and in place on a shared one, where this is
+    /// what the task's waker points at.
+    waker: M::HeldWaker,
     state: M::Lock<JoinState<T>>,
+}
+
+impl<M, T> Join<M, T>
+where
+    M: Mode,
+{
+    /// The state of the task's waker.
+    fn task_waker(&self) -> &TaskWaker {
+        self.waker.borrow()
+    }
+}
+
+/// The waker of a task on a shared runtime: what the task and its handle share, which is `Send`
+/// and `Sync` there, so that a spawn allocates no waker of its own.
+///
+/// A waker somebody keeps keeps all of that alive with it, output included where the task has
+/// one and nobody took it; a handle that is detached or dropped settles the outcome, so that the
+/// task drops its output as it hands it over instead.
+impl<T> Wake for Join<Shared, T>
+where
+    T: Send + 'static,
+{
+    fn wake(self: Arc<Self>) {
+        self.waker.wake();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.waker.wake();
+    }
 }
 
 /// The outcome of a task, and the waker of whoever is joining it.
@@ -501,17 +659,24 @@ where
 }
 
 /// Polls the future in `future` until it is done, with every panic a poll of it raises caught
-/// and handed back in place of its output.
+/// and handed back in place of its output, marking the task `task_waker` wakes unqueued before
+/// each poll.
 ///
 /// The future sits in an `Option` so that the caller can drop it once this is done, in place and
 /// with its own panics caught, before anybody hears of the outcome.
-fn catch_unwind_polls<F>(
-    mut future: Pin<&mut Option<F>>,
-) -> impl Future<Output = thread::Result<F::Output>>
+fn catch_unwind_polls<'a, F>(
+    task_waker: &'a TaskWaker,
+    mut future: Pin<&'a mut Option<F>>,
+) -> impl Future<Output = thread::Result<F::Output>> + 'a
 where
-    F: Future,
+    F: Future + 'a,
 {
     poll_fn(move |cx| {
+        // The queue entry this poll was taken off is spent by this: a wake that arrives from here
+        // on, the poll below included, queues the task afresh. A swap rather than a store, so
+        // that the poll sees what the wakes turned away since the entry was queued were for.
+        // Here rather than in the scheduler, which holds the task's waker only as a `Waker`.
+        task_waker.queued.swap(false, Ordering::AcqRel);
         let Some(future) = future.as_mut().as_pin_mut() else {
             unreachable!("the future is polled until it is done, and dropped only then");
         };
@@ -575,23 +740,14 @@ impl Hasher for IdHasher {
     }
 }
 
-/// One task: its waker, made once as it was spawned and cloned into every poll of it, and what
-/// it is up to.
-struct Slot<M>
+/// One task, and what it is up to.
+enum Slot<M>
 where
     M: Mode,
 {
-    waker: Arc<TaskWaker>,
-    state: SlotState<M>,
-}
-
-/// What a task is up to.
-enum SlotState<M>
-where
-    M: Mode,
-{
-    /// Waiting to be polled, with its future in hand.
-    Idle(M::BoxFuture),
+    /// Waiting to be polled, with its future in hand, and its waker, made once as it was spawned:
+    /// both are moved out for a poll and back after it, so a poll clones nothing.
+    Idle { future: M::BoxFuture, waker: Waker },
     /// Out of its slot, being polled.
     Running {
         /// Whether the handle was dropped while the task was being polled, so the future is to
@@ -600,30 +756,42 @@ where
     },
 }
 
-/// The waker of one task: its id, and the queue it goes on when woken.
+/// The state of one task's waker: its id, and the queue it goes on when woken.
 ///
-/// Holds nothing of the task itself, which may not leave the thread its runtime is on, so that
+/// Holds nothing of the task's future, which may not leave the thread its runtime is on, so that
 /// it can be woken from any thread whatever the runtime's flavour.
-struct TaskWaker {
+///
+/// Public in name only, in a module nobody outside can reach, because the sealed trait behind
+/// [`Mode`] names it.
+pub struct TaskWaker {
     id: u64,
     /// Whether the task's id sits in the ready queue, so that a wake which finds it there leaves
-    /// it at that. Cleared right before the task is polled.
+    /// it at that. Cleared right before the task's own future is polled.
     queued: AtomicBool,
     remote: Arc<Remote>,
 }
 
-impl Wake for TaskWaker {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
+impl TaskWaker {
+    /// Queues the task, unless it is queued already.
+    fn wake(&self) {
         // A previous `true` means the task is queued already, and the poll that entry leads to
         // sees what this wake was for: it acquires this very swap as it clears the flag.
         if self.queued.swap(true, Ordering::AcqRel) {
             return;
         }
         self.remote.schedule(self.id);
+    }
+}
+
+/// The waker of a task on a local runtime, whose shared state is not `Sync` and so cannot be
+/// what the waker points at.
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        TaskWaker::wake(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        TaskWaker::wake(self);
     }
 }
 
@@ -714,6 +882,36 @@ mod tests {
         assert!(scheduler.run_one());
         assert!(!scheduler.run_one());
         assert!(block_on(handle).is_ok());
+    }
+
+    /// A task that a poll of a batch woke runs again in that batch, budget permitting, rather
+    /// than after the wait on the reactor that follows it.
+    #[test]
+    #[timeout(15000)]
+    fn a_task_woken_during_a_batch_runs_again_in_it() {
+        let runtime = runtime();
+        let scheduler = &runtime.core.scheduler;
+        let handle = runtime.spawn("a task that yields once", async {
+            yield_now().await;
+            5
+        });
+
+        // A budget of one poll leaves the task queued again once that poll woke it.
+        scheduler.run_batch(&mut [0; 1]);
+        assert_eq!(runtime.core.remote.ready_len(), 1);
+        scheduler.run_batch(&mut [0; 1]);
+        assert_eq!(scheduler.live_tasks(), 0);
+
+        let handle_2 = runtime.spawn("another task that yields once", async {
+            yield_now().await;
+            6
+        });
+        scheduler.run_batch(&mut [0; 2]);
+
+        assert_eq!(scheduler.live_tasks(), 0);
+        assert!(!runtime.core.remote.has_ready());
+        assert_eq!(block_on(handle).unwrap(), 5);
+        assert_eq!(block_on(handle_2).unwrap(), 6);
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! is neither, and a `Shared` one is both because every piece of it is.
 
 use std::{
+    borrow::Borrow,
     cell::{RefCell, RefMut},
     future::Future,
     ops::{Deref, DerefMut},
@@ -25,7 +26,7 @@ use std::{
     sync::{self, Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use crate::runtime::Core;
+use crate::{runtime::Core, scheduler::TaskWaker};
 
 #[cfg(unix)]
 use std::os::fd::{AsFd as AsSource, BorrowedFd as BorrowedSource};
@@ -85,6 +86,12 @@ pub(crate) mod sealed {
 
         /// A task's future once its type is erased: boxed, and `Send` where the runtime is shared.
         type BoxFuture: Future<Output = ()> + Unpin + 'static;
+
+        /// How what a task and its handle share holds the state of the task's waker: behind an
+        /// [`Arc`] of its own for a local runtime, where what they share is not `Sync` and so
+        /// cannot be what the waker points at, and in place for a shared one, where it is, so
+        /// that a spawn allocates no waker of its own.
+        type HeldWaker: Borrow<TaskWaker> + From<TaskWaker> + 'static;
 
         /// A registered source once its type is erased: shared, so that a wait can hold on to it
         /// while the registration goes, and `Send + Sync` where the runtime is shared.
@@ -157,6 +164,7 @@ pub(crate) mod sealed {
         type Weak<T> = rc::Weak<T>;
         type Lock<T> = RefCell<T>;
         type BoxFuture = Pin<Box<dyn Future<Output = ()>>>;
+        type HeldWaker = Arc<TaskWaker>;
         type SourcePtr = Rc<dyn AsSource>;
         #[cfg(feature = "helper")]
         type Seat = ();
@@ -193,6 +201,7 @@ pub(crate) mod sealed {
         type Weak<T> = sync::Weak<T>;
         type Lock<T> = Mutex<T>;
         type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+        type HeldWaker = TaskWaker;
         type SourcePtr = Arc<dyn AsSource + Send + Sync>;
         /// `None` for a runtime made by [`Runtime::new`](crate::Runtime::new), which only the
         /// threads inside `block_on` on it run.

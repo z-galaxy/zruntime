@@ -184,13 +184,7 @@ impl Runtime<Local> {
     where
         T: 'static,
     {
-        let (join, task) = scheduler::task::<Local, _>(name.into(), future);
-
-        Task(scheduler::spawn::<Local, T>(
-            &self.core,
-            join,
-            Box::pin(task),
-        ))
+        Task(scheduler::spawn_local(&self.core, name.into(), future))
     }
 
     /// Watches `source` for readiness.
@@ -337,12 +331,7 @@ impl Runtime<Shared> {
     where
         T: Send + 'static,
     {
-        let (join, task) = scheduler::task::<Shared, _>(name.into(), future);
-        let task = Task(scheduler::spawn::<Shared, T>(
-            &self.core,
-            join,
-            Box::pin(task),
-        ));
+        let task = Task(scheduler::spawn_shared(&self.core, name.into(), future));
         // Asked for once the task is on the scheduler's queue, so that a helper starting here
         // finds it there.
         self.core.ensure_progress();

@@ -38,7 +38,7 @@ use std::{
 
 use crate::{
     Shared,
-    runtime::{Core, drives_a_runtime, lock, set_driving},
+    runtime::{Core, drives, drives_a_runtime, lock, set_driving},
 };
 
 /// The runtime for what the calling thread builds, made here if none is alive: the one it is in
@@ -241,6 +241,12 @@ pub(crate) fn ensure_helper(inner: &Arc<Core<Shared>>) {
     let Some(seat) = &inner.seat else {
         return;
     };
+    // A thread in the seat of this very runtime — a `block_on` spawning from its future, or a task
+    // it or the helper is running — finds the work in the round it is in, or where it decides
+    // whether to leave: the same answer the lock below would give, for one thread-local read.
+    if drives(&inner.remote) {
+        return;
+    }
     // A thread inside `block_on` on the very runtime the work is handed to asks for no helper: it
     // takes the seat on the next turn of its loop and runs the work itself. Work handed to any
     // other runtime — another thread's, or this thread's own while its innermost call drives a
