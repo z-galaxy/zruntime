@@ -4,11 +4,10 @@
 //! connection's setup and teardown, a method call's round trip, a large body, a burst of
 //! concurrent calls to a peer on another thread) with the protocol taken out.
 //!
-//! Each id times its operation inside one `zruntime::block_on`, the shape of a program that does
-//! all of its work inside one call. The runtime handle a routine spawns tasks or timers on is
-//! taken once, in a `block_on` of its own, before the group starts, so only the operation runs
-//! inside the timed `block_on`; a `Runtime` handle kept alive this way is also what a later
-//! `block_on` on the same thread resolves to, rather than a fresh runtime.
+//! Each id times its operation inside one `block_on` on the thread's runtime, the shape of a
+//! program that does all of its work inside one call. The runtime handle a routine spawns tasks
+//! or timers on is taken once, in a `block_on` of its own, before the group starts, so only the
+//! operation runs inside the timed `block_on`.
 //!
 //! The `spawn` and `timer` ids need nothing but the scheduler and the reactor's timers, so they
 //! run on every platform. The `io` and `cross-thread` ids need a unix socket pair to give the
@@ -23,22 +22,44 @@ use std::{
 };
 
 use criterion::{Criterion, Throughput, async_executor::AsyncExecutor, criterion_group};
-use zruntime::{Runtime, Sleep};
+use zruntime::{Shared, SharedRuntime, Sleep};
 
-/// Runs a routine's future to completion inside `zruntime::block_on`.
+/// Runs a routine's future to completion inside [`block_on`].
 struct ZruntimeExecutor;
 
 impl AsyncExecutor for ZruntimeExecutor {
     fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        zruntime::block_on(future)
+        block_on(future)
     }
+}
+
+/// Runs `future` to completion on the calling thread, driving [`current`] alongside it.
+///
+/// This stands in for the `zruntime::block_on` these benchmarks were written against: one
+/// runtime per thread, driven by every call on that thread. Work left behind between two calls
+/// waits for the next one, there being no helper thread to run it in between.
+fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    current().block_on(future)
+}
+
+/// A handle on the runtime of the calling thread, which [`block_on`] drives.
+fn current() -> SharedRuntime {
+    RUNTIME.with(SharedRuntime::clone)
+}
+
+thread_local! {
+    /// The runtime of this thread, which everything these benchmarks build on it goes on.
+    static RUNTIME: SharedRuntime = SharedRuntime::new().expect("a runtime for this thread");
 }
 
 /// A handle on the runtime this thread's `block_on` calls drive, brought into being in a
 /// `block_on` of its own and kept alive by the caller so that every later `block_on` on this
 /// thread resolves to the same runtime rather than a fresh one.
-fn runtime_handle() -> Runtime {
-    zruntime::block_on(async { Runtime::current().expect("a runtime for this thread") })
+fn runtime_handle() -> SharedRuntime {
+    block_on(async { current() })
 }
 
 fn spawn_benches(c: &mut Criterion) {
@@ -88,7 +109,7 @@ const TIMER_DURATION: Duration = Duration::from_millis(1);
 
 /// Awaits every one of `sleeps`, polling all of them together on each wake so that they run
 /// concurrently rather than one after another.
-async fn join_all(mut sleeps: Vec<Sleep>) {
+async fn join_all(mut sleeps: Vec<Sleep<Shared>>) {
     poll_fn(move |cx| {
         sleeps.retain_mut(|sleep| Pin::new(sleep).poll(cx).is_pending());
 
@@ -114,9 +135,9 @@ mod unix {
 
     use criterion::{BatchSize, Criterion, Throughput};
     use futures_lite::future;
-    use zruntime::{Interest, Registration, Runtime};
+    use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
-    use super::{ZruntimeExecutor, runtime_handle};
+    use super::{ZruntimeExecutor, block_on, current, runtime_handle};
 
     const BIG: usize = 1024 * 1024;
     /// How many requests `cross-thread/1000-in-flight` has in flight at once.
@@ -194,8 +215,8 @@ mod unix {
 
         let (local, far) = pair();
         let far_thread = thread::spawn(move || {
-            zruntime::block_on(async move {
-                let runtime = Runtime::current().expect("a runtime for this thread");
+            block_on(async move {
+                let runtime = current();
                 let far_registration = register(&runtime, &far);
                 echo_forever(far_registration, far).await;
             });
@@ -246,13 +267,13 @@ mod unix {
     /// One end of a pair together with its registration, shared between the routine and a task
     /// it spawns.
     struct Watched {
-        registration: Registration,
+        registration: Registration<Shared>,
         stream: UnixStream,
     }
 
     /// Watches `stream` on `runtime` through a clone of its descriptor, so the registration can
     /// be dropped on its own while `stream` stays open for the direct reads and writes below.
-    fn register(runtime: &Runtime, stream: &UnixStream) -> Registration {
+    fn register(runtime: &SharedRuntime, stream: &UnixStream) -> Registration<Shared> {
         runtime.register(stream.try_clone().unwrap()).unwrap()
     }
 
@@ -269,7 +290,7 @@ mod unix {
     /// Reads whatever bytes arrive on `far` and writes them straight back, forever. The far end
     /// of every echo the benchmarks above drive, from a spawned task or another thread's
     /// `block_on`. Returns once the near side has closed, which is when a read comes back empty.
-    async fn echo_forever(registration: Registration, far: UnixStream) {
+    async fn echo_forever(registration: Registration<Shared>, far: UnixStream) {
         let mut chunk = [0u8; CHUNK];
         loop {
             let read = read_some(&registration, &far, &mut chunk).await;
@@ -282,7 +303,7 @@ mod unix {
 
     /// Reads at least one byte from `stream` into `buf`, or `0` once the peer's side has closed.
     async fn read_some(
-        registration: &Registration,
+        registration: &Registration<Shared>,
         mut stream: &UnixStream,
         buf: &mut [u8],
     ) -> usize {
@@ -292,7 +313,11 @@ mod unix {
     }
 
     /// Reads until `buf` is full, waiting out `WouldBlock` on `registration` in between.
-    async fn read_exact(registration: &Registration, stream: &UnixStream, mut buf: &mut [u8]) {
+    async fn read_exact(
+        registration: &Registration<Shared>,
+        stream: &UnixStream,
+        mut buf: &mut [u8],
+    ) {
         while !buf.is_empty() {
             let read = read_some(registration, stream, buf).await;
             assert_ne!(read, 0, "the peer closed the connection early");
@@ -302,7 +327,11 @@ mod unix {
 
     /// Writes every byte of `buf` to `stream`, waiting out `WouldBlock` on `registration` in
     /// between.
-    async fn write_all(registration: &Registration, mut stream: &UnixStream, mut buf: &[u8]) {
+    async fn write_all(
+        registration: &Registration<Shared>,
+        mut stream: &UnixStream,
+        mut buf: &[u8],
+    ) {
         while !buf.is_empty() {
             let written =
                 poll_fn(|cx| registration.poll_io(cx, Interest::Writable, || stream.write(buf)))

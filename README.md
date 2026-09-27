@@ -16,10 +16,10 @@ A simple, single-threaded Rust async runtime:
 ```rust
 use std::time::Duration;
 
-use zruntime::Runtime;
+use zruntime::LocalRuntime;
 
-let runtime = Runtime::current().expect("a runtime for this thread");
-let doubled = zruntime::block_on(async {
+let runtime = LocalRuntime::new().expect("a runtime for this thread");
+let doubled = runtime.block_on(async {
     let sleeper = runtime.clone();
     let task = runtime.spawn("double", async move {
         sleeper.sleep(Duration::from_millis(1)).await;

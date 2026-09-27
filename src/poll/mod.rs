@@ -2,9 +2,9 @@
 //!
 //! Each implementation watches a list of sources for the length of one wait and reports which of
 //! them were found ready, and each keeps a channel of its own that a `notify` writes to, so that
-//! a wait can be broken from another thread. The sources are handed over as `Arc<dyn Source>`
-//! clones and held for the whole call, so no descriptor in the set can be closed while the
-//! platform is looking at it.
+//! a wait can be broken from another thread. The sources are lent to the wait as shared pointers
+//! the caller cloned for it and holds for the whole call, so no descriptor in the set can be
+//! closed while the platform is looking at it.
 
 #[cfg(unix)]
 mod unix;

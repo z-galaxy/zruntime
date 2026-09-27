@@ -41,15 +41,37 @@ use criterion::{
 use event_listener::Event;
 use futures_lite::future;
 use futures_util::{future::try_join_all, lock};
-use zruntime::{Runtime, Task};
+use zruntime::{Shared, SharedRuntime, Task};
 
-/// Runs a routine's future to completion inside `zruntime::block_on`.
+/// Runs a routine's future to completion inside [`block_on`].
 struct ZruntimeExecutor;
 
 impl AsyncExecutor for ZruntimeExecutor {
     fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        zruntime::block_on(future)
+        block_on(future)
     }
+}
+
+/// Runs `future` to completion on the calling thread, driving [`current`] alongside it.
+///
+/// This stands in for the `zruntime::block_on` these benchmarks were written against: one
+/// runtime per thread, driven by every call on that thread. Work left behind between two calls
+/// waits for the next one, there being no helper thread to run it in between.
+fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    current().block_on(future)
+}
+
+/// A handle on the runtime of the calling thread, which [`block_on`] drives.
+fn current() -> SharedRuntime {
+    RUNTIME.with(SharedRuntime::clone)
+}
+
+thread_local! {
+    /// The runtime of this thread, which everything these benchmarks build on it goes on.
+    static RUNTIME: SharedRuntime = SharedRuntime::new().expect("a runtime for this thread");
 }
 
 /// How long a call waits for its reply before giving up, matching the `method_timeout` zbus's
@@ -123,21 +145,21 @@ type BuildFuture = Pin<Box<dyn Future<Output = (BoxedReader, BoxedWriter)>>>;
 fn run_burst_bench<M>(
     group: &mut BenchmarkGroup<'_, M>,
     id: &str,
-    build_server: impl FnOnce(&Runtime) -> BuildFuture + Send + 'static,
-    build_client: impl FnOnce(&Runtime) -> BuildFuture,
+    build_server: impl FnOnce(&SharedRuntime) -> BuildFuture + Send + 'static,
+    build_client: impl FnOnce(&SharedRuntime) -> BuildFuture,
 ) where
     M: Measurement,
 {
     let server_thread = thread::spawn(move || {
-        zruntime::block_on(async move {
-            let runtime = Runtime::current().expect("a runtime for this thread");
+        block_on(async move {
+            let runtime = current();
             let (reader, writer) = build_server(&runtime).await;
             let connection = build_connection(reader, writer, &runtime, Some(dispatch));
             connection.closed().await;
         })
     });
-    let client = zruntime::block_on(async {
-        let runtime = Runtime::current().expect("a runtime for this thread");
+    let client = block_on(async {
+        let runtime = current();
         let (reader, writer) = build_client(&runtime).await;
 
         build_connection(reader, writer, &runtime, None)
@@ -459,13 +481,13 @@ struct Connection {
     next_serial: AtomicU32,
     closed: Arc<AtomicBool>,
     closed_event: Arc<Event>,
-    runtime: Runtime,
+    runtime: SharedRuntime,
     // Neither of these is reachable from `pending`, `signals` or `write`, so the tasks they hold
     // can never (even indirectly) end up owning a handle on themselves; dropping `Connection`
     // drops both fields and so cancels both tasks outright. Named with a leading underscore
     // because nothing ever reads them back — they are kept only for that drop.
-    _reader_task: Task<()>,
-    _object_server_task: Option<Task<()>>,
+    _reader_task: Task<(), Shared>,
+    _object_server_task: Option<Task<(), Shared>>,
     drop_event: Arc<Event>,
 }
 
@@ -574,7 +596,7 @@ impl Drop for Connection {
 fn build_connection(
     reader: BoxedReader,
     writer: BoxedWriter,
-    runtime: &Runtime,
+    runtime: &SharedRuntime,
     handler: Option<Handler>,
 ) -> Connection {
     let write = Arc::new(lock::Mutex::new(writer));
@@ -663,7 +685,7 @@ async fn run_reader(
 async fn run_object_server(
     calls: Arc<Queue<Frame>>,
     write: Arc<lock::Mutex<BoxedWriter>>,
-    runtime: Runtime,
+    runtime: SharedRuntime,
     handler: Handler,
 ) {
     while let Some(call) = calls.pop().await {
@@ -695,11 +717,11 @@ mod unix {
 
     use criterion::{Criterion, Throughput};
     use futures_lite::future;
-    use zruntime::{Interest, Registration, Runtime};
+    use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
     use super::{
-        BoxedReader, BoxedWriter, Connection, Frame, FrameKind, ZruntimeExecutor, build_connection,
-        dispatch, echo, ping, run_burst_bench,
+        BoxedReader, BoxedWriter, Connection, Frame, FrameKind, ZruntimeExecutor, block_on,
+        build_connection, current, dispatch, echo, ping, run_burst_bench,
     };
 
     /// How big a body `method-call/1MiB-body` sends and receives.
@@ -709,8 +731,8 @@ mod unix {
     /// `block_on` of its own and kept alive by the caller so that every later `block_on` on this
     /// thread resolves to the same runtime rather than a fresh one. Mirrors `runtime_handle` in
     /// `benches/runtime.rs`.
-    fn runtime_handle() -> Runtime {
-        zruntime::block_on(async { Runtime::current().expect("a runtime for this thread") })
+    fn runtime_handle() -> SharedRuntime {
+        block_on(async { current() })
     }
 
     /// A small fixed header (kind, serial, reply serial, body length) plus a body of raw bytes —
@@ -778,7 +800,7 @@ mod unix {
         });
         group.bench_function("graceful-shutdown", |b| {
             b.iter_custom(|iters| {
-                zruntime::block_on(async {
+                block_on(async {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         let (server, client) = pair(&runtime).await;
@@ -799,7 +821,7 @@ mod unix {
 
         let mut group = c.benchmark_group("method-call");
         {
-            let (_server, client) = zruntime::block_on(pair(&runtime));
+            let (_server, client) = block_on(pair(&runtime));
             group.bench_function("roundtrip", |b| {
                 b.to_async(ZruntimeExecutor)
                     .iter(|| async { black_box(ping(&client, 1).await.unwrap()) });
@@ -808,7 +830,7 @@ mod unix {
         group.sample_size(10);
         group.throughput(Throughput::Bytes(BIG as u64));
         {
-            let (_server, client) = zruntime::block_on(pair(&runtime));
+            let (_server, client) = block_on(pair(&runtime));
             let body = vec![7u8; BIG];
             group.bench_function("1MiB-body", |b| {
                 b.to_async(ZruntimeExecutor)
@@ -822,7 +844,7 @@ mod unix {
         let runtime = runtime_handle();
 
         let mut group = c.benchmark_group("signal");
-        let (server, client) = zruntime::block_on(pair(&runtime));
+        let (server, client) = block_on(pair(&runtime));
         group.bench_function("emit-receive", |b| {
             b.to_async(ZruntimeExecutor).iter(|| async {
                 server.emit_signal(Vec::new()).await;
@@ -848,7 +870,7 @@ mod unix {
         run_burst_bench(
             &mut group,
             "1000-concurrent-p2p-socket",
-            move |runtime: &Runtime| {
+            move |runtime: &SharedRuntime| {
                 let end = Arc::new(UnixEnd::register(runtime, server_stream));
                 Box::pin(async move {
                     server_handshake(&end).await;
@@ -858,7 +880,7 @@ mod unix {
                     (reader, writer)
                 })
             },
-            move |runtime: &Runtime| {
+            move |runtime: &SharedRuntime| {
                 let end = Arc::new(UnixEnd::register(runtime, client_stream));
                 Box::pin(async move {
                     client_handshake(&end).await;
@@ -875,7 +897,7 @@ mod unix {
 
     /// A server and a client over a fresh socket pair, handshake included. Mirrors `pair` in
     /// `zbus/benches/runtime.rs`.
-    async fn pair(runtime: &Runtime) -> (Connection, Connection) {
+    async fn pair(runtime: &SharedRuntime) -> (Connection, Connection) {
         let (server_stream, client_stream) = UnixStream::pair().unwrap();
         let server_end = Arc::new(UnixEnd::register(runtime, server_stream));
         let client_end = Arc::new(UnixEnd::register(runtime, client_stream));
@@ -903,12 +925,12 @@ mod unix {
     /// single registration either way, never one dup per half, so the peer sees an EOF as soon
     /// as this end drops.
     struct UnixEnd {
-        registration: Registration,
+        registration: Registration<Shared>,
         stream: UnixStream,
     }
 
     impl UnixEnd {
-        fn register(runtime: &Runtime, stream: UnixStream) -> Self {
+        fn register(runtime: &SharedRuntime, stream: UnixStream) -> Self {
             stream.set_nonblocking(true).expect("nonblocking");
             let registration = runtime
                 .register(
