@@ -22,6 +22,7 @@ targets = [
 [features]
 default = ["tracing"]
 tracing = ["dep:tracing"]
+helper = []
 
 [dependencies]
 tracing = { version = "0.1.44", optional = true }
@@ -53,7 +54,9 @@ bench = false
 [[bench]]
 name = "runtime"
 harness = false
+required-features = ["helper"]
 
 [[bench]]
 name = "connection"
 harness = false
+required-features = ["helper"]

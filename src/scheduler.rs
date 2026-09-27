@@ -165,7 +165,7 @@ where
     }
 
     /// How many spawned futures have neither finished nor been cancelled.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "helper"))]
     pub(crate) fn live_tasks(&self) -> usize {
         self.tasks.lock().slots.len()
     }
@@ -399,10 +399,11 @@ where
             waker.wake();
         }
         // Even where nothing was queued: a thread waiting with this as its last task learns
-        // from it that it has nothing left to wait for.
+        // from it that it has nothing left to wait for, and a helper thread that it can retire.
         core.remote.notify();
         // Carried on from here, so that the panic is still the caller's to see while the task it
-        // belonged to is closed off either way.
+        // belonged to is closed off either way: the notification above is what lets an idle
+        // helper retire, and somebody's destructor panicking is no reason to leave one up.
         if let Some(Err(payload)) = dropped {
             resume_unwind(payload);
         }

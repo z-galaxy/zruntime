@@ -12,6 +12,9 @@
 //! a time drives a runtime, and a thread drives one runtime at a time; a thread-local marker of
 //! which runtime a thread drives is what the two rules are checked against, and what spares a
 //! wake on that very thread the write that would break a wait it is not in.
+//!
+//! A shared runtime with a seat, which the `helper` feature's registries hand out, is driven
+//! through that seat instead (see the `driver` module), and writes the same marker as it does.
 
 use std::{
     cell::Cell,
@@ -30,11 +33,15 @@ use std::{
 };
 
 use crate::{
-    Mode, log::error, mode::sealed::Lock, poll::Poller, reactor::Reactor, scheduler::Scheduler,
+    Mode, Shared, log::error, mode::sealed::Lock, poll::Poller, reactor::Reactor,
+    scheduler::Scheduler,
 };
 
 /// What a runtime is made of, shared by every handle on it and by the thread that drives it.
-pub(crate) struct Core<M>
+///
+/// Public in name only, in a module nobody outside can reach, because the sealed trait behind
+/// [`Mode`] names it.
+pub struct Core<M>
 where
     M: Mode,
 {
@@ -45,6 +52,9 @@ where
     /// Whether a thread is inside `block_on` on this runtime, so that a second thread asking to
     /// drive it at the same time is told it cannot.
     driven: M::Lock<bool>,
+    /// Who runs this runtime where no thread is inside `block_on` on it.
+    #[cfg(feature = "helper")]
+    pub(crate) seat: M::Seat,
 }
 
 impl<M> Core<M>
@@ -55,14 +65,7 @@ where
     ///
     /// What can fail is the channel a wait is broken through, which this opens.
     pub(crate) fn new() -> io::Result<M::Ptr<Self>> {
-        let remote = Arc::new(Remote::new()?);
-
-        Ok(M::new_ptr(Self {
-            scheduler: Scheduler::new(remote.clone()),
-            reactor: Reactor::new(remote.clone()),
-            remote,
-            driven: Lock::new(false),
-        }))
+        Ok(M::new_ptr(Self::unshared()?))
     }
 
     /// Runs `future` to completion on the calling thread, driving this runtime alongside it.
@@ -101,7 +104,7 @@ where
     /// One round for `block_on`: a batch, then one wait on the reactor, which waits for nothing
     /// where the future this thread is polling has been woken in the meantime, so that the poll
     /// of it comes next and what a source has for the tasks is reported all the same.
-    fn round(&self, woken: &AtomicBool, failed_waits: &mut u32) {
+    pub(crate) fn round(&self, woken: &AtomicBool, failed_waits: &mut u32) {
         self.run_batch();
         // Read before the wait, so a wake that already landed is passed on as `at_once`.
         let woken = woken.load(Ordering::Acquire);
@@ -110,7 +113,7 @@ where
     }
 
     /// Polls up to `BATCH` ready tasks.
-    fn run_batch(&self) {
+    pub(crate) fn run_batch(&self) {
         for _ in 0..BATCH {
             if !self.scheduler.run_one() {
                 break;
@@ -126,7 +129,7 @@ where
     /// `failed_waits` counts the failures in a row, for the pause that keeps a wait which fails
     /// every time from becoming a spin; every waiter retries its own operation and sees its own
     /// error.
-    fn wait(&self, at_once: bool, failed_waits: &mut u32) {
+    pub(crate) fn wait(&self, at_once: bool, failed_waits: &mut u32) {
         let at_most = (at_once || self.remote.has_ready()).then_some(Duration::ZERO);
         match self.reactor.wait(at_most) {
             Ok(()) => *failed_waits = 0,
@@ -139,6 +142,44 @@ where
                 thread::sleep(Duration::from_millis(1 << (*failed_waits).min(10)));
             }
         }
+    }
+
+    /// A runtime with nothing to do, not yet shared: one of those only the threads inside
+    /// `block_on` on it run.
+    fn unshared() -> io::Result<Self> {
+        let remote = Arc::new(Remote::new()?);
+
+        Ok(Self {
+            scheduler: Scheduler::new(remote.clone()),
+            reactor: Reactor::new(remote.clone()),
+            remote,
+            driven: Lock::new(false),
+            #[cfg(feature = "helper")]
+            seat: Default::default(),
+        })
+    }
+}
+
+impl Core<Shared> {
+    /// A shared runtime with nothing to do and a seat for whoever runs it, in no registry: one a
+    /// helper thread runs where no thread is inside `block_on` on it.
+    #[cfg(feature = "helper")]
+    pub(crate) fn with_seat() -> io::Result<Arc<Self>> {
+        let mut core = Self::unshared()?;
+        core.seat = Some(Mutex::new(crate::driver::Seat::new()));
+
+        Ok(Arc::new(core))
+    }
+
+    /// Sees to it that the work just handed over is run: for a runtime with a seat, a helper is
+    /// started unless a thread is in the seat or about to take it. Called after that work is in
+    /// place, never before.
+    ///
+    /// A runtime with no seat is run by the threads inside `block_on` on it alone, and the work
+    /// waits for the next such call.
+    pub(crate) fn ensure_progress(self: &Arc<Self>) {
+        #[cfg(feature = "helper")]
+        crate::driver::ensure_helper(self);
     }
 }
 
@@ -263,9 +304,19 @@ where
     /// thread at a time polls a runtime's tasks and waits on its reactor.
     fn enter(core: &'a Core<M>) -> Self {
         assert!(
-            DRIVING.with(Cell::get).is_none(),
+            !drives_a_runtime(),
             "block_on called from a task this runtime is running: the call would wait for the \
              very thread it is on"
+        );
+        // Inside a call of the helper layer's `block_on`, whether or not that call holds its seat
+        // at this moment: one that does not may be handed it at any turn, and one that does is
+        // driving already. A call that blocked the thread here would keep that one from its
+        // runtime either way, so it is turned away either way rather than by the timing of it.
+        #[cfg(feature = "helper")]
+        assert!(
+            !crate::driver::in_block_on(),
+            "block_on called from inside the future of another block_on: the call would keep the \
+             thread from the runtime that one drives"
         );
         // Claimed under the lock and asserted once it is released, so that the panic leaves the
         // flag as it found it.
@@ -275,7 +326,7 @@ where
             "block_on called on a runtime another thread is driving: a runtime is driven by one \
              thread at a time"
         );
-        DRIVING.with(|driving| driving.set(Some(NonNull::from(&*core.remote))));
+        set_driving(Some(&core.remote));
 
         Self { core }
     }
@@ -286,7 +337,7 @@ where
     M: Mode,
 {
     fn drop(&mut self) {
-        DRIVING.with(|driving| driving.set(None));
+        set_driving(None);
         *self.core.driven.lock() = false;
     }
 }
@@ -320,6 +371,22 @@ impl Wake for Signal {
     }
 }
 
+/// Marks the calling thread as the one driving the runtime `remote` belongs to, or, with `None`,
+/// as driving none.
+///
+/// Written by whatever puts a thread in charge of a runtime and takes it out again: `block_on` on
+/// a runtime with no seat, and the seat of one with a seat. The one record of which runtime a
+/// thread drives, whichever of the two made it.
+pub(crate) fn set_driving(remote: Option<&Remote>) {
+    DRIVING.with(|driving| driving.set(remote.map(NonNull::from)));
+}
+
+/// Whether the calling thread drives a runtime, so that a `block_on` there, which could only wait
+/// for the very thread it is on, is turned away.
+pub(crate) fn drives_a_runtime() -> bool {
+    DRIVING.with(Cell::get).is_some()
+}
+
 thread_local! {
     /// The remote of the runtime this thread drives, and nothing on a thread that drives none.
     ///
@@ -330,6 +397,6 @@ thread_local! {
 }
 
 /// The value behind a lock, taken whether or not a panic poisoned it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

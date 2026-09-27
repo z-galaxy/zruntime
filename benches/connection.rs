@@ -43,35 +43,13 @@ use futures_lite::future;
 use futures_util::{future::try_join_all, lock};
 use zruntime::{Shared, SharedRuntime, Task};
 
-/// Runs a routine's future to completion inside [`block_on`].
+/// Runs a routine's future to completion inside `zruntime::block_on`.
 struct ZruntimeExecutor;
 
 impl AsyncExecutor for ZruntimeExecutor {
     fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        block_on(future)
+        zruntime::block_on(future)
     }
-}
-
-/// Runs `future` to completion on the calling thread, driving [`current`] alongside it.
-///
-/// This stands in for the `zruntime::block_on` these benchmarks were written against: one
-/// runtime per thread, driven by every call on that thread. Work left behind between two calls
-/// waits for the next one, there being no helper thread to run it in between.
-fn block_on<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    current().block_on(future)
-}
-
-/// A handle on the runtime of the calling thread, which [`block_on`] drives.
-fn current() -> SharedRuntime {
-    RUNTIME.with(SharedRuntime::clone)
-}
-
-thread_local! {
-    /// The runtime of this thread, which everything these benchmarks build on it goes on.
-    static RUNTIME: SharedRuntime = SharedRuntime::new().expect("a runtime for this thread");
 }
 
 /// How long a call waits for its reply before giving up, matching the `method_timeout` zbus's
@@ -151,15 +129,15 @@ fn run_burst_bench<M>(
     M: Measurement,
 {
     let server_thread = thread::spawn(move || {
-        block_on(async move {
-            let runtime = current();
+        zruntime::block_on(async move {
+            let runtime = SharedRuntime::current().expect("a runtime for this thread");
             let (reader, writer) = build_server(&runtime).await;
             let connection = build_connection(reader, writer, &runtime, Some(dispatch));
             connection.closed().await;
         })
     });
-    let client = block_on(async {
-        let runtime = current();
+    let client = zruntime::block_on(async {
+        let runtime = SharedRuntime::current().expect("a runtime for this thread");
         let (reader, writer) = build_client(&runtime).await;
 
         build_connection(reader, writer, &runtime, None)
@@ -720,8 +698,8 @@ mod unix {
     use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
     use super::{
-        BoxedReader, BoxedWriter, Connection, Frame, FrameKind, ZruntimeExecutor, block_on,
-        build_connection, current, dispatch, echo, ping, run_burst_bench,
+        BoxedReader, BoxedWriter, Connection, Frame, FrameKind, ZruntimeExecutor, build_connection,
+        dispatch, echo, ping, run_burst_bench,
     };
 
     /// How big a body `method-call/1MiB-body` sends and receives.
@@ -732,7 +710,7 @@ mod unix {
     /// thread resolves to the same runtime rather than a fresh one. Mirrors `runtime_handle` in
     /// `benches/runtime.rs`.
     fn runtime_handle() -> SharedRuntime {
-        block_on(async { current() })
+        zruntime::block_on(async { SharedRuntime::current().expect("a runtime for this thread") })
     }
 
     /// A small fixed header (kind, serial, reply serial, body length) plus a body of raw bytes —
@@ -800,7 +778,7 @@ mod unix {
         });
         group.bench_function("graceful-shutdown", |b| {
             b.iter_custom(|iters| {
-                block_on(async {
+                zruntime::block_on(async {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         let (server, client) = pair(&runtime).await;
@@ -821,7 +799,7 @@ mod unix {
 
         let mut group = c.benchmark_group("method-call");
         {
-            let (_server, client) = block_on(pair(&runtime));
+            let (_server, client) = zruntime::block_on(pair(&runtime));
             group.bench_function("roundtrip", |b| {
                 b.to_async(ZruntimeExecutor)
                     .iter(|| async { black_box(ping(&client, 1).await.unwrap()) });
@@ -830,7 +808,7 @@ mod unix {
         group.sample_size(10);
         group.throughput(Throughput::Bytes(BIG as u64));
         {
-            let (_server, client) = block_on(pair(&runtime));
+            let (_server, client) = zruntime::block_on(pair(&runtime));
             let body = vec![7u8; BIG];
             group.bench_function("1MiB-body", |b| {
                 b.to_async(ZruntimeExecutor)
@@ -844,7 +822,7 @@ mod unix {
         let runtime = runtime_handle();
 
         let mut group = c.benchmark_group("signal");
-        let (server, client) = block_on(pair(&runtime));
+        let (server, client) = zruntime::block_on(pair(&runtime));
         group.bench_function("emit-receive", |b| {
             b.to_async(ZruntimeExecutor).iter(|| async {
                 server.emit_signal(Vec::new()).await;

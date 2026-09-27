@@ -8,6 +8,11 @@
 //! else — the scheduler, the reactor, the loop that drives them — is written once, over [`Mode`],
 //! and reaches that state through the associated types of the sealed trait behind it.
 //!
+//! The one other difference is who may drive a runtime. A shared runtime that came out of one of
+//! the registries the `helper` feature keeps has a seat, which a helper thread takes where no
+//! thread is inside `block_on` on it; the sealed trait's two hooks, for `block_on` and for work
+//! just handed over, are where a shared runtime looks for that seat and a local one never does.
+//!
 //! Neither flavour is `Send` or `Sync` by assertion: a `Local` runtime is neither because an `Rc`
 //! is neither, and a `Shared` one is both because every piece of it is.
 
@@ -19,6 +24,8 @@ use std::{
     rc::{self, Rc},
     sync::{self, Arc, Mutex, MutexGuard, PoisonError},
 };
+
+use crate::runtime::Core;
 
 #[cfg(unix)]
 use std::os::fd::{AsFd as AsSource, BorrowedFd as BorrowedSource};
@@ -83,6 +90,12 @@ pub(crate) mod sealed {
         /// while the registration goes, and `Send + Sync` where the runtime is shared.
         type SourcePtr: Clone + 'static;
 
+        /// Who runs a runtime of this flavour where no thread is inside `block_on` on it: nobody
+        /// for a local runtime, and for a shared one, the seat a helper thread takes where the
+        /// runtime came out of a registry.
+        #[cfg(feature = "helper")]
+        type Seat: Default;
+
         /// Shares `value`.
         fn new_ptr<T>(value: T) -> Self::Ptr<T>;
 
@@ -98,6 +111,21 @@ pub(crate) mod sealed {
         /// `AsSocket` for an `Rc` or an `Arc` of a sized type only, and a source pointer is one
         /// of a trait object.
         fn as_source(source: &Self::SourcePtr) -> BorrowedSource<'_>;
+
+        /// Runs `future` to completion on the calling thread, driving `core` alongside it.
+        ///
+        /// A hook rather than a method of the core, so that a shared runtime which came out of a
+        /// registry can be driven through the seat that runtime has.
+        fn block_on<F>(core: &Self::Ptr<Core<Self>>, future: F) -> F::Output
+        where
+            Self: Mode,
+            F: Future;
+
+        /// Sees to it that the work just handed to `core` is run. Called after that work is in
+        /// place, never before.
+        fn ensure_progress(core: &Self::Ptr<Core<Self>>)
+        where
+            Self: Mode;
     }
 
     /// A lock around a value, taken with no way to fail.
@@ -130,6 +158,8 @@ pub(crate) mod sealed {
         type Lock<T> = RefCell<T>;
         type BoxFuture = Pin<Box<dyn Future<Output = ()>>>;
         type SourcePtr = Rc<dyn AsSource>;
+        #[cfg(feature = "helper")]
+        type Seat = ();
 
         fn new_ptr<T>(value: T) -> Rc<T> {
             Rc::new(value)
@@ -146,6 +176,16 @@ pub(crate) mod sealed {
         fn as_source(source: &Self::SourcePtr) -> BorrowedSource<'_> {
             borrow_source(&**source)
         }
+
+        fn block_on<F>(core: &Rc<Core<Self>>, future: F) -> F::Output
+        where
+            F: Future,
+        {
+            core.block_on(future)
+        }
+
+        // A local runtime is run by the thread inside `block_on` on it and by nobody else.
+        fn ensure_progress(_core: &Rc<Core<Self>>) {}
     }
 
     impl Sealed for Shared {
@@ -154,6 +194,10 @@ pub(crate) mod sealed {
         type Lock<T> = Mutex<T>;
         type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
         type SourcePtr = Arc<dyn AsSource + Send + Sync>;
+        /// `None` for a runtime made by [`Runtime::new`](crate::Runtime::new), which only the
+        /// threads inside `block_on` on it run.
+        #[cfg(feature = "helper")]
+        type Seat = Option<Mutex<crate::driver::Seat>>;
 
         fn new_ptr<T>(value: T) -> Arc<T> {
             Arc::new(value)
@@ -169,6 +213,22 @@ pub(crate) mod sealed {
 
         fn as_source(source: &Self::SourcePtr) -> BorrowedSource<'_> {
             borrow_source(&**source)
+        }
+
+        fn block_on<F>(core: &Arc<Core<Self>>, future: F) -> F::Output
+        where
+            F: Future,
+        {
+            #[cfg(feature = "helper")]
+            if core.seat.is_some() {
+                return crate::driver::block_on_seated(core, future);
+            }
+
+            core.block_on(future)
+        }
+
+        fn ensure_progress(core: &Arc<Core<Self>>) {
+            core.ensure_progress();
         }
     }
 

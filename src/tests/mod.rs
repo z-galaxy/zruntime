@@ -8,6 +8,8 @@
 
 #[cfg(test)]
 mod core;
+#[cfg(test)]
+mod helper;
 
 /// A local runtime's handle stays on its thread: it is neither `Send`...
 ///

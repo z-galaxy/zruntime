@@ -166,7 +166,7 @@ where
     }
 
     /// No registered source and no pending timer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "helper"))]
     pub(crate) fn is_idle(&self) -> bool {
         let no_sources = self.sources.lock().states.is_empty();
 
@@ -338,6 +338,21 @@ where
     deadline: Option<Instant>,
     /// Handed out on the first poll, which is when the timer joins the reactor's map.
     id: Option<u64>,
+}
+
+impl<M> Sleep<M>
+where
+    M: Mode,
+{
+    /// The runtime this timer belongs to.
+    pub(crate) fn core(&self) -> &M::Ptr<Core<M>> {
+        &self.core
+    }
+
+    /// Whether this timer has no deadline the clock can name, and so never comes due.
+    pub(crate) fn never_fires(&self) -> bool {
+        self.deadline.is_none()
+    }
 }
 
 impl<M> Future for Sleep<M>

@@ -4,10 +4,11 @@
 //! connection's setup and teardown, a method call's round trip, a large body, a burst of
 //! concurrent calls to a peer on another thread) with the protocol taken out.
 //!
-//! Each id times its operation inside one `block_on` on the thread's runtime, the shape of a
-//! program that does all of its work inside one call. The runtime handle a routine spawns tasks
-//! or timers on is taken once, in a `block_on` of its own, before the group starts, so only the
-//! operation runs inside the timed `block_on`.
+//! Each id times its operation inside one `zruntime::block_on`, the shape of a program that does
+//! all of its work inside one call. The runtime handle a routine spawns tasks or timers on is
+//! taken once, in a `block_on` of its own, before the group starts, so only the operation runs
+//! inside the timed `block_on`; a `SharedRuntime` handle kept alive this way is also what a later
+//! `block_on` on the same thread resolves to, rather than a fresh runtime.
 //!
 //! The `spawn` and `timer` ids need nothing but the scheduler and the reactor's timers, so they
 //! run on every platform. The `io` and `cross-thread` ids need a unix socket pair to give the
@@ -24,42 +25,20 @@ use std::{
 use criterion::{Criterion, Throughput, async_executor::AsyncExecutor, criterion_group};
 use zruntime::{Shared, SharedRuntime, Sleep};
 
-/// Runs a routine's future to completion inside [`block_on`].
+/// Runs a routine's future to completion inside `zruntime::block_on`.
 struct ZruntimeExecutor;
 
 impl AsyncExecutor for ZruntimeExecutor {
     fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        block_on(future)
+        zruntime::block_on(future)
     }
-}
-
-/// Runs `future` to completion on the calling thread, driving [`current`] alongside it.
-///
-/// This stands in for the `zruntime::block_on` these benchmarks were written against: one
-/// runtime per thread, driven by every call on that thread. Work left behind between two calls
-/// waits for the next one, there being no helper thread to run it in between.
-fn block_on<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    current().block_on(future)
-}
-
-/// A handle on the runtime of the calling thread, which [`block_on`] drives.
-fn current() -> SharedRuntime {
-    RUNTIME.with(SharedRuntime::clone)
-}
-
-thread_local! {
-    /// The runtime of this thread, which everything these benchmarks build on it goes on.
-    static RUNTIME: SharedRuntime = SharedRuntime::new().expect("a runtime for this thread");
 }
 
 /// A handle on the runtime this thread's `block_on` calls drive, brought into being in a
 /// `block_on` of its own and kept alive by the caller so that every later `block_on` on this
 /// thread resolves to the same runtime rather than a fresh one.
 fn runtime_handle() -> SharedRuntime {
-    block_on(async { current() })
+    zruntime::block_on(async { SharedRuntime::current().expect("a runtime for this thread") })
 }
 
 fn spawn_benches(c: &mut Criterion) {
@@ -137,7 +116,7 @@ mod unix {
     use futures_lite::future;
     use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
-    use super::{ZruntimeExecutor, block_on, current, runtime_handle};
+    use super::{ZruntimeExecutor, runtime_handle};
 
     const BIG: usize = 1024 * 1024;
     /// How many requests `cross-thread/1000-in-flight` has in flight at once.
@@ -215,8 +194,8 @@ mod unix {
 
         let (local, far) = pair();
         let far_thread = thread::spawn(move || {
-            block_on(async move {
-                let runtime = current();
+            zruntime::block_on(async move {
+                let runtime = SharedRuntime::current().expect("a runtime for this thread");
                 let far_registration = register(&runtime, &far);
                 echo_forever(far_registration, far).await;
             });

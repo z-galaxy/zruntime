@@ -8,6 +8,8 @@
     allow(unused_extern_crates),
 )))]
 
+#[cfg(feature = "helper")]
+mod driver;
 mod log;
 mod mode;
 mod poll;
@@ -35,6 +37,42 @@ pub use mode::{Local, Mode, Shared};
 pub use reactor::Registration;
 use runtime::Core;
 use scheduler::JoinHandle;
+
+/// Runs `future` to completion on the calling thread, running that thread's runtime alongside it.
+///
+/// This is for a program that has no async runtime of its own. Put the async code in one call to
+/// this function; the call blocks the thread until the future completes. In between polls of the
+/// future, the calling thread also runs the scheduler and the reactor of everything built on the
+/// runtime this call drives — every task spawned, source registered or timer armed from inside
+/// it on [`SharedRuntime::current`] — and two threads that each call this drive their own
+/// runtime, in parallel. If the call returns while some of that work is still alive, a helper
+/// thread takes it over until the next call, or until the work is gone.
+///
+/// The scheduler and the reactor of a runtime are run by one thread at a time, the one in the
+/// runtime's seat. A call takes the seat if it is free and keeps it until its future is done, so
+/// a program that drives its work through this function runs it on its own thread and starts no
+/// helper. A call that finds the seat taken parks instead, to be polled again when its future is
+/// woken or the seat is freed. A call that arrives while the helper is in the seat is given it,
+/// the helper parking until that call leaves, so that a program calling this once per operation
+/// runs each of them on its own thread rather than behind a thread of the runtime's own.
+///
+/// Because that work runs on the calling thread in between polls, the future must not block that
+/// thread waiting for it. A synchronous wait for a task's result, or a busy loop until a signal
+/// arrives, never finishes.
+///
+/// Do not call this from inside a task this runtime is running. It panics there, because it
+/// would be waiting for the very thread it is on. Do not call it from another runtime's task
+/// either: it blocks that task's thread until the future completes, which deadlocks the program
+/// if the future needs that thread to make progress.
+///
+/// This is only available when the `helper` feature is enabled.
+#[cfg(feature = "helper")]
+pub fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    driver::block_on(driver::Target::Own, &driver::own, future)
+}
 
 /// A runtime that stays on the thread it was made on, and runs futures that need not be `Send`.
 pub type LocalRuntime = Runtime<Local>;
@@ -70,6 +108,11 @@ where
     /// only while some thread is inside [`Runtime::block_on`] on it, and waits for the next such
     /// call in between.
     ///
+    /// A task whose future holds a timer, a registration or a clone of the runtime keeps the
+    /// runtime, and the descriptors its reactor holds, alive until the task ends. No helper thread
+    /// ever runs a runtime made here, so a detached task that never ends is never let go of: drive
+    /// such a task to completion, or keep its [`Task`] and cancel it by dropping that.
+    ///
     /// What can fail is the reactor: it opens the channel a wait is broken through.
     pub fn new() -> io::Result<Self> {
         Ok(Self {
@@ -91,13 +134,19 @@ where
     ///
     /// Panics where the calling thread is driving a runtime already: from inside a task a runtime
     /// is running, or from inside the future of another `block_on`. Such a call would be waiting
-    /// for the very thread it is on. A shared runtime is driven by one thread at a time, so this
-    /// panics, too, where another thread is inside `block_on` on the same runtime.
+    /// for the very thread it is on. With the `helper` feature, a call on a runtime made by
+    /// [`Runtime::new`] panics, too, from inside the future of a call of the free `block_on` or of
+    /// a `block_on` on a runtime from `SharedRuntime::current`, whether or not that call is driving
+    /// its runtime at that moment. A shared runtime made by [`Runtime::new`] is driven by one
+    /// thread at a time, so this panics, too, where another thread is inside `block_on` on the
+    /// same runtime. One handed out by `SharedRuntime::current`, which the `helper` feature adds,
+    /// has a seat for whoever drives it instead: a call on it waits for the seat, and is given it
+    /// by the helper thread, as a call of the free `block_on` is.
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future,
     {
-        self.core.block_on(future)
+        M::block_on(&self.core, future)
     }
 
     /// A future that completes once `duration` has passed. Dropping it cancels the timer.
@@ -189,13 +238,84 @@ impl Runtime<Local> {
 }
 
 impl Runtime<Shared> {
+    /// A handle on the runtime for what this thread builds, brought into being here if none is
+    /// alive.
+    ///
+    /// Which runtime that is depends on where the call is made. On a thread in the seat of a
+    /// runtime — inside [`block_on`], or on the helper thread running a task —
+    /// it is that runtime. On a thread inside `block_on` but not in any seat, it is the runtime
+    /// the innermost such call drives: the thread's own runtime for a call of the free
+    /// [`block_on`], and the runtime it was called on for a [`Runtime::block_on`]. Anywhere else,
+    /// it is one runtime the whole process shares, for work some other executor polls: such
+    /// work has no thread of its own to look to, so a helper thread runs it, and one runtime
+    /// for all of it is one helper and one pair of descriptors rather than a set per thread.
+    ///
+    /// A runtime handed out here goes once its last handle, and the last of the work built on
+    /// it, are gone; the next call brings a fresh one into being. Work built on it runs on the
+    /// thread in its seat: one inside `block_on` on it, where there is one, and a helper thread,
+    /// started where that work is found with nobody in the seat and gone once nothing is left to
+    /// run, watch or time, where there is not.
+    ///
+    /// A [`LocalRuntime::block_on`], or a `block_on` on a runtime made by [`Runtime::new`], does
+    /// not count as a `block_on` here: it drives the runtime it was called on and no other. A call
+    /// made inside one gives the runtime the process shares, and a helper thread runs what is
+    /// built on it, while the thread inside that `block_on` is left to its own runtime. (A
+    /// `block_on` of that kind made the other way round, inside the future of a `block_on` this
+    /// feature adds, panics.)
+    ///
+    /// What can fail is the reactor: it opens the channel a wait is broken through.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{
+    ///     future::poll_fn,
+    ///     io::{Read, Write},
+    ///     net::{TcpListener, TcpStream},
+    ///     sync::Arc,
+    /// };
+    ///
+    /// use zruntime::{Interest, SharedRuntime};
+    ///
+    /// let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    /// let stream = Arc::new(listener.accept().unwrap().0);
+    /// stream.set_nonblocking(true).unwrap();
+    ///
+    /// let received = zruntime::block_on(async {
+    ///     let runtime = SharedRuntime::current().expect("a runtime for this thread");
+    ///     let registration = runtime.register(stream.clone()).unwrap();
+    ///     peer.write_all(b"!").unwrap();
+    ///
+    ///     let mut byte = [0];
+    ///     poll_fn(|cx| {
+    ///         registration.poll_io(cx, Interest::Readable, || (&*stream).read(&mut byte))
+    ///     })
+    ///     .await
+    ///     .unwrap();
+    ///
+    ///     byte
+    /// });
+    ///
+    /// assert_eq!(&received, b"!");
+    /// ```
+    ///
+    /// This is only available when the `helper` feature is enabled.
+    #[cfg(feature = "helper")]
+    pub fn current() -> io::Result<Self> {
+        Ok(Self {
+            core: driver::current()?,
+        })
+    }
+
     /// Queues `future` under the diagnostic name `name` and hands back the task that joins or
     /// cancels it.
     ///
     /// The task runs concurrently with the caller, on whichever thread is inside
-    /// [`Runtime::block_on`] on this runtime. The handle resolves to what `future` produced, or to
-    /// `Err` where the runtime lost the task — after it panicked, say. Dropping the handle cancels
-    /// the task; [`Task::detach`] lets it run on.
+    /// [`Runtime::block_on`] on this runtime, or, on a runtime from `SharedRuntime::current`, on
+    /// a helper thread where no such thread is there to run it. The handle resolves to what
+    /// `future` produced, or to `Err` where the runtime lost the task — after it panicked, say.
+    /// Dropping the handle cancels the task; [`Task::detach`] lets it run on.
     ///
     /// `name` says what the task is there for — `"socket reader"`, say. It is for diagnostics
     /// only: it is what the message logged if the task panics names it by.
@@ -208,12 +328,16 @@ impl Runtime<Shared> {
         T: Send + 'static,
     {
         let (join, task) = scheduler::task::<Shared, _>(name.into(), future);
-
-        Task(scheduler::spawn::<Shared, T>(
+        let task = Task(scheduler::spawn::<Shared, T>(
             &self.core,
             join,
             Box::pin(task),
-        ))
+        ));
+        // Asked for once the task is on the scheduler's queue, so that a helper starting here
+        // finds it there.
+        self.core.ensure_progress();
+
+        task
     }
 
     /// Watches `source` for readiness.
@@ -231,7 +355,36 @@ impl Runtime<Shared> {
     where
         S: AsSource + Send + Sync + 'static,
     {
-        reactor::register::<Shared>(&self.core, Arc::new(source))
+        let registered = reactor::register::<Shared>(&self.core, Arc::new(source))?;
+        // Asked for once the source is in the reactor's map, so that a helper starting here
+        // takes it into its very first wait.
+        self.core.ensure_progress();
+
+        Ok(registered)
+    }
+
+    /// A handle on `core`, whatever registry it is or is not in.
+    #[cfg(all(test, feature = "helper"))]
+    pub(crate) fn from_inner(core: Arc<Core<Shared>>) -> Self {
+        Self { core }
+    }
+
+    /// What this handle is on.
+    #[cfg(all(test, feature = "helper"))]
+    pub(crate) fn inner(&self) -> &Arc<Core<Shared>> {
+        &self.core
+    }
+
+    /// Whether the helper thread is running.
+    #[cfg(all(test, feature = "helper"))]
+    pub(crate) fn helper_running(&self) -> bool {
+        driver::seat(&self.core).helper_running()
+    }
+
+    /// Whether the helper thread is parked for want of the seat.
+    #[cfg(all(test, feature = "helper"))]
+    pub(crate) fn helper_parked(&self) -> bool {
+        driver::seat(&self.core).helper_parked()
     }
 }
 
@@ -277,8 +430,10 @@ where
     /// Lets the task run to completion on its own.
     ///
     /// A detached task is the runtime's to keep: it runs until it ends, whenever a thread is
-    /// inside [`Runtime::block_on`] on its runtime. A task that never ends is kept, with
-    /// everything its future holds, for as long as the runtime lives.
+    /// inside [`Runtime::block_on`] on its runtime, and on a runtime from
+    /// `SharedRuntime::current`, on a helper thread where no such thread is there to run it. A
+    /// task that never ends is kept, with everything its future holds, for as long as the runtime
+    /// lives, and where a helper runs it, keeps that helper for the life of the process.
     pub fn detach(self) {
         self.0.detach();
     }
@@ -304,11 +459,14 @@ where
     }
 }
 
-/// A timer on a [`Runtime`].
+/// A timer on a [`Runtime`], which keeps a thread on it for as long as it has a deadline.
 ///
-/// The reactor takes a timer's deadline on the first poll of it rather than where it is made, so
-/// a timer nobody ever polls costs nothing at all. A timer holds its runtime, so a task holding
-/// one keeps that runtime alive: nothing here takes a runtime down while it has work.
+/// The reactor takes a timer's deadline on the first poll of it rather than where it is made, and
+/// the thread that is to fire it has to be there from that poll onwards, however long ago the
+/// timer was asked for. So it is the poll that asks for one — a helper thread, on a runtime from
+/// `SharedRuntime::current` that nobody is inside `block_on` on — and a timer nobody ever polls
+/// costs nothing at all. A timer holds its runtime, so a task holding one keeps that runtime
+/// alive: nothing here takes a runtime down while it has work.
 pub struct Sleep<M = Local>(reactor::Sleep<M>)
 where
     M: Mode;
@@ -320,7 +478,20 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        Pin::new(&mut self.get_mut().0).poll(cx)
+        let this = self.get_mut();
+        if Pin::new(&mut this.0).poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        // A timer that never comes due leaves no deadline behind and needs no thread: one
+        // started for it would find nothing to wait on and retire in the round it started.
+        if this.0.never_fires() {
+            return Poll::Pending;
+        }
+        // Asked for once the deadline is in the reactor's map, so that a helper starting here
+        // waits on it.
+        M::ensure_progress(this.0.core());
+
+        Poll::Pending
     }
 }
 

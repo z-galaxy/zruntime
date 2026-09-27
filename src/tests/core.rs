@@ -630,12 +630,12 @@ impl Drop for ReadyThenPanicOnDrop {
 /// A source shareable between the registration a test makes and the reads or writes it makes
 /// directly: an owned descriptor of its own, behind an `Arc` of the test's own.
 #[cfg(unix)]
-type TestSource = Arc<std::os::fd::OwnedFd>;
+pub(super) type TestSource = Arc<std::os::fd::OwnedFd>;
 #[cfg(windows)]
-type TestSource = Arc<std::os::windows::io::OwnedSocket>;
+pub(super) type TestSource = Arc<std::os::windows::io::OwnedSocket>;
 
 /// A connected pair: the source to register, and the far end to drive it from.
-fn pair() -> (TestSource, Socket) {
+pub(super) fn pair() -> (TestSource, Socket) {
     let (near, far) = connected();
     near.set_nonblocking(true).unwrap();
     far.set_nonblocking(true).unwrap();
