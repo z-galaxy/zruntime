@@ -7,7 +7,7 @@
 
 A simple, single-threaded Rust async runtime:
 
-* a scheduler that holds tasks and hands them out to be polled
+* a scheduler that holds tasks and hands them out to be polled.
 * a `poll(2)`/`select` reactor that watches registered I/O sources and keeps timers, and
 * [`block_on`] to drive a future to completion on the calling thread.
 
