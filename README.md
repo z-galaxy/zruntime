@@ -5,10 +5,11 @@
 [![](https://img.shields.io/crates/v/zruntime)](https://crates.io/crates/zruntime)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/zruntime?utm_source=badge)
 
-A simple, single-threaded Rust async runtime: a scheduler that holds tasks and hands them out to
-be polled, a `poll(2)`/`select` reactor that watches registered I/O sources and keeps timers, and
-[`block_on`] to drive a future to completion on the calling thread. It has no dependency on any
-particular application; [zbus] uses it as the runtime it brings along by default.
+A simple, single-threaded Rust async runtime:
+
+* a scheduler that holds tasks and hands them out to be polled.
+* a `poll(2)`/`select` reactor that watches registered I/O sources and keeps timers, and
+* [`block_on`] to drive a future to completion on the calling thread.
 
 ## Example
 
@@ -17,8 +18,8 @@ use std::time::Duration;
 
 use zruntime::Runtime;
 
+let runtime = Runtime::current().expect("a runtime for this thread");
 let doubled = zruntime::block_on(async {
-    let runtime = Runtime::current().expect("a runtime for this thread");
     let sleeper = runtime.clone();
     let task = runtime.spawn("double", async move {
         sleeper.sleep(Duration::from_millis(1)).await;
@@ -38,10 +39,16 @@ the call returns.
 zruntime logs through [`tracing`], behind the default `tracing` feature; a `default-features =
 false` build emits no log events.
 
-[`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
-[`tracing`]: https://docs.rs/tracing
-[zbus]: https://github.com/z-galaxy/zbus
+## Why?
+
+The project grew out of the need for a single-threaded runtime in [zbus] that it would use by default.
+It was split into a separate project so non-zbus users can use it too.
 
 ## License
 
-MIT license [LICENSE](LICENSE)
+[MIT]
+
+[`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
+[`tracing`]: https://docs.rs/tracing
+[zbus]: https://github.com/z-galaxy/zbus
+[MIT]: (LICENSE)
