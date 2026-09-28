@@ -22,13 +22,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use event_listener::Event;
 use futures_lite::future::yield_now;
 use ntest::timeout;
 use socket2::{SockRef, Socket};
 
 use crate::{
-    Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime, Sleep, Task,
+    Event, Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime,
+    Sleep, Task,
 };
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local`

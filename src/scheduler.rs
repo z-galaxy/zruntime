@@ -805,12 +805,11 @@ mod tests {
         time::Duration,
     };
 
-    use event_listener::Event;
     use futures_lite::future::{block_on, yield_now};
     use ntest::timeout;
 
     use super::*;
-    use crate::{LocalRuntime, Task};
+    use crate::{Event, LocalRuntime, Task};
 
     #[test]
     #[timeout(15000)]

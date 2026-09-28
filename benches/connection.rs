@@ -38,10 +38,9 @@ use criterion::{
     BenchmarkGroup, Criterion, Throughput, async_executor::AsyncExecutor, criterion_group,
     criterion_main, measurement::Measurement,
 };
-use event_listener::Event;
 use futures_lite::future;
 use futures_util::{future::try_join_all, lock};
-use zruntime::{Shared, SharedRuntime, Task};
+use zruntime::{Event, Shared, SharedRuntime, Task};
 
 /// Runs a routine's future to completion inside `zruntime::block_on`.
 struct ZruntimeExecutor;

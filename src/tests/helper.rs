@@ -19,14 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use event_listener::{Event, EventListener};
 use futures_lite::future::{block_on, poll_once};
 use ntest::timeout;
 use socket2::SockRef;
 
 use super::core::pair;
 use crate::{
-    Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, driver,
+    Event, EventListener, Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task,
+    driver,
     runtime::{Core, lock},
 };
 
