@@ -63,3 +63,7 @@ required-features = ["helper"]
 name = "connection"
 harness = false
 required-features = ["helper"]
+
+[[bench]]
+name = "event"
+harness = false
