@@ -10,6 +10,7 @@
 
 #[cfg(feature = "helper")]
 mod driver;
+mod event;
 mod log;
 mod mode;
 mod poll;
@@ -33,6 +34,7 @@ use std::{
     time::Duration,
 };
 
+pub use event::{Event, EventListener};
 pub use mode::{Local, Mode, Shared};
 pub use reactor::Registration;
 use runtime::Core;

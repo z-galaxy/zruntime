@@ -93,6 +93,18 @@ arrives while the helper holds the runtime is handed it straight away, so a prog
 `block_on` once per operation still runs each of them on its own thread rather than behind a
 thread of the runtime's own.
 
+## Events
+
+An [`Event`] is a notification that tasks can wait for. A task takes an [`EventListener`] from it
+and awaits that, and whoever changes what the task is waiting for — releases a lock, fills a
+queue, closes a connection — notifies the event, which wakes as many of the tasks listening as it
+is asked to, oldest first. It is what the waiting part of a lock, a channel or a connection is
+built on.
+
+An event needs no runtime. A listener is a plain future, woken through the waker of whatever
+polled it last, so it works under any executor, and an event may be notified from any thread. It
+is available whatever features are enabled.
+
 ## Why?
 
 The project grew out of the need for a single-threaded runtime in [zbus] that it would use by
@@ -109,6 +121,8 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`SharedRuntime::current`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.current
 [`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
+[`Event`]: https://docs.rs/zruntime/latest/zruntime/struct.Event.html
+[`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
 [MIT]: (LICENSE)

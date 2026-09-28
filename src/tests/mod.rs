@@ -1,13 +1,16 @@
-//! Tests of a runtime as a whole.
+//! Tests of a runtime as a whole, and of the event that tasks wait for.
 //!
-//! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
-//! the `core` module, in both flavours wherever the test means the same in each. What the type
-//! system is to rule out — a local runtime's handles leaving their thread, a shared runtime taking
-//! a future that could not follow it to another — can only be shown by code that does not
-//! compile, so it is shown here, by the doc tests of the items below.
+//! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in the
+//! `core` module, in both flavours wherever the test means the same in each. An event and its
+//! listeners, which need no runtime, are tested in the `event` module. What the type system is to
+//! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future that
+//! could not follow it to another — can only be shown by code that does not compile, so it is shown
+//! here, by the doc tests of the items below.
 
 #[cfg(test)]
 mod core;
+#[cfg(test)]
+mod event;
 #[cfg(test)]
 mod helper;
 

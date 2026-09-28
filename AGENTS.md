@@ -68,14 +68,16 @@ cargo bench --features helper
 ```
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Interest,
-│                 # Task, Sleep, and (helper feature) the free block_on
+│                 # Task, Sleep, Event, EventListener, and (helper feature) the free block_on
+├── event.rs      # Event/EventListener: a notification tasks wait for, under any executor
 ├── mode.rs       # The sealed `Mode` trait: what Local/Shared build their shared state from
 ├── runtime.rs    # Core<M>: scheduler + reactor + driving state, pointed to by a Runtime<M>
 ├── scheduler.rs  # Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # Watches registered I/O sources and keeps timers
 ├── poll/         # The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
-└── tests/        # core.rs: Local + Shared, always compiled; helper.rs: the helper feature
+└── tests/        # core.rs: Local + Shared, always compiled; event.rs: Event, always compiled;
+                  # helper.rs: the helper feature
 ```
 
 ### Key Design Patterns
@@ -135,3 +137,4 @@ completion unobserved.
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
 - `src/reactor.rs`: I/O readiness and timers
 - `src/scheduler.rs`: Task storage and polling
+- `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex
