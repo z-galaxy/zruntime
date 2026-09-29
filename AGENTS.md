@@ -77,6 +77,9 @@ cargo doc --all-features
 # Run benchmarks (need the helper feature: they measure the block_on-per-operation case; the
 # event and connection ones need Event too, which is a default feature)
 cargo bench --features helper
+
+# The broadcast channel's benchmark needs the broadcast feature and no runtime
+cargo bench --features broadcast --bench broadcast
 ```
 
 ## Architecture Overview

@@ -79,3 +79,8 @@ required-features = ["helper", "event"]
 name = "event"
 harness = false
 required-features = ["event"]
+
+[[bench]]
+name = "broadcast"
+harness = false
+required-features = ["broadcast"]
