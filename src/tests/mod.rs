@@ -6,12 +6,16 @@
 //! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future that
 //! could not follow it to another — can only be shown by code that does not compile, so it is shown
 //! here, by the doc tests of the items below.
+//!
+//! The runtime and the event are features of their own, and a build may have either without the
+//! other. A test of the runtime that uses an event to know that something happened is built only
+//! where both are.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "runtime"))]
 mod core;
-#[cfg(test)]
+#[cfg(all(test, feature = "event"))]
 mod event;
-#[cfg(test)]
+#[cfg(all(test, feature = "helper"))]
 mod helper;
 
 /// A local runtime's handle stays on its thread: it is neither `Send`...
@@ -50,7 +54,7 @@ mod helper;
 ///
 /// sent_and_shared::<zruntime::SharedRuntime>();
 /// ```
-#[cfg(doctest)]
+#[cfg(all(doctest, feature = "runtime"))]
 struct LocalRuntimeStaysOnItsThread;
 
 /// What is built on a local runtime stays on its thread as well: a task handle...
@@ -102,7 +106,7 @@ struct LocalRuntimeStaysOnItsThread;
 /// sent::<zruntime::Sleep<zruntime::Shared>>();
 /// sent::<zruntime::Registration<zruntime::Shared>>();
 /// ```
-#[cfg(doctest)]
+#[cfg(all(doctest, feature = "runtime"))]
 struct LocalHandlesStayOnTheirThread;
 
 /// A shared runtime's tasks may be polled on any thread, so it turns a future away that could not
@@ -129,5 +133,5 @@ struct LocalHandlesStayOnTheirThread;
 ///
 /// assert_eq!(runtime.block_on(task).unwrap(), 7);
 /// ```
-#[cfg(doctest)]
+#[cfg(all(doctest, feature = "runtime"))]
 struct SharedRuntimeTakesSendFuturesOnly;

@@ -304,13 +304,17 @@ impl Seat {
     }
 
     /// Whether the helper thread is up and parked, having left the seat to a `block_on`.
-    #[cfg(test)]
+    ///
+    /// Only tests that wait for an `Event` ask this, so it is built with the `event` feature.
+    #[cfg(all(test, feature = "event"))]
     pub(crate) fn helper_parked(&self) -> bool {
         self.parked_helper().is_some()
     }
 
     /// How many threads are down as waiting for the seat.
-    #[cfg(test)]
+    ///
+    /// Only tests that wait for an `Event` ask this, so it is built with the `event` feature.
+    #[cfg(all(test, feature = "event"))]
     pub(crate) fn waiting(&self) -> usize {
         self.waiting.len()
     }

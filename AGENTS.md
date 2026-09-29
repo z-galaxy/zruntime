@@ -19,6 +19,15 @@ drive their work with one `block_on` call per operation rather than one for the 
 is a standalone crate with no dependency on any particular application; it was extracted from
 zbus's built-in runtime, which now depends on it.
 
+Two default cargo features, each usable without the other, split the crate. `runtime` is the
+runtime above — `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations —
+and is what needs `rustix` on unix and `windows-sys` on Windows. `event` is `Event` and
+`EventListener`, a notification that tasks wait for, which needs no runtime and works under any
+executor. A crate that only notifies (as zbus does, whatever runtime it runs on) builds zruntime
+with `default-features = false, features = ["event"]` and gets none of the runtime; one that only
+runs tasks leaves `event` out. `helper` implies `runtime`, and `tracing`, also a default feature,
+makes the runtime log through the `tracing` crate.
+
 It is a single crate at the repository root — not a workspace.
 
 ## Common Development Commands
@@ -40,9 +49,10 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the build without the `tracing` feature: the no-op `error!` in `log.rs` that replaces
-# `tracing`'s is the only code `--all-features` leaves out
-cargo check --no-default-features
+# Check the runtime and Event each built alone: `--all-features` cannot show that each builds
+# without the other, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
+cargo check --no-default-features --features runtime
+cargo check --no-default-features --features event
 
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
@@ -59,7 +69,8 @@ cargo doc --all-features
 
 ### Benchmarks
 ```bash
-# Run benchmarks (need the helper feature: they measure the block_on-per-operation case)
+# Run benchmarks (need the helper feature: they measure the block_on-per-operation case; the
+# event and connection ones need Event too, which is a default feature)
 cargo bench --features helper
 ```
 
@@ -68,16 +79,21 @@ cargo bench --features helper
 ```
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Interest,
-│                 # Task, Sleep, Event, EventListener, and (helper feature) the free block_on
-├── event.rs      # Event/EventListener: a notification tasks wait for, under any executor
-├── mode.rs       # The sealed `Mode` trait: what Local/Shared build their shared state from
-├── runtime.rs    # Core<M>: scheduler + reactor + driving state, pointed to by a Runtime<M>
-├── scheduler.rs  # Holds spawned tasks and hands them out to be polled
-├── reactor.rs    # Watches registered I/O sources and keeps timers
-├── poll/         # The OS polling primitive (poll(2) on unix, select on Windows)
+│                 # Task, Sleep (runtime feature), Event, EventListener (event feature), and
+│                 # the free block_on (helper feature)
+├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
+│                 # any executor, with no use of the runtime
+├── event-only.md # The crate's documentation in a build with `event` but not `runtime`, whose
+│                 # README examples it cannot run
+├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
+├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
+├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
+├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
+├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
+├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
-└── tests/        # core.rs: Local + Shared, always compiled; event.rs: Event, always compiled;
-                  # helper.rs: the helper feature
+└── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
+                  # helper.rs: helper feature
 ```
 
 ### Key Design Patterns
@@ -121,6 +137,11 @@ completion unobserved.
 - **Changelog**: `CHANGELOG.md` is managed by [release-plz] — do **not** hand-edit it. Write a
   good commit message (conventional-commits-ish) and release-plz will generate the entry at
   release time.
+- **Features**: `runtime` and `event` each build without the other. Nothing in `event.rs` may reach
+  into the runtime, and a test of the runtime that uses an `Event` is gated with
+  `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
+  tests without it). CI builds and tests everything with every feature on, and checks each of the
+  two alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).

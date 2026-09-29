@@ -20,21 +20,30 @@ targets = [
 ]
 
 [features]
-default = ["tracing"]
+default = ["runtime", "event", "tracing"]
+# The runtime: `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations.
+runtime = ["dep:rustix", "dep:windows-sys"]
+# `Event` and `EventListener`, which need no runtime.
+event = []
 # Logs through `tracing`; a build without it emits no log events.
 tracing = ["dep:tracing"]
 # Per-thread shared runtimes: `SharedRuntime::current()`, the free `block_on`, and the helper
 # thread that keeps their work moving in between `block_on` calls.
-helper = []
+helper = ["runtime"]
 
 [dependencies]
 tracing = { version = "0.1.44", optional = true }
 
-[target."cfg(unix)".dependencies]
-rustix = { version = "1.1.5", default-features = false, features = ["event", "pipe", "std"] }
+[target."cfg(unix)".dependencies.rustix]
+version = "1.1.5"
+default-features = false
+features = ["event", "pipe", "std"]
+optional = true
 
-[target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.61.2"
+features = ["Win32_Networking_WinSock"]
+optional = true
 
 [target."cfg(windows)".dev-dependencies]
 uds_windows = "1.2.1"
@@ -61,8 +70,9 @@ required-features = ["helper"]
 [[bench]]
 name = "connection"
 harness = false
-required-features = ["helper"]
+required-features = ["helper", "event"]
 
 [[bench]]
 name = "event"
 harness = false
+required-features = ["event"]

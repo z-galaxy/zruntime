@@ -74,9 +74,6 @@ or [`SharedRuntime`] instead of naming [`Runtime`] directly.
 A future built from several tasks, timers and registered sockets runs the same way: `block_on`
 drives all of it on the calling thread.
 
-zruntime logs through [`tracing`], behind the default `tracing` feature; a `default-features =
-false` build emits no log events.
-
 ## The `helper` feature
 
 The two examples above each drive their runtime with one `block_on` call. A library whose
@@ -103,7 +100,21 @@ built on.
 
 An event needs no runtime. A listener is a plain future, woken through the waker of whatever
 polled it last, so it works under any executor, and an event may be notified from any thread. It
-is available whatever features are enabled.
+is behind the `event` feature, which builds without the runtime: see [Features](#features).
+
+## Features
+
+* `runtime` (default): [`Runtime`], [`LocalRuntime`] and [`SharedRuntime`], with the tasks,
+  timers and I/O registrations built on them.
+* `event` (default): [`Event`] and [`EventListener`], which need no runtime.
+* `tracing` (default): the runtime logs through [`tracing`]; a build without it emits no log
+  events.
+* `helper`: the layer [described above](#the-helper-feature); it implies `runtime`.
+
+`runtime` and `event` each build without the other. A crate that wants only the `Event` builds
+zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
+nor the `rustix` and `windows-sys` crates the runtime polls with; one that wants only the runtime
+leaves `event` out.
 
 ## Why?
 

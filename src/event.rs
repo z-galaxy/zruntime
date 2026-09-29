@@ -47,11 +47,9 @@ use std::{
     future::Future,
     mem,
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
     task::{Context, Poll, Waker},
 };
-
-use crate::runtime::lock;
 
 /// A notification that tasks can wait for.
 ///
@@ -98,7 +96,9 @@ use crate::runtime::lock;
 ///
 /// # Example
 ///
-/// A flag that one thread raises and a task waits for:
+/// A flag that one thread raises and a task waits for. The task is driven by `block_on` from the
+/// `futures-lite` crate, but the `block_on` of any executor would do, as an event needs no
+/// runtime:
 ///
 /// ```
 /// use std::{
@@ -109,7 +109,8 @@ use crate::runtime::lock;
 ///     thread,
 /// };
 ///
-/// use zruntime::{Event, LocalRuntime};
+/// use futures_lite::future::block_on;
+/// use zruntime::Event;
 ///
 /// /// A flag, raised once, and the event its raising is announced through.
 /// struct Flag {
@@ -129,8 +130,7 @@ use crate::runtime::lock;
 ///     }
 /// });
 ///
-/// let runtime = LocalRuntime::new().expect("a runtime for this thread");
-/// runtime.block_on(async {
+/// block_on(async {
 ///     // Taken before the check, so that a raising the check misses is one it hears of.
 ///     let listener = flag.event.listen();
 ///     if !flag.raised.load(Ordering::Acquire) {
@@ -185,21 +185,29 @@ impl Event {
     /// # Example
     ///
     /// ```
-    /// use zruntime::{Event, LocalRuntime};
+    /// use std::{
+    ///     future::Future,
+    ///     pin::Pin,
+    ///     task::{Context, Waker},
+    /// };
+    ///
+    /// use zruntime::Event;
     ///
     /// let event = Event::new();
-    /// let first = event.listen();
-    /// let second = event.listen();
+    /// let mut first = event.listen();
+    /// let mut second = event.listen();
+    /// // The listeners are polled by hand, with a waker that goes nowhere.
+    /// let mut cx = Context::from_waker(Waker::noop());
     ///
     /// assert_eq!(event.notify(1), 1);
     /// // The first listener is still notified, so one listener is notified already.
     /// assert_eq!(event.notify(1), 0);
     ///
-    /// let runtime = LocalRuntime::new().expect("a runtime for this thread");
-    /// runtime.block_on(first);
+    /// assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
+    /// assert!(Pin::new(&mut second).poll(&mut cx).is_pending());
     /// // The first listener has completed and no longer counts, so this notifies the second.
     /// assert_eq!(event.notify(1), 1);
-    /// runtime.block_on(second);
+    /// assert!(Pin::new(&mut second).poll(&mut cx).is_ready());
     /// ```
     pub fn notify(&self, n: usize) -> usize {
         self.send(n, Notification::Counting)
@@ -215,21 +223,26 @@ impl Event {
     /// # Example
     ///
     /// ```
-    /// use zruntime::{Event, LocalRuntime};
+    /// use std::{
+    ///     future::Future,
+    ///     pin::Pin,
+    ///     task::{Context, Waker},
+    /// };
+    ///
+    /// use zruntime::Event;
     ///
     /// let event = Event::new();
-    /// let first = event.listen();
-    /// let second = event.listen();
+    /// let mut first = event.listen();
+    /// let mut second = event.listen();
+    /// // The listeners are polled by hand, with a waker that goes nowhere.
+    /// let mut cx = Context::from_waker(Waker::noop());
     ///
     /// assert_eq!(event.notify(1), 1);
     /// // One more of whatever the first listener waits for, for the second one.
     /// assert_eq!(event.notify_additional(1), 1);
     ///
-    /// let runtime = LocalRuntime::new().expect("a runtime for this thread");
-    /// runtime.block_on(async {
-    ///     first.await;
-    ///     second.await;
-    /// });
+    /// assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
+    /// assert!(Pin::new(&mut second).poll(&mut cx).is_ready());
     /// ```
     pub fn notify_additional(&self, n: usize) -> usize {
         self.send(n, Notification::Additional)
@@ -625,4 +638,12 @@ impl Wakers {
             waker.wake();
         }
     }
+}
+
+/// The value behind a lock, taken whether or not a panic poisoned it.
+///
+/// The runtime has a function like this one too, but this module does not use it: the runtime may
+/// be left out of the build, and an event needs none of it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

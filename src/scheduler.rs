@@ -797,11 +797,12 @@ impl Wake for TaskWaker {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "event")]
+    use std::thread;
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
         sync::atomic::{AtomicBool, Ordering},
-        thread,
         time::Duration,
     };
 
@@ -809,7 +810,9 @@ mod tests {
     use ntest::timeout;
 
     use super::*;
-    use crate::{Event, LocalRuntime, Task};
+    #[cfg(feature = "event")]
+    use crate::Event;
+    use crate::{LocalRuntime, Task};
 
     #[test]
     #[timeout(15000)]
@@ -823,6 +826,7 @@ mod tests {
         assert_eq!(runtime.core.scheduler.live_tasks(), 0);
     }
 
+    #[cfg(feature = "event")]
     #[test]
     #[timeout(15000)]
     fn a_wake_from_another_thread_notifies_the_driver() {

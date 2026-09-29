@@ -26,9 +26,10 @@ use futures_lite::future::yield_now;
 use ntest::timeout;
 use socket2::{SockRef, Socket};
 
+#[cfg(feature = "event")]
+use crate::Event;
 use crate::{
-    Event, Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime,
-    Sleep, Task,
+    Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime, Sleep, Task,
 };
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local`
@@ -116,6 +117,7 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    #[cfg(feature = "event")]
     fn a_detached_task_runs_to_completion<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let done = Arc::new(Event::new());
@@ -423,6 +425,7 @@ fn a_local_task_can_hold_an_rc() {
 ///
 /// A waker is `Send` whatever the task it wakes is, so a local task waiting on a thread's work is
 /// woken by that thread as any other task is.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_thread_wakes_a_local_task() {
@@ -449,6 +452,7 @@ fn a_thread_wakes_a_local_task() {
 
 /// A task spawned from another thread onto a shared runtime breaks the wait of the thread inside
 /// `block_on` on it, which then runs the task.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_spawn_from_another_thread_reaches_the_driving_thread() {
@@ -475,6 +479,7 @@ fn a_spawn_from_another_thread_reaches_the_driving_thread() {
 
 /// A shared runtime is driven by one thread at a time, so a second thread asking to drive it
 /// while the first does is told so rather than left to race it.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_second_concurrent_block_on_panics() {
