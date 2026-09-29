@@ -269,16 +269,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "event-listener"
-version = "5.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
-dependencies = [
- "parking",
- "pin-project-lite",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1032,7 +1022,6 @@ name = "zruntime"
 version = "0.1.0"
 dependencies = [
  "codspeed-criterion-compat",
- "event-listener",
  "futures-lite",
  "futures-util",
  "ntest",

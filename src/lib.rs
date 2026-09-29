@@ -1,4 +1,9 @@
-#![doc = include_str!("../README.md")]
+#![cfg_attr(feature = "runtime", doc = include_str!("../README.md"))]
+// The README's examples need the runtime, so a build without it gets an overview of its own.
+#![cfg_attr(
+    all(feature = "event", not(feature = "runtime")),
+    doc = include_str!("event-only.md")
+)]
 #![deny(rust_2018_idioms)]
 #![doc(test(attr(
     warn(unused),
@@ -10,17 +15,26 @@
 
 #[cfg(feature = "helper")]
 mod driver;
+#[cfg(feature = "event")]
+mod event;
+#[cfg(feature = "runtime")]
 mod log;
+#[cfg(feature = "runtime")]
 mod mode;
+#[cfg(feature = "runtime")]
 mod poll;
+#[cfg(feature = "runtime")]
 mod reactor;
+#[cfg(feature = "runtime")]
 mod runtime;
+#[cfg(feature = "runtime")]
 mod scheduler;
 
-#[cfg(unix)]
+#[cfg(all(feature = "runtime", unix))]
 use std::os::fd::AsFd as AsSource;
-#[cfg(windows)]
+#[cfg(all(feature = "runtime", windows))]
 use std::os::windows::io::AsSocket as AsSource;
+#[cfg(feature = "runtime")]
 use std::{
     borrow::Cow,
     fmt,
@@ -33,9 +47,15 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "event")]
+pub use event::{Event, EventListener};
+#[cfg(feature = "runtime")]
 pub use mode::{Local, Mode, Shared};
+#[cfg(feature = "runtime")]
 pub use reactor::Registration;
+#[cfg(feature = "runtime")]
 use runtime::Core;
+#[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
 
 /// Runs `future` to completion on the calling thread, running that thread's runtime alongside it.
@@ -75,9 +95,11 @@ where
 }
 
 /// A runtime that stays on the thread it was made on, and runs futures that need not be `Send`.
+#[cfg(feature = "runtime")]
 pub type LocalRuntime = Runtime<Local>;
 
 /// A runtime that may be reached from, and driven on, any thread, and runs `Send` futures.
+#[cfg(feature = "runtime")]
 pub type SharedRuntime = Runtime<Shared>;
 
 /// A handle to a runtime: a scheduler and a reactor, driven by whichever thread is inside
@@ -97,6 +119,7 @@ pub type SharedRuntime = Runtime<Shared>;
 /// atomics or locks beyond what a [`Waker`](std::task::Waker) forces. [`Shared`] costs an `Arc`
 /// and a `Mutex` where `Local` costs an `Rc` and a `RefCell`, and only runs `Send` futures, in
 /// return for being usable from, and drivable on, any thread.
+#[cfg(feature = "runtime")]
 pub struct Runtime<M = Local>
 where
     M: Mode,
@@ -104,6 +127,7 @@ where
     core: M::Ptr<Core<M>>,
 }
 
+#[cfg(feature = "runtime")]
 impl<M> Runtime<M>
 where
     M: Mode,
@@ -165,6 +189,7 @@ where
     }
 }
 
+#[cfg(feature = "runtime")]
 impl Runtime<Local> {
     /// Queues `future` under the diagnostic name `name` and hands back the task that joins or
     /// cancels it.
@@ -241,6 +266,7 @@ impl Runtime<Local> {
     }
 }
 
+#[cfg(feature = "runtime")]
 impl Runtime<Shared> {
     /// A handle on the runtime for what this thread builds, brought into being here if none is
     /// alive.
@@ -381,12 +407,15 @@ impl Runtime<Shared> {
     }
 
     /// Whether the helper thread is parked for want of the seat.
-    #[cfg(all(test, feature = "helper"))]
+    ///
+    /// Only tests that wait for an `Event` ask this, so it is built with the `event` feature.
+    #[cfg(all(test, feature = "helper", feature = "event"))]
     pub(crate) fn helper_parked(&self) -> bool {
         driver::seat(&self.core).helper_parked()
     }
 }
 
+#[cfg(feature = "runtime")]
 impl<M> Clone for Runtime<M>
 where
     M: Mode,
@@ -398,6 +427,7 @@ where
     }
 }
 
+#[cfg(feature = "runtime")]
 impl<M> fmt::Debug for Runtime<M>
 where
     M: Mode,
@@ -408,6 +438,7 @@ where
 }
 
 /// The readiness an I/O operation waits for.
+#[cfg(feature = "runtime")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Interest {
@@ -418,10 +449,12 @@ pub enum Interest {
 }
 
 /// A task spawned on a [`Runtime`], which cancels that task when dropped.
+#[cfg(feature = "runtime")]
 pub struct Task<T, M = Local>(JoinHandle<T, M>)
 where
     M: Mode;
 
+#[cfg(feature = "runtime")]
 impl<T, M> Task<T, M>
 where
     M: Mode,
@@ -438,6 +471,7 @@ where
     }
 }
 
+#[cfg(feature = "runtime")]
 impl<T, M> fmt::Debug for Task<T, M>
 where
     M: Mode,
@@ -447,6 +481,7 @@ where
     }
 }
 
+#[cfg(feature = "runtime")]
 impl<T, M> Future for Task<T, M>
 where
     M: Mode,
@@ -466,10 +501,12 @@ where
 /// `SharedRuntime::current` that nobody is inside `block_on` on — and a timer nobody ever polls
 /// costs nothing at all. A timer holds its runtime, so a task holding one keeps that runtime
 /// alive: nothing here takes a runtime down while it has work.
+#[cfg(feature = "runtime")]
 pub struct Sleep<M = Local>(reactor::Sleep<M>)
 where
     M: Mode;
 
+#[cfg(feature = "runtime")]
 impl<M> Future for Sleep<M>
 where
     M: Mode,

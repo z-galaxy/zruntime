@@ -1,0 +1,649 @@
+//! A notification that tasks wait for, and that anyone may send.
+//!
+//! An [`Event`] keeps a queue of listeners, oldest first. [`Event::listen`] puts one at the back
+//! and hands it out as an [`EventListener`], a future that completes once a notification reaches
+//! it; [`Event::notify`] and [`Event::notify_additional`] mark the oldest listeners not notified
+//! yet and wake the tasks that polled them. A listener takes its notification by completing, or
+//! passes it on by being dropped with it.
+//!
+//! All of an event's state is one [`List`] behind one mutex, allocated by the first `listen` or
+//! `notify` rather than by [`Event::new`], which can then be a `const fn`. The list is a slab: a
+//! vector of slots, each either holding the entry of one listener or vacant, the vacant ones
+//! chained into a list that the next `listen` takes a slot from before it grows the vector. A
+//! listener holds the index of its slot as its key, which is how it finds its entry, and the
+//! entries are linked by index into a doubly-linked queue, which is how a listener leaves the
+//! queue from wherever it is in it without a walk. The vector never shrinks: an event keeps as many
+//! slots as it has had listeners alive at once, for as long as it lives.
+//!
+//! What the list relies on, and every change made under its lock keeps:
+//!
+//! * A slot is freed only by the listener whose key names it, as that listener completes or is
+//!   dropped, and the listener lets go of its key as it frees it. So a key never names a slot
+//!   another listener has taken since.
+//! * The notified entries are a prefix of the queue. [`List::first_waiting`] names the first entry
+//!   after them, or nothing where every entry is notified: a notification starts there rather than
+//!   walking past the listeners notified already.
+//! * [`List::notified`] is the number of notified entries, which is what the counting
+//!   [`Event::notify`] counts against.
+//! * Only an entry still waiting holds a waker: a notification takes it out as it marks the entry.
+//!
+//! No waker is woken, cloned or dropped while the lock is held. Each of these runs somebody else's
+//! code, which may come straight back to this event — to listen, to notify, to drop a listener —
+//! and take the lock itself. A notification takes the wakers out and wakes them once it has let go
+//! of the lock; a poll clones the waker it is to store with the lock let go of, and drops the one
+//! it replaces the same way. So nothing but this module's own code runs under the lock, none of
+//! which panics while the list keeps to what it relies on, and the lock is taken whether a panic
+//! poisoned it or not: none can have left the list half-changed.
+//!
+//! The one mutex is also what keeps a notification from slipping between a listener being taken
+//! and its caller checking the condition it waits for, with no fence of its own. Whoever notifies
+//! changes the condition before `notify` takes the lock, and `listen` lets go of the lock before
+//! its caller checks the condition. If `notify` takes the lock after `listen` let go of it, it
+//! finds the listener in the queue; if before, its release of the lock comes before `listen`'s
+//! taking of it, and so before the check, which then sees the condition changed.
+
+use std::{
+    fmt,
+    future::Future,
+    mem,
+    pin::Pin,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    task::{Context, Poll, Waker},
+};
+
+/// A notification that tasks can wait for.
+///
+/// An event is where a task waits for a condition to change — a lock to be released, a queue to
+/// have room, a connection to close. The task takes a listener with [`Event::listen`] and awaits
+/// it, and whoever changes the condition notifies the event, which wakes the tasks listening. The
+/// event carries no value and knows nothing of the condition: it only brings the news that
+/// something changed, to the listeners there to hear it.
+///
+/// An event needs no runtime. A listener is a plain [`Future`], woken through the waker of
+/// whatever polled it last, so it works under any executor, and an event may be notified from any
+/// thread, from inside a task or from outside of one.
+///
+/// # Listen, then check
+///
+/// A notification reaches only the listeners there when it is sent: one sent before a listener
+/// was taken is not kept for it. So a task takes its listener before its last check of the
+/// condition, and awaits the listener only where that check fails. A change made before the
+/// check is then one the check sees, and a change made after it is one the listener hears of.
+/// Checking first and listening after leaves a gap between the two, in which a notification can
+/// come and go unheard while the task goes on to wait for good.
+///
+/// # How many listeners a notification reaches
+///
+/// Listeners are notified oldest first. A listener counts as notified from the moment a
+/// notification reaches it until it completes or is dropped. [`Event::notify`] counts those:
+/// `notify(n)` notifies listeners until at least `n` are notified, so calling `notify(1)` twice in
+/// a row notifies one listener, not two. That suits a condition that only one waiter can act on,
+/// such as a lock that only one of them can take. [`Event::notify_additional`] notifies `n` more
+/// listeners, regardless of how many are notified already, which suits a condition that `n` more
+/// waiters can act on, such as a queue with `n` more items in it. `notify(usize::MAX)` notifies
+/// every listener there is.
+///
+/// A listener dropped while notified, before it completed, passes its notification on, so that a
+/// task giving up its wait does not take the news with it. If `notify` sent the notification, the
+/// next listener gets it only if no other listener is notified at that point, as a `notify(1)`
+/// would do. If `notify_additional` sent it, the next listener gets it regardless.
+///
+/// The tasks a notification wakes are woken after the event has taken note of it, so that a waker
+/// is free to come back into the same event from its `wake`: to notify it, listen to it or drop
+/// one of its listeners. A listener polled on another thread in the meantime sees its
+/// notification and completes, so a task can be done with its listener while the thread that
+/// notified it still holds the waker it is waking.
+///
+/// # Example
+///
+/// A flag that one thread raises and a task waits for. The task is driven by `block_on` from the
+/// `futures-lite` crate, but the `block_on` of any executor would do, as an event needs no
+/// runtime:
+///
+/// ```
+/// use std::{
+///     sync::{
+///         Arc,
+///         atomic::{AtomicBool, Ordering},
+///     },
+///     thread,
+/// };
+///
+/// use futures_lite::future::block_on;
+/// use zruntime::Event;
+///
+/// /// A flag, raised once, and the event its raising is announced through.
+/// struct Flag {
+///     raised: AtomicBool,
+///     event: Event,
+/// }
+///
+/// let flag = Arc::new(Flag {
+///     raised: AtomicBool::new(false),
+///     event: Event::new(),
+/// });
+/// let raiser = thread::spawn({
+///     let flag = flag.clone();
+///     move || {
+///         flag.raised.store(true, Ordering::Release);
+///         flag.event.notify(usize::MAX);
+///     }
+/// });
+///
+/// block_on(async {
+///     // Taken before the check, so that a raising the check misses is one it hears of.
+///     let listener = flag.event.listen();
+///     if !flag.raised.load(Ordering::Acquire) {
+///         listener.await;
+///     }
+/// });
+///
+/// assert!(flag.raised.load(Ordering::Acquire));
+/// raiser.join().expect("the other thread did not panic");
+/// ```
+pub struct Event {
+    /// What the event and its listeners share, brought into being by the first `listen` or
+    /// `notify`.
+    list: OnceLock<Arc<Mutex<List>>>,
+}
+
+impl Event {
+    /// An event with nobody listening to it.
+    ///
+    /// Making one allocates nothing, so an event can sit in a `static` or in a value made by a
+    /// `const fn` of its own.
+    pub const fn new() -> Self {
+        Self {
+            list: OnceLock::new(),
+        }
+    }
+
+    /// A listener to this event, which completes once a notification reaches it.
+    ///
+    /// The listener is in the event's queue by the time this returns: every notification sent
+    /// from then on can reach it, whether it has been polled yet or not. Take it before the last
+    /// check of the condition it is for, as [listen, then check](Event#listen-then-check) says.
+    pub fn listen(&self) -> EventListener {
+        let list = self.list();
+        let key = lock(list).insert();
+
+        EventListener {
+            list: list.clone(),
+            key: Some(key),
+        }
+    }
+
+    /// Notifies the oldest listeners not notified yet, until at least `n` listeners are notified
+    /// or none is left to notify.
+    ///
+    /// Listeners notified earlier count towards `n` until they complete or are dropped, so this
+    /// notifies no listener if `n` are notified already, and `notify(usize::MAX)` notifies every
+    /// listener there is. The task that last polled each listener this notifies is woken.
+    ///
+    /// Returns how many listeners this call notified.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{
+    ///     future::Future,
+    ///     pin::Pin,
+    ///     task::{Context, Waker},
+    /// };
+    ///
+    /// use zruntime::Event;
+    ///
+    /// let event = Event::new();
+    /// let mut first = event.listen();
+    /// let mut second = event.listen();
+    /// // The listeners are polled by hand, with a waker that goes nowhere.
+    /// let mut cx = Context::from_waker(Waker::noop());
+    ///
+    /// assert_eq!(event.notify(1), 1);
+    /// // The first listener is still notified, so one listener is notified already.
+    /// assert_eq!(event.notify(1), 0);
+    ///
+    /// assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
+    /// assert!(Pin::new(&mut second).poll(&mut cx).is_pending());
+    /// // The first listener has completed and no longer counts, so this notifies the second.
+    /// assert_eq!(event.notify(1), 1);
+    /// assert!(Pin::new(&mut second).poll(&mut cx).is_ready());
+    /// ```
+    pub fn notify(&self, n: usize) -> usize {
+        self.send(n, Notification::Counting)
+    }
+
+    /// Notifies up to `n` more listeners, regardless of how many are notified already.
+    ///
+    /// These are the `n` oldest listeners not notified yet, or all of them if there are fewer. The
+    /// task that last polled each listener this notifies is woken.
+    ///
+    /// Returns how many listeners this call notified.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{
+    ///     future::Future,
+    ///     pin::Pin,
+    ///     task::{Context, Waker},
+    /// };
+    ///
+    /// use zruntime::Event;
+    ///
+    /// let event = Event::new();
+    /// let mut first = event.listen();
+    /// let mut second = event.listen();
+    /// // The listeners are polled by hand, with a waker that goes nowhere.
+    /// let mut cx = Context::from_waker(Waker::noop());
+    ///
+    /// assert_eq!(event.notify(1), 1);
+    /// // One more of whatever the first listener waits for, for the second one.
+    /// assert_eq!(event.notify_additional(1), 1);
+    ///
+    /// assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
+    /// assert!(Pin::new(&mut second).poll(&mut cx).is_ready());
+    /// ```
+    pub fn notify_additional(&self, n: usize) -> usize {
+        self.send(n, Notification::Additional)
+    }
+
+    /// How many slots the queue of this event has, vacant ones included, or `None` before
+    /// anything allocated the queue.
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> Option<usize> {
+        self.list.get().map(|list| lock(list).slots.len())
+    }
+
+    /// What this event and its listeners share, brought into being here where nothing has yet.
+    ///
+    /// A `notify` brings it into being as a `listen` does, even on an event nobody has listened
+    /// to yet: telling that nobody has would take a look without the lock, which could miss a
+    /// `listen` made on another thread just before its caller's check of the condition.
+    fn list(&self) -> &Arc<Mutex<List>> {
+        self.list.get_or_init(Arc::default)
+    }
+
+    /// Sends `notification` to `n` listeners, as [`List::notify`] counts them, and hands back how
+    /// many it reached.
+    fn send(&self, n: usize, notification: Notification) -> usize {
+        let mut wakers = Wakers::default();
+        let notified = lock(self.list()).notify(n, notification, &mut wakers);
+        // Clear of the lock: a wake is somebody else's code, which may come back to this event.
+        wakers.wake();
+
+        notified
+    }
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (listeners, notified) = match self.list.get() {
+            Some(list) => {
+                let list = lock(list);
+
+                (list.len, list.notified)
+            }
+            None => (0, 0),
+        };
+
+        f.debug_struct("Event")
+            .field("listeners", &listeners)
+            .field("notified", &notified)
+            .finish()
+    }
+}
+
+/// A listener to an [`Event`], which completes once a notification reaches it.
+///
+/// Made by [`Event::listen`], which puts it at the back of the event's queue: it can be reached
+/// by every notification sent from then on, whether it has been polled yet or not. A notification
+/// that reaches it wakes the task that polled it last, and it completes on its next poll. Polled
+/// again after it completed, it completes again at once.
+///
+/// Dropping a listener takes it out of the queue. If it was notified and had not completed yet, it
+/// passes its notification on to the next listener: if [`Event::notify`] sent the notification,
+/// only if no other listener is notified at that point, and if [`Event::notify_additional`] sent
+/// it, regardless.
+///
+/// A listener may outlive its event. Dropping the event notifies nobody: a listener notified by
+/// then still completes, and one that was not can then be reached by nothing but a notification
+/// passed on to it by a notified listener dropped after the event.
+pub struct EventListener {
+    /// What the listener shares with its event, kept alive by the listener as much as by the
+    /// event.
+    list: Arc<Mutex<List>>,
+    /// The slot of this listener's entry in the list, until it has completed.
+    key: Option<usize>,
+}
+
+impl Future for EventListener {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let Some(key) = this.key else {
+            return Poll::Ready(());
+        };
+
+        // The waker to store, cloned with the lock let go of: a waker's clone is somebody else's
+        // code, which is not to run with the lock held. Only a listener whose stored waker would
+        // not wake the same task needs one, which only the list can tell, so the clone is made
+        // once the list has said so, and the list looked at a second time with it in hand.
+        // Nothing but a notification can have changed this listener's entry in between: nobody
+        // else polls it. A clone left unused is dropped as this returns, clear of the lock too.
+        let mut clone = None;
+        let mut polled = lock(&this.list).poll(key, cx.waker(), &mut clone);
+        if let Polled::WantsClone = polled {
+            clone = Some(cx.waker().clone());
+            polled = lock(&this.list).poll(key, cx.waker(), &mut clone);
+        }
+
+        match polled {
+            Polled::Notified => {
+                this.key = None;
+
+                Poll::Ready(())
+            }
+            Polled::Waiting(replaced) => {
+                // Clear of the lock: dropping a waker can drop a task, whose future may hold a
+                // listener of this event.
+                drop(replaced);
+
+                Poll::Pending
+            }
+            Polled::WantsClone => {
+                unreachable!("a second look, with a clone in hand, never asks for one")
+            }
+        }
+    }
+}
+
+impl Drop for EventListener {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+
+        let mut wakers = Wakers::default();
+        let removed = {
+            let mut list = lock(&self.list);
+            let removed = list.remove(key);
+            // Passed on as it was sent: a counting notification only if no other listener is
+            // notified at this point, an additional one regardless.
+            if let State::Notified(notification) = removed {
+                list.notify(1, notification, &mut wakers);
+            }
+
+            removed
+        };
+        // Clear of the lock: a wake is somebody else's code, which may come back to this event, and
+        // so is the drop of the waker the entry that came out may hold, which can drop a task
+        // whose future holds a listener of this event. The wakes come first, so that a drop that
+        // panics cannot keep the listener passed to from being woken.
+        wakers.wake();
+        drop(removed);
+    }
+}
+
+impl fmt::Debug for EventListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A listener that completed was notified before it did.
+        let notified = self
+            .key
+            .is_none_or(|key| matches!(lock(&self.list).entry(key).state, State::Notified(_)));
+
+        f.debug_struct("EventListener")
+            .field("notified", &notified)
+            .finish()
+    }
+}
+
+/// The listeners of one event: their entries, in the slots of a slab, and the queue they form.
+#[derive(Default)]
+struct List {
+    /// Every slot, each holding a listener's entry or vacant.
+    slots: Vec<Slot>,
+    /// The first of the vacant slots, each of which names the next.
+    vacant: Option<usize>,
+    /// The newest listener in the queue.
+    tail: Option<usize>,
+    /// The oldest listener not notified yet: the first after those that are.
+    first_waiting: Option<usize>,
+    /// How many listeners are in the queue.
+    len: usize,
+    /// How many of them are notified.
+    notified: usize,
+}
+
+impl List {
+    /// Puts a fresh listener at the back of the queue and hands back the key of its slot.
+    fn insert(&mut self) -> usize {
+        let entry = Entry {
+            prev: self.tail,
+            next: None,
+            state: State::Waiting(None),
+        };
+        let key = match self.vacant {
+            Some(key) => {
+                let Slot::Vacant(next) = mem::replace(&mut self.slots[key], Slot::Occupied(entry))
+                else {
+                    unreachable!("the chain of vacant slots holds vacant slots only");
+                };
+                self.vacant = next;
+
+                key
+            }
+            None => {
+                self.slots.push(Slot::Occupied(entry));
+
+                self.slots.len() - 1
+            }
+        };
+
+        if let Some(tail) = self.tail {
+            self.entry_mut(tail).next = Some(key);
+        }
+        self.tail = Some(key);
+        // Behind every listener notified so far, so the first one waiting unless another is.
+        if self.first_waiting.is_none() {
+            self.first_waiting = Some(key);
+        }
+        self.len += 1;
+
+        key
+    }
+
+    /// Takes a notification for the listener `key` if one reached it, which takes that listener
+    /// out of the queue, and stores `waker` for it otherwise.
+    ///
+    /// A waker is stored as a clone, which is not made here, under the lock: where one is wanted,
+    /// the clone is taken from `clone` if the caller has made it, and asked for otherwise. A
+    /// waker that would wake the same task as the one stored is not stored at all.
+    fn poll(&mut self, key: usize, waker: &Waker, clone: &mut Option<Waker>) -> Polled {
+        let State::Waiting(stored) = &mut self.entry_mut(key).state else {
+            // Taken rather than passed on: this listener is the one it was for.
+            self.remove(key);
+
+            return Polled::Notified;
+        };
+        if stored
+            .as_ref()
+            .is_some_and(|stored| stored.will_wake(waker))
+        {
+            return Polled::Waiting(None);
+        }
+
+        match clone.take() {
+            Some(clone) => Polled::Waiting(stored.replace(clone)),
+            None => Polled::WantsClone,
+        }
+    }
+
+    /// Takes the listener `key` out of the queue and frees its slot, handing back the state it
+    /// was in.
+    fn remove(&mut self, key: usize) -> State {
+        let Slot::Occupied(entry) = mem::replace(&mut self.slots[key], Slot::Vacant(self.vacant))
+        else {
+            unreachable!("a listener's key names a slot holding its entry");
+        };
+        self.vacant = Some(key);
+
+        if let Some(prev) = entry.prev {
+            self.entry_mut(prev).next = entry.next;
+        }
+        match entry.next {
+            Some(next) => self.entry_mut(next).prev = entry.prev,
+            None => self.tail = entry.prev,
+        }
+        // An entry behind it is waiting too, where there is one: notified entries are a prefix.
+        if self.first_waiting == Some(key) {
+            self.first_waiting = entry.next;
+        }
+        self.len -= 1;
+        if let State::Notified(_) = entry.state {
+            self.notified -= 1;
+        }
+
+        entry.state
+    }
+
+    /// Sends `notification` to `n` listeners and hands back how many it reached, putting the
+    /// wakers it takes out of their entries in `wakers`, to be woken once the lock is let go of.
+    ///
+    /// A counting notification counts the listeners notified already towards `n`, and an
+    /// additional one does not. Either reaches the oldest listeners not notified yet.
+    fn notify(&mut self, n: usize, notification: Notification, wakers: &mut Wakers) -> usize {
+        let wanted = match notification {
+            Notification::Counting => n.saturating_sub(self.notified),
+            Notification::Additional => n,
+        };
+
+        let mut reached = 0;
+        while reached < wanted {
+            let Some(key) = self.first_waiting else {
+                break;
+            };
+            let entry = self.entry_mut(key);
+            let next = entry.next;
+            let State::Waiting(waker) =
+                mem::replace(&mut entry.state, State::Notified(notification))
+            else {
+                unreachable!("every entry from the first one waiting onwards is waiting");
+            };
+            self.first_waiting = next;
+            if let Some(waker) = waker {
+                wakers.push(waker);
+            }
+            reached += 1;
+        }
+        self.notified += reached;
+
+        reached
+    }
+
+    /// The entry of the listener `key`.
+    fn entry(&self, key: usize) -> &Entry {
+        match &self.slots[key] {
+            Slot::Occupied(entry) => entry,
+            Slot::Vacant(_) => unreachable!("a listener's key names a slot holding its entry"),
+        }
+    }
+
+    /// The entry of the listener `key`, to be changed.
+    fn entry_mut(&mut self, key: usize) -> &mut Entry {
+        match &mut self.slots[key] {
+            Slot::Occupied(entry) => entry,
+            Slot::Vacant(_) => unreachable!("a listener's key names a slot holding its entry"),
+        }
+    }
+}
+
+/// One slot of a [`List`].
+enum Slot {
+    /// The slot of a listener in the queue.
+    Occupied(Entry),
+    /// A slot nobody holds, and the vacant slot after it, if any.
+    Vacant(Option<usize>),
+}
+
+/// A listener's place in the queue, and whether a notification has reached it.
+struct Entry {
+    /// The listener in front of this one.
+    prev: Option<usize>,
+    /// The listener behind this one.
+    next: Option<usize>,
+    /// Whether a notification has reached the listener.
+    state: State,
+}
+
+/// Whether a notification has reached a listener.
+enum State {
+    /// None has: the listener waits, with the waker of its latest poll if it has been polled.
+    Waiting(Option<Waker>),
+    /// One has, and is the listener's until it completes or is dropped.
+    Notified(Notification),
+}
+
+/// The kind of notification that reached a listener, and so the kind it passes on if dropped.
+#[derive(Clone, Copy)]
+enum Notification {
+    /// Sent by [`Event::notify`], which counts the listeners notified already.
+    Counting,
+    /// Sent by [`Event::notify_additional`], which does not.
+    Additional,
+}
+
+/// What a poll of a listener found.
+enum Polled {
+    /// A notification had reached the listener, which has left the queue with it.
+    Notified,
+    /// None had, and the listener's waker is stored, with the one it replaced, if any, to be
+    /// dropped once the lock is let go of.
+    Waiting(Option<Waker>),
+    /// None had, and the poll's waker is to be stored, for which a clone of it is wanted.
+    WantsClone,
+}
+
+/// The wakers a notification took out of the list, to be woken once its lock is let go of.
+///
+/// The first is held apart from the rest, so that a notification waking one task, which is most
+/// of them, allocates nothing.
+#[derive(Default)]
+struct Wakers {
+    /// The waker taken first, if any.
+    first: Option<Waker>,
+    /// Those taken after it, oldest first.
+    rest: Vec<Waker>,
+}
+
+impl Wakers {
+    /// Keeps `waker`, to be woken after those kept before it.
+    fn push(&mut self, waker: Waker) {
+        match self.first {
+            None => self.first = Some(waker),
+            Some(_) => self.rest.push(waker),
+        }
+    }
+
+    /// Wakes each waker, in the order they were kept.
+    fn wake(self) {
+        for waker in self.first.into_iter().chain(self.rest) {
+            waker.wake();
+        }
+    }
+}
+
+/// The value behind a lock, taken whether or not a panic poisoned it.
+///
+/// The runtime has a function like this one too, but this module does not use it: the runtime may
+/// be left out of the build, and an event needs none of it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}

@@ -2,7 +2,6 @@
 //! handed to a runtime with a seat from outside `block_on`, the `block_on` that runs the scheduler
 //! and the reactor on its own thread, the hand-over between the two, and the registries
 //! [`SharedRuntime::current`] hands runtimes out of.
-#![cfg(feature = "helper")]
 
 use std::{
     cell::RefCell,
@@ -19,12 +18,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use event_listener::{Event, EventListener};
 use futures_lite::future::{block_on, poll_once};
 use ntest::timeout;
 use socket2::SockRef;
 
 use super::core::pair;
+#[cfg(feature = "event")]
+use crate::{Event, EventListener};
 use crate::{
     Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, driver,
     runtime::{Core, lock},
@@ -151,6 +151,7 @@ fn cancelling_the_last_task_from_another_thread_lets_the_helper_exit() {
 /// The waiting task announces itself and the thread here waits that announcement out, so that
 /// the wake is sent to a runtime whose thread has nothing of its own left to poll and is
 /// therefore in a wait that only its wake channel can end.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_task_on_one_runtime_wakes_a_task_on_another() {
@@ -680,6 +681,7 @@ fn work_left_by_a_block_on_that_panicked_without_the_seat_goes_to_a_helper() {
     assert!(helper_gone(&runtime));
 }
 
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_takes_the_seat_from_the_helper() {
@@ -704,6 +706,7 @@ fn a_block_on_takes_the_seat_from_the_helper() {
     assert_eq!(ran_on, thread::current().id());
 }
 
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn the_helper_takes_the_seat_back_when_block_on_leaves() {
@@ -729,6 +732,7 @@ fn the_helper_takes_the_seat_back_when_block_on_leaves() {
 /// A `block_on` asks for the seat before it polls, and the helper gives it up in the round the
 /// asking wakes it for. A future that is done at that first poll leaves the seat free with the
 /// helper parked, and nothing but this call is there to tell the helper to look again.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_that_leaves_without_the_seat_rouses_the_helper() {
@@ -750,6 +754,7 @@ fn a_block_on_that_leaves_without_the_seat_rouses_the_helper() {
     assert!(helper_gone(&runtime));
 }
 
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_parked_helper_leaves_once_nothing_is_left() {
@@ -765,6 +770,7 @@ fn a_parked_helper_leaves_once_nothing_is_left() {
     assert!(helper_gone(&runtime));
 }
 
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_second_block_on_parks_while_the_first_drives() {
@@ -798,6 +804,7 @@ fn a_second_block_on_parks_while_the_first_drives() {
 /// A thread-per-request program calling `block_on`, where a helper keeps the seat for a task's
 /// whole life, would gather one such handle per thread it ever ran and hold them for the life of
 /// the process, were the entry not taken back where its call returns.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_that_waited_for_the_seat_leaves_nothing_behind() {
@@ -966,6 +973,7 @@ fn a_spawn_from_inside_another_threads_block_on_starts_a_helper() {
 ///
 /// The value below is touched before the locals `SharedRuntime::current` reaches, so that its drop
 /// runs after theirs: thread-local destructors run in reverse order of registration.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_task_spawned_as_a_thread_ends_is_run_by_a_helper() {
@@ -1128,6 +1136,7 @@ fn current_inside_a_local_block_on_is_run_by_a_helper() {
 /// The call finds the helper in the seat, so its first poll is made without it. Work built there
 /// on the thread's own runtime would ask for no helper, the thread being inside a `block_on`, and
 /// wait for a call on that runtime that never comes.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn work_built_in_a_block_on_on_another_runtime_goes_on_that_runtime() {
@@ -1197,6 +1206,7 @@ fn a_core_block_on_inside_a_helper_block_on_panics_with_or_without_the_seat() {
 /// until the nested one returns; a spawn on the outer call's runtime from inside the nested one
 /// would then take the parked helper for one about to be roused, and wait for ever. The nested
 /// call takes the outer one off the list instead, and the helper keeps the seat.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_nested_in_a_waiting_block_on_leaves_its_runtime_to_the_helper() {
@@ -1217,6 +1227,7 @@ fn a_block_on_nested_in_a_waiting_block_on_leaves_its_runtime_to_the_helper() {
 
 /// The same, with the nested call made on another runtime from `SharedRuntime::current`, whose
 /// seat it takes.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_on_another_runtime_nested_in_a_waiting_one_leaves_its_runtime_to_the_helper() {
@@ -1235,6 +1246,7 @@ fn a_block_on_on_another_runtime_nested_in_a_waiting_one_leaves_its_runtime_to_t
 }
 
 /// The same, with the outer call one of the free `block_on`, driving the thread's own runtime.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_nested_in_a_waiting_free_block_on_leaves_the_own_runtime_to_the_helper() {
@@ -1254,6 +1266,7 @@ fn a_block_on_nested_in_a_waiting_free_block_on_leaves_the_own_runtime_to_the_he
 
 /// A `block_on` nested inside a waiting `block_on` on the very same runtime waits for that seat,
 /// and is given it by the helper.
+#[cfg(feature = "event")]
 #[test]
 #[timeout(15000)]
 fn a_block_on_nested_in_a_waiting_block_on_on_the_same_runtime_takes_the_seat() {
@@ -1305,6 +1318,7 @@ where
 /// moment to reach the seat. The task announces its first poll, which the helper makes from the
 /// seat, and this returns once that announcement is out: the helper is in the seat by then, and
 /// what keeps it there until the task is dropped is the task itself.
+#[cfg(feature = "event")]
 fn held_by_the_helper(runtime: &SharedRuntime) -> Task<(), Shared> {
     let announce = Arc::new(Event::new());
     let announced = announce.listen();
@@ -1324,6 +1338,7 @@ fn held_by_the_helper(runtime: &SharedRuntime) -> Task<(), Shared> {
 /// for and has no poll to spare for the watching. The announcement is made whether or not the
 /// park is seen, so that a call awaiting it is never left waiting on one that did not happen;
 /// whether it did is what the thread hands back where it is joined.
+#[cfg(feature = "event")]
 fn the_parked_helper_announced(
     runtime: &SharedRuntime,
 ) -> (EventListener, thread::JoinHandle<bool>) {
@@ -1374,11 +1389,13 @@ type Resolver = Box<dyn Fn() -> Option<Arc<Core<Shared>>>>;
 /// seat: the outer call is down as waiting, and the helper either parks for it or — where the
 /// nested call has taken it off the list — is left in the seat. Either way the helper is done
 /// deciding by the time this holds, so what follows sees it settled.
+#[cfg(feature = "event")]
 fn the_helper_parked_or_nobody_waiting(runtime: &SharedRuntime) -> bool {
     within_a_second(|| runtime.helper_parked() || waiting(runtime) == 0)
 }
 
 /// How many threads are down as waiting for `runtime`'s seat.
+#[cfg(feature = "event")]
 fn waiting(runtime: &SharedRuntime) -> usize {
     driver::seat(runtime.inner()).waiting()
 }
