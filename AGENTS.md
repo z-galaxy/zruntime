@@ -25,20 +25,11 @@ It is a single crate at the repository root — not a workspace.
 
 ### Building and Testing
 ```bash
-# Full test suite, default features only (Local runtime, tracing)
-cargo test
-
-# Full test suite, every feature (adds the helper-layer tests)
+# Full test suite, every feature on (the features only add code, so this runs all of it)
 cargo test --all-features
 
-# Test with default features off (no tracing)
-cargo test --no-default-features
-
-# Test the helper feature alone
-cargo test --no-default-features --features helper
-
 # Run a single test
-cargo test some_test_name
+cargo test --all-features some_test_name
 ```
 
 ### Code Quality
@@ -47,22 +38,23 @@ cargo test some_test_name
 cargo +nightly fmt --all
 
 # Lint with clippy
-cargo clippy -- -D warnings
-cargo clippy --all-features -- -D warnings
-cargo clippy --no-default-features --features helper -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Check the build without the `tracing` feature: the no-op `error!` in `log.rs` that replaces
+# `tracing`'s is the only code `--all-features` leaves out
+cargo check --no-default-features
 
 # Check cross-platform compatibility
-cargo check --target x86_64-pc-windows-gnu
-cargo check --target x86_64-apple-darwin
-cargo check --target x86_64-unknown-freebsd
-cargo check --target x86_64-unknown-netbsd
-cargo check --target aarch64-linux-android
+cargo check --all-features --target x86_64-pc-windows-gnu
+cargo check --all-features --target x86_64-apple-darwin
+cargo check --all-features --target x86_64-unknown-freebsd
+cargo check --all-features --target x86_64-unknown-netbsd
+cargo check --all-features --target aarch64-linux-android
 ```
 
 ### Documentation
 ```bash
 cargo doc --all-features
-cargo doc --no-default-features
 ```
 
 ### Benchmarks
