@@ -228,7 +228,8 @@ type BoxedWriter = Box<dyn FrameWriter>;
 /// A small in-process queue: unbounded where it is just a handoff between this bench's own
 /// tasks (a connection's signals and, on a server, its incoming calls), and bounded where it
 /// stands in for a transport (`channel_pair`'s in-process channel), so that a full queue
-/// backpressures its writer exactly as zbus's own `async_broadcast`-based `Channel` does.
+/// backpressures its writer exactly as zbus's own `Channel`, built on
+/// `zruntime::broadcast`, does.
 struct Queue<T> {
     items: Mutex<VecDeque<T>>,
     capacity: Option<usize>,

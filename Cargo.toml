@@ -30,8 +30,11 @@ tracing = ["dep:tracing"]
 # Per-thread shared runtimes: `SharedRuntime::current()`, the free `block_on`, and the helper
 # thread that keeps their work moving in between `block_on` calls.
 helper = ["runtime"]
+# The `broadcast` module: an async multi-producer multi-consumer broadcast channel.
+broadcast = ["event", "dep:futures-core"]
 
 [dependencies]
+futures-core = { version = "0.3.34", default-features = false, optional = true }
 tracing = { version = "0.1.44", optional = true }
 
 [target."cfg(unix)".dependencies.rustix]
@@ -76,3 +79,8 @@ required-features = ["helper", "event"]
 name = "event"
 harness = false
 required-features = ["event"]
+
+[[bench]]
+name = "broadcast"
+harness = false
+required-features = ["broadcast"]

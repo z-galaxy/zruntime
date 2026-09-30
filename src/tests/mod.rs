@@ -1,16 +1,19 @@
-//! Tests of a runtime as a whole, and of the event that tasks wait for.
+//! Tests of a runtime as a whole, of the event that tasks wait for, and of the broadcast channel.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in the
 //! `core` module, in both flavours wherever the test means the same in each. An event and its
 //! listeners, which need no runtime, are tested in the `event` module. What the type system is to
 //! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future that
 //! could not follow it to another — can only be shown by code that does not compile, so it is shown
-//! here, by the doc tests of the items below.
+//! here, by the doc tests of the items below. The broadcast channel, built on the event, is tested
+//! in the `broadcast` module.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
 //! where both are.
 
+#[cfg(all(test, feature = "broadcast"))]
+mod broadcast;
 #[cfg(all(test, feature = "runtime"))]
 mod core;
 #[cfg(all(test, feature = "event"))]

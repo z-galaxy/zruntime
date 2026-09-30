@@ -28,6 +28,10 @@ with `default-features = false, features = ["event"]` and gets none of the runti
 runs tasks leaves `event` out. `helper` implies `runtime`, and `tracing`, also a default feature,
 makes the runtime log through the `tracing` crate.
 
+A non-default `broadcast` feature, which implies `event` and adds a `futures-core` dependency,
+gives `zruntime::broadcast`: an async multi-producer multi-consumer broadcast channel, moved here
+from async-broadcast. It is built on `Event`, needs no runtime and works under any executor.
+
 It is a single crate at the repository root — not a workspace.
 
 ## Common Development Commands
@@ -49,10 +53,11 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime and Event each built alone: `--all-features` cannot show that each builds
-# without the other, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
+# Check the runtime, Event and broadcast each built alone: `--all-features` cannot show that each
+# builds without the others, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
+cargo check --no-default-features --features broadcast
 
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
@@ -72,6 +77,9 @@ cargo doc --all-features
 # Run benchmarks (need the helper feature: they measure the block_on-per-operation case; the
 # event and connection ones need Event too, which is a default feature)
 cargo bench --features helper
+
+# The broadcast channel's benchmark needs the broadcast feature and no runtime
+cargo bench --features broadcast --bench broadcast
 ```
 
 ## Architecture Overview
@@ -85,6 +93,8 @@ src/
 │                 # any executor, with no use of the runtime
 ├── event-only.md # The crate's documentation in a build with `event` but not `runtime`, whose
 │                 # README examples it cannot run
+├── broadcast.rs  # [broadcast feature] The async multi-producer multi-consumer broadcast channel,
+│                 # built on Event, with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
@@ -93,7 +103,8 @@ src/
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
-                  # helper.rs: helper feature
+                  # broadcast.rs: the broadcast channel, broadcast feature; helper.rs: helper
+                  # feature
 ```
 
 ### Key Design Patterns
@@ -140,8 +151,9 @@ completion unobserved.
 - **Features**: `runtime` and `event` each build without the other. Nothing in `event.rs` may reach
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
-  tests without it). CI builds and tests everything with every feature on, and checks each of the
-  two alone.
+  tests without it). `broadcast` implies `event` and, like it, must not reach into the runtime.
+  CI builds and tests everything with every feature on, and checks `runtime`, `event` and
+  `broadcast` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).

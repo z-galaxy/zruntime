@@ -13,6 +13,8 @@
     allow(unused_extern_crates),
 )))]
 
+#[cfg(feature = "broadcast")]
+pub mod broadcast;
 #[cfg(feature = "helper")]
 mod driver;
 #[cfg(feature = "event")]
