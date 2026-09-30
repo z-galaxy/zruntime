@@ -32,6 +32,8 @@ tracing = ["dep:tracing"]
 helper = ["runtime"]
 # The `broadcast` module: an async multi-producer multi-consumer broadcast channel.
 broadcast = ["event", "dep:futures-core"]
+# The `lock` module: an async mutex and readers-writer lock, which need no runtime.
+lock = ["event"]
 
 [dependencies]
 futures-core = { version = "0.3.34", default-features = false, optional = true }
@@ -54,7 +56,7 @@ uds_windows = "1.2.1"
 [dev-dependencies]
 criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }
 futures-lite = "2.6.1"
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 ntest = "0.9.5"
 socket2 = { version = "0.6.5", features = ["all"] }
 
@@ -73,12 +75,12 @@ required-features = ["helper"]
 [[bench]]
 name = "connection"
 harness = false
-required-features = ["helper", "event"]
+required-features = ["helper", "lock"]
 
 [[bench]]
 name = "event"
 harness = false
-required-features = ["event"]
+required-features = ["lock"]
 
 [[bench]]
 name = "broadcast"

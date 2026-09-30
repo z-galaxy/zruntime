@@ -112,6 +112,8 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 * `helper`: the layer [described above](#the-helper-feature); it implies `runtime`.
 * `broadcast`: the [`broadcast`] module, an async multi-producer multi-consumer broadcast channel
   built on [`Event`]; it implies `event`, and needs no runtime either.
+* `lock`: the [`lock`] module, an async `Mutex` and `RwLock`, whose guards a task may hold across
+  an await, built on [`Event`]; it implies `event`, and needs no runtime either.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
@@ -137,6 +139,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Event`]: https://docs.rs/zruntime/latest/zruntime/struct.Event.html
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html
+[`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
 [MIT]: (LICENSE)

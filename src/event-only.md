@@ -21,6 +21,8 @@ it last, and an event may be notified from any thread.
   between `block_on` calls. It implies `runtime`.
 * `broadcast`: the `broadcast` module, an async multi-producer multi-consumer broadcast channel
   built on [`Event`]; it implies `event`.
+* `lock`: the `lock` module, an async `Mutex` and `RwLock`, whose guards a task may hold across an
+  await, built on [`Event`]; it implies `event`.
 
 `event`, `runtime` and `tracing` are on by default, and `event` and `runtime` each build without
 the other: a crate that only notifies depends on zruntime with
