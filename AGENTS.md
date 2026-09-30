@@ -66,6 +66,10 @@ cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
 cargo check --no-default-features --features lock
 
+# Run what needs no runtime (Event, the locks, the broadcast channel) under Miri, as CI does; the
+# runtime polls with `ppoll`, which Miri cannot run
+cargo +nightly miri test --no-default-features --features lock,broadcast
+
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
 cargo check --all-features --target x86_64-apple-darwin
