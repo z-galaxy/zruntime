@@ -23,14 +23,19 @@ Two default cargo features, each usable without the other, split the crate. `run
 runtime above — `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations —
 and is what needs `rustix` on unix and `windows-sys` on Windows. `event` is `Event` and
 `EventListener`, a notification that tasks wait for, which needs no runtime and works under any
-executor. A crate that only notifies (as zbus does, whatever runtime it runs on) builds zruntime
-with `default-features = false, features = ["event"]` and gets none of the runtime; one that only
-runs tasks leaves `event` out. `helper` implies `runtime`, and `tracing`, also a default feature,
-makes the runtime log through the `tracing` crate.
+executor. A crate that only notifies builds zruntime with
+`default-features = false, features = ["event"]` and gets none of the runtime (zbus, whatever
+runtime it runs on, adds `broadcast` and `lock` to that); one that only runs tasks leaves `event`
+out. `helper` implies `runtime`, and `tracing`, also a default feature, makes the runtime log
+through the `tracing` crate.
 
 A non-default `broadcast` feature, which implies `event` and adds a `futures-core` dependency,
 gives `zruntime::broadcast`: an async multi-producer multi-consumer broadcast channel, moved here
 from async-broadcast. It is built on `Event`, needs no runtime and works under any executor.
+
+A non-default `lock` feature, which implies `event` and adds no dependency, gives `zruntime::lock`:
+an async `Mutex` and `RwLock` whose guards may be held across an await, moved here from zbus. They
+are built on `Event`, need no runtime and work under any executor.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -53,11 +58,13 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime, Event and broadcast each built alone: `--all-features` cannot show that each
-# builds without the others, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
+# Check the runtime, Event, broadcast and the locks each built alone: `--all-features` cannot
+# show that each builds without the others, and leaves out the no-op `error!` in `log.rs` that
+# replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
+cargo check --no-default-features --features lock
 
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
@@ -95,6 +102,7 @@ src/
 │                 # README examples it cannot run
 ├── broadcast.rs  # [broadcast feature] The async multi-producer multi-consumer broadcast channel,
 │                 # built on Event, with no use of the runtime
+├── lock/         # [lock feature] Mutex and RwLock, built on Event, with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
@@ -103,18 +111,18 @@ src/
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
-                  # broadcast.rs: the broadcast channel, broadcast feature; helper.rs: helper
-                  # feature
+                  # broadcast.rs: the broadcast channel, broadcast feature; lock.rs: the locks,
+                  # lock feature; helper.rs: helper feature
 ```
 
 ### Key Design Patterns
 
 **Two flavours over a sealed `Mode`**: `Runtime<M: Mode = Local>` is generic over how it shares
 its state. `Local` builds it from `Rc`/`RefCell`/`Cell`, stays on its thread, and runs any
-`'static` future; `Shared` builds it from `Arc`/`Mutex`, is `Send + Sync` by auto traits alone (no
-`unsafe impl` anywhere in the crate), and runs `Send` futures. The sealed trait in `mode.rs` is
-the single place that names which: everything else in `scheduler.rs`, `reactor.rs` and
-`runtime.rs` is written once, generic over `M`.
+`'static` future; `Shared` builds it from `Arc`/`Mutex`, is `Send + Sync` by auto traits alone (the
+runtime has no `unsafe impl`: the crate's only ones are the `lock` module's `Send` and `Sync`
+impls), and runs `Send` futures. The sealed trait in `mode.rs` is the single place that names which:
+everything else in `scheduler.rs`, `reactor.rs` and `runtime.rs` is written once, generic over `M`.
 
 **The wake path is the only cross-thread part of a `Local` runtime**: a `Waker` must be
 `Send + Sync` even for a `Local` task, whose future is not, so a task's waker never holds the
@@ -151,9 +159,9 @@ completion unobserved.
 - **Features**: `runtime` and `event` each build without the other. Nothing in `event.rs` may reach
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
-  tests without it). `broadcast` implies `event` and, like it, must not reach into the runtime.
-  CI builds and tests everything with every feature on, and checks `runtime`, `event` and
-  `broadcast` each alone.
+  tests without it). `broadcast` and `lock` imply `event` and, like it, must not reach into the
+  runtime. CI builds and tests everything with every feature on, and checks `runtime`, `event`,
+  `broadcast` and `lock` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
@@ -171,3 +179,4 @@ completion unobserved.
 - `src/reactor.rs`: I/O readiness and timers
 - `src/scheduler.rs`: Task storage and polling
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex
+- `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`

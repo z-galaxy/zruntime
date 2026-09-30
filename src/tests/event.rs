@@ -5,11 +5,12 @@
 //! which task it woke. A few poll with a waker built on a vtable of their own, which counts the
 //! clones of the waker as well, or notifies the event from inside a clone: a waker built on
 //! [`Wake`] is cloned by the standard library, where no test can see it. That vtable is the one
-//! piece of `unsafe` code here, and the library has none of its own. They come in the order of what
-//! they pin down: that a listener is queued as it is taken, that nothing is kept for one taken
-//! later, the order listeners are notified in, what each kind of notification counts, what a
-//! notified listener does when polled or dropped, what outlives what, which wakers are kept, and
-//! that a waker may come back into the event it was woken or dropped by.
+//! piece of `unsafe` code here: the library's own is in the `lock` module and, on Windows, in the
+//! poller's calls into Winsock. They come in the order of what they pin down: that a listener is
+//! queued as it is taken, that nothing is kept for one taken later, the order listeners are
+//! notified in, what each kind of notification counts, what a notified listener does when polled
+//! or dropped, what outlives what, which wakers are kept, and that a waker may come back into the
+//! event it was woken or dropped by.
 //!
 //! The last few drive one event from many threads at once — through a lock built on it, through
 //! listeners that give up the moment a notification reaches them, through wakers that come back

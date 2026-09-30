@@ -32,6 +32,8 @@ tracing = ["dep:tracing"]
 helper = ["runtime"]
 # The `broadcast` module: an async multi-producer multi-consumer broadcast channel.
 broadcast = ["event", "dep:futures-core"]
+# The `lock` module: an async mutex and readers-writer lock, which need no runtime.
+lock = ["event"]
 
 [dependencies]
 futures-core = { version = "0.3.34", default-features = false, optional = true }
