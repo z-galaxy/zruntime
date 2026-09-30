@@ -39,8 +39,8 @@ use criterion::{
     criterion_main, measurement::Measurement,
 };
 use futures_lite::future;
-use futures_util::{future::try_join_all, lock};
-use zruntime::{Event, Shared, SharedRuntime, Task};
+use futures_util::future::try_join_all;
+use zruntime::{Event, Shared, SharedRuntime, Task, lock};
 
 /// Runs a routine's future to completion inside `zruntime::block_on`.
 struct ZruntimeExecutor;

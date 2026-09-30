@@ -9,19 +9,20 @@
 //! that a panic while a guard is held releases it, the smaller conveniences (borrowing the value,
 //! taking it back, making a lock, printing it) and that a lock may be a trait object.
 //!
-//! The last five drive one lock from many threads at once: the first two check that it never lets
-//! two holders in together and that nothing deadlocks on the way, and the other three that a
-//! release racing the start of a wait is not missed. They are shrunk under Miri, which runs them
-//! far more slowly.
+//! The last six drive one lock from many threads at once. The first two check that it never lets a
+//! holder in beside one it should keep out and that nothing deadlocks on the way, the next three
+//! that a release racing the start of a wait is not missed, and the last that a mutex whose
+//! waiters' wakers come back into it from their wake still admits one holder at a time and
+//! deadlocks nothing. They are shrunk under Miri, which runs them far more slowly.
 
 use std::{
     fmt,
     future::Future,
     hint,
     panic::{AssertUnwindSafe, catch_unwind},
-    pin::pin,
+    pin::{Pin, pin},
     sync::{Arc, Barrier},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, Wake, Waker},
     thread,
 };
 
@@ -575,6 +576,50 @@ fn a_read_release_racing_a_write_is_not_missed() {
     );
 }
 
+/// Wakers that come back into the lock from their wake, each taking it and letting go at once or
+/// listening for it and giving up, while threads take and release it: nothing deadlocks, and the
+/// lock still admits one holder at a time.
+///
+/// A release notifies the event that waiting threads listen to, and the notification runs their
+/// wakers, which come back into that very event from the thread that is notifying it: were the
+/// event to run them with its own state still held, that thread would wait for itself for good,
+/// which the timeout would catch. The count is read and written back as two steps, so a second
+/// holder let in at the same time would lose a step of it.
+#[test]
+#[timeout(15000)]
+fn wakers_coming_back_into_the_lock_from_many_threads_do_not_deadlock() {
+    let (threads, rounds) = if cfg!(miri) { (3, 10) } else { (4, 250) };
+    let mutex = Arc::new(Mutex::new(0usize));
+    let start = Arc::new(Barrier::new(threads));
+
+    let takers: Vec<_> = (0..threads)
+        .map(|_| {
+            let mutex = mutex.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                // Lets the threads in together, so that they contend from their first round rather
+                // than each running its rounds before the next is spawned.
+                start.wait();
+                for _ in 0..rounds {
+                    let mut count = block_on(ComingBack {
+                        mutex: mutex.clone(),
+                        future: pin!(mutex.lock()),
+                    });
+                    let seen = *count;
+                    // Gives a second holder, were one let in, a moment to come in between.
+                    linger();
+                    *count = seen + 1;
+                }
+            })
+        })
+        .collect();
+    for taker in takers {
+        taker.join().unwrap();
+    }
+
+    assert_eq!(*block_on(mutex.lock()), threads * rounds);
+}
+
 /// Polls `future` once, with a waker that goes nowhere.
 fn poll_once<F>(future: &mut F) -> Poll<F::Output>
 where
@@ -647,4 +692,53 @@ where
         barrier.wait();
     }
     waiter.join().unwrap();
+}
+
+/// A future that polls `future` through a waker that comes back into `mutex` from its wake, before
+/// it wakes the task that polled this future.
+struct ComingBack<F> {
+    mutex: Arc<Mutex<usize>>,
+    future: F,
+}
+
+impl<F> Future for ComingBack<F>
+where
+    F: Future + Unpin,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        let waker = Waker::from(Arc::new(ComeBackThenWake {
+            mutex: this.mutex.clone(),
+            task: cx.waker().clone(),
+        }));
+
+        Pin::new(&mut this.future).poll(&mut Context::from_waker(&waker))
+    }
+}
+
+/// A waker that comes back into a mutex from its wake, before it wakes the task it stands for.
+///
+/// The mutex keeps its event to itself, so the waker comes back into it through the mutex's own
+/// calls: it polls a fresh `lock` once, with a waker that goes nowhere, and lets go of what that
+/// gave. A guard, where the mutex was free, releases the mutex and notifies its event as it goes;
+/// a wait still pending gives up the listener it took. The waker is run by a notification of the
+/// mutex's event, so either happens inside that notification.
+struct ComeBackThenWake {
+    mutex: Arc<Mutex<usize>>,
+    task: Waker,
+}
+
+impl Wake for ComeBackThenWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // `drop` lets go of the poll's result, and the future it polled goes at the end of this
+        // statement, so whatever the poll took is let go of before the task is woken.
+        drop(pin!(self.mutex.lock()).poll(&mut Context::from_waker(Waker::noop())));
+        self.task.wake_by_ref();
+    }
 }

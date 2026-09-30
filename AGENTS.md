@@ -81,9 +81,10 @@ cargo doc --all-features
 
 ### Benchmarks
 ```bash
-# Run benchmarks (need the helper feature: they measure the block_on-per-operation case; the
-# event and connection ones need Event too, which is a default feature)
-cargo bench --features helper
+# Run benchmarks (the runtime and connection ones need the helper feature: they measure the
+# block_on-per-operation case; the event and connection ones need the lock feature, which implies
+# Event)
+cargo bench --features helper,lock
 
 # The broadcast channel's benchmark needs the broadcast feature and no runtime
 cargo bench --features broadcast --bench broadcast

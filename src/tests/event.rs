@@ -12,10 +12,12 @@
 //! or dropped, what outlives what, which wakers are kept, and that a waker may come back into the
 //! event it was woken or dropped by.
 //!
-//! The last few drive one event from many threads at once — through a lock built on it, through
-//! listeners that give up the moment a notification reaches them, through wakers that come back
-//! into it — and check that no notification is lost on the way and that nothing deadlocks. They
-//! are shrunk under Miri, which runs them far more slowly.
+//! The last three drive one event from many threads at once — through listeners polled for the
+//! first time while one notification for all of them is sent, and through listeners that give up
+//! the moment a notification reaches them — and check that no notification is lost on the way.
+//! They are shrunk under Miri, which runs them far more slowly. Driving an event from many threads
+//! through a lock built on it, and through wakers that come back into it, is tested with the
+//! locks, in the `lock` tests.
 
 use std::{
     future::Future,
@@ -450,6 +452,31 @@ fn a_waker_may_come_back_into_the_event_from_its_wake() {
     assert_eq!(format!("{event:?}"), "Event { listeners: 0, notified: 0 }");
 }
 
+/// A waker woken by a notification that a dropped listener passes on may come back into the same
+/// event from inside its wake, which it could not do were the event's lock still held.
+#[test]
+#[timeout(15000)]
+fn a_waker_woken_by_a_passed_on_notification_may_come_back_into_the_event() {
+    let event = Arc::new(Event::new());
+    let first = event.listen();
+    let mut second = event.listen();
+    let mut third = event.listen();
+    let comes_back = Arc::new(ComesBack {
+        event: event.clone(),
+        listener: Mutex::new(None),
+        woken: AtomicBool::new(false),
+    });
+    assert!(poll(&mut second, &Waker::from(comes_back.clone())).is_pending());
+    assert_eq!(event.notify(1), 1);
+
+    drop(first);
+
+    assert!(comes_back.woken.load(Ordering::SeqCst));
+    assert!(ready(&mut second));
+    // The wake notified one more: the third.
+    assert!(ready(&mut third));
+}
+
 /// A waker the event lets go of as a later poll replaces it may drop a listener of the same event
 /// as it goes, which it could not do were the event's lock still held.
 #[test]
@@ -565,37 +592,6 @@ fn a_listener_takes_the_slot_of_one_gone() {
     assert_eq!(event.slots(), Some(3));
 }
 
-/// A lock built on an event, the way zbus builds its own, keeps out every taker but one at a
-/// time, and wakes the next once the one before it lets go.
-///
-/// The count is read and written back as two steps, so a second taker let in at the same time
-/// would lose a step of it; and a release that no waiting taker heard of would leave that taker
-/// waiting for good, which the timeout would catch.
-#[test]
-#[timeout(15000)]
-fn a_lock_built_on_an_event_admits_one_holder_at_a_time() {
-    let (threads, rounds) = if cfg!(miri) { (3, 20) } else { (8, 1000) };
-    let lock = Arc::new(TestLock::default());
-
-    let takers: Vec<_> = (0..threads)
-        .map(|_| {
-            let lock = lock.clone();
-            thread::spawn(move || {
-                for _ in 0..rounds {
-                    block_on(lock.lock(false));
-                    lock.increment();
-                    lock.unlock();
-                }
-            })
-        })
-        .collect();
-    for taker in takers {
-        taker.join().unwrap();
-    }
-
-    assert_eq!(lock.count.load(Ordering::Relaxed), threads * rounds);
-}
-
 /// Listeners polled for the first time on many threads, while one notification for all of them
 /// is sent, are each reached by it.
 #[test]
@@ -651,34 +647,6 @@ fn additional_notifications_are_passed_down_listeners_dropped_once_notified() {
     for _ in 0..rounds {
         pass_down_listeners_dropped_once_notified(3, |event| event.notify_additional(3));
     }
-}
-
-/// Wakers that come back into the event from their wake, to listen, to drop a listener and to
-/// notify one more, while threads take and release a lock built on that event: nothing deadlocks,
-/// and the lock still keeps out every taker but one.
-#[test]
-#[timeout(15000)]
-fn wakers_coming_back_into_the_event_from_many_threads_do_not_deadlock() {
-    let (threads, rounds) = if cfg!(miri) { (3, 10) } else { (4, 250) };
-    let lock = Arc::new(TestLock::default());
-
-    let takers: Vec<_> = (0..threads)
-        .map(|_| {
-            let lock = lock.clone();
-            thread::spawn(move || {
-                for _ in 0..rounds {
-                    block_on(lock.lock(true));
-                    lock.increment();
-                    lock.unlock();
-                }
-            })
-        })
-        .collect();
-    for taker in takers {
-        taker.join().unwrap();
-    }
-
-    assert_eq!(lock.count.load(Ordering::Relaxed), threads * rounds);
 }
 
 /// Polls `listener` once, with `waker`.
@@ -941,100 +909,5 @@ impl Future for DropOnceWoken {
         this.registered.wait();
 
         Poll::Pending
-    }
-}
-
-/// A lock built the way zbus builds its own: a flag taken with a compare-exchange, and an event
-/// that a release notifies once.
-#[derive(Default)]
-struct TestLock {
-    locked: AtomicBool,
-    released: Event,
-    /// What the lock guards: read and written back in two steps, which only one holder of the
-    /// lock at a time can do without losing a step.
-    count: AtomicUsize,
-}
-
-impl TestLock {
-    /// Takes the lock, waiting for its release where it is held. With `come_back`, every wait
-    /// goes through a waker that comes back into the event from its wake.
-    async fn lock(self: &Arc<Self>, come_back: bool) {
-        loop {
-            if self.try_lock() {
-                return;
-            }
-            // Taken before the second try, so that a release in between is one it hears of.
-            let listener = self.released.listen();
-            if self.try_lock() {
-                return;
-            }
-            if come_back {
-                ComingBack {
-                    lock: self.clone(),
-                    listener,
-                }
-                .await;
-            } else {
-                listener.await;
-            }
-        }
-    }
-
-    /// Adds one to the count, in two steps, while the lock is held.
-    fn increment(&self) {
-        let count = self.count.load(Ordering::Relaxed);
-        self.count.store(count + 1, Ordering::Relaxed);
-    }
-
-    /// Lets go of the lock, and wakes a taker waiting for it.
-    fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-        self.released.notify(1);
-    }
-
-    fn try_lock(&self) -> bool {
-        self.locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    }
-}
-
-/// A listener of a [`TestLock`]'s event, polled through a waker that comes back into that event
-/// before it wakes the task.
-struct ComingBack {
-    lock: Arc<TestLock>,
-    listener: EventListener,
-}
-
-impl Future for ComingBack {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        let waker = Waker::from(Arc::new(ComeBackThenWake {
-            lock: this.lock.clone(),
-            task: cx.waker().clone(),
-        }));
-
-        Pin::new(&mut this.listener).poll(&mut Context::from_waker(&waker))
-    }
-}
-
-/// A waker that listens on a [`TestLock`]'s event, drops the listener, and notifies one more
-/// listener, before it wakes the task it stands for.
-struct ComeBackThenWake {
-    lock: Arc<TestLock>,
-    task: Waker,
-}
-
-impl Wake for ComeBackThenWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        drop(self.lock.released.listen());
-        self.lock.released.notify_additional(1);
-        self.task.wake_by_ref();
     }
 }
