@@ -6,14 +6,15 @@
 //! yet and wake the tasks that polled them. A listener takes its notification by completing, or
 //! passes it on by being dropped with it.
 //!
-//! All of an event's state is one [`List`] behind one mutex, allocated by the first `listen` or
-//! `notify` rather than by [`Event::new`], which can then be a `const fn`. The list is a slab: a
-//! vector of slots, each either holding the entry of one listener or vacant, the vacant ones
-//! chained into a list that the next `listen` takes a slot from before it grows the vector. A
-//! listener holds the index of its slot as its key, which is how it finds its entry, and the
-//! entries are linked by index into a doubly-linked queue, which is how a listener leaves the
-//! queue from wherever it is in it without a walk. The vector never shrinks: an event keeps as many
-//! slots as it has had listeners alive at once, for as long as it lives.
+//! All of an event's state is one [`List`] behind one mutex, kept in a [`Shared`] beside a word
+//! that tells a notification, without the lock, whether it would reach any listener. Both are
+//! allocated by the first `listen` or `notify` rather than by [`Event::new`], which can then be a
+//! `const fn`. The list is a slab: a vector of slots, each either holding the entry of one listener
+//! or vacant, the vacant ones chained into a list that the next `listen` takes a slot from before
+//! it grows the vector. A listener holds the index of its slot as its key, which is how it finds
+//! its entry, and the entries are linked by index into a doubly-linked queue, which is how a
+//! listener leaves the queue from wherever it is in it without a walk. The vector never shrinks: an
+//! event keeps as many slots as it has had listeners alive at once, for as long as it lives.
 //!
 //! What the list relies on, and every change made under its lock keeps:
 //!
@@ -26,6 +27,9 @@
 //! * [`List::notified`] is the number of notified entries, which is what the counting
 //!   [`Event::notify`] counts against.
 //! * Only an entry still waiting holds a waker: a notification takes it out as it marks the entry.
+//! * [`Shared::notified`] says what the list said as the lock was last let go of: how many entries
+//!   are notified while any entry waits, or [`NONE_WAITING`] while none does. Every holder of the
+//!   lock writes it, through [`Locked`], before letting go.
 //!
 //! No waker is woken, cloned or dropped while the lock is held. Each of these runs somebody else's
 //! code, which may come straight back to this event — to listen, to notify, to drop a listener —
@@ -35,19 +39,48 @@
 //! which panics while the list keeps to what it relies on, and the lock is taken whether a panic
 //! poisoned it or not: none can have left the list half-changed.
 //!
-//! The one mutex is also what keeps a notification from slipping between a listener being taken
-//! and its caller checking the condition it waits for, with no fence of its own. Whoever notifies
-//! changes the condition before `notify` takes the lock, and `listen` lets go of the lock before
-//! its caller checks the condition. If `notify` takes the lock after `listen` let go of it, it
-//! finds the listener in the queue; if before, its release of the lock comes before `listen`'s
-//! taking of it, and so before the check, which then sees the condition changed.
+//! A notification that the word says would reach nobody takes no lock. [`Event::notify`] and
+//! [`Event::notify_additional`] first look at [`Shared::notified`], and take the lock only where it
+//! says that a listener waits and that they would reach one: for `notify(n)`, that fewer than `n`
+//! listeners are notified, and for `notify_additional(n)`, that `n` is not zero. Under the lock,
+//! they count again, as the list may have changed since the word was written. Letting go of a lock
+//! built on an event, with nobody waiting for it, thus costs a fence and a look rather than a turn
+//! with the lock of the list.
+//!
+//! The look must not miss a listener taken on another thread just before its caller checks the
+//! condition it waits for. Whoever notifies changes the condition, then looks at the word; whoever
+//! listens writes the word, then checks the condition: each side writes one location and then reads
+//! the one the other side writes. Nothing short of a `SeqCst` fence between the write and the read,
+//! on each side, keeps both reads from missing the other side's write, whatever orderings a caller
+//! changes and checks its condition with. So `listen` makes one once it has let go of the lock,
+//! with its listener counted in the word, and a notification makes one before it looks.
+//!
+//! One of the two fences comes before the other. If the notification's does, the caller's check
+//! sees the condition changed. If `listen`'s does, the look finds the word `listen` wrote or a
+//! later one, and the notification does what it would have done under the lock as that word was
+//! written: it skips the lock only where the listener was notified already, or enough listeners
+//! were for a notification that counts them, and where it takes the lock, it finds the list no
+//! earlier than as the word was written of, with the listener in it or notified since.
+//!
+//! One thing the lock gave that a look without it does not: a notification that took the lock came
+//! before every later poll of a listener, so a listener it found notified already saw, on
+//! completing, whatever the notification's caller had changed. A notification that skips the lock
+//! lets go of nothing that a later poll takes, and a listener completing after it may check the
+//! condition and find it as it was. A caller that takes a new listener before its last check ahead
+//! of waiting again, as every caller in this crate does, sees the change on that check: the word
+//! written for the new listener comes after the one the notification looked at, which puts the
+//! notification's fence before the one `listen` makes.
 
 use std::{
     fmt,
     future::Future,
     mem,
+    ops::{Deref, DerefMut},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::{AtomicUsize, Ordering, fence},
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -144,7 +177,7 @@ use std::{
 pub struct Event {
     /// What the event and its listeners share, brought into being by the first `listen` or
     /// `notify`.
-    list: OnceLock<Arc<Mutex<List>>>,
+    shared: OnceLock<Arc<Shared>>,
 }
 
 impl Event {
@@ -154,7 +187,7 @@ impl Event {
     /// `const fn` of its own.
     pub const fn new() -> Self {
         Self {
-            list: OnceLock::new(),
+            shared: OnceLock::new(),
         }
     }
 
@@ -164,11 +197,14 @@ impl Event {
     /// from then on can reach it, whether it has been polled yet or not. Take it before the last
     /// check of the condition it is for, as [listen, then check](Event#listen-then-check) says.
     pub fn listen(&self) -> EventListener {
-        let list = self.list();
-        let key = lock(list).insert();
+        let shared = self.shared();
+        let key = shared.lock().insert();
+        // Between the word written with the listener counted and the caller's check of the
+        // condition: the fence that pairs with the one a notification makes before its look.
+        fence(Ordering::SeqCst);
 
         EventListener {
-            list: list.clone(),
+            shared: shared.clone(),
             key: Some(key),
         }
     }
@@ -252,23 +288,37 @@ impl Event {
     /// anything allocated the queue.
     #[cfg(test)]
     pub(crate) fn slots(&self) -> Option<usize> {
-        self.list.get().map(|list| lock(list).slots.len())
+        self.shared.get().map(|shared| shared.lock().slots.len())
     }
 
     /// What this event and its listeners share, brought into being here where nothing has yet.
     ///
     /// A `notify` brings it into being as a `listen` does, even on an event nobody has listened
-    /// to yet: telling that nobody has would take a look without the lock, which could miss a
-    /// `listen` made on another thread just before its caller's check of the condition.
-    fn list(&self) -> &Arc<Mutex<List>> {
-        self.list.get_or_init(Arc::default)
+    /// to yet, rather than taking an event with nothing yet for one that nobody listens to. That
+    /// keeps what a notification looks at without the lock to [`Shared::notified`] alone, which
+    /// the fences of the module documentation keep from missing a `listen` made on another
+    /// thread just before its caller's check of the condition. How the cell tells whether it is
+    /// set is the standard library's own business, which no such argument could rest on.
+    fn shared(&self) -> &Arc<Shared> {
+        self.shared.get_or_init(Arc::default)
     }
 
     /// Sends `notification` to `n` listeners, as [`List::notify`] counts them, and hands back how
     /// many it reached.
+    ///
+    /// The lock is taken only where [`Shared::notified`] says the notification would reach a
+    /// listener, as the module documentation says.
     fn send(&self, n: usize, notification: Notification) -> usize {
+        // Between the caller's change to the condition and the look at the word: the fence that
+        // pairs with the one `listen` makes before its caller's check.
+        fence(Ordering::SeqCst);
+        let shared = self.shared();
+        if !shared.would_reach(n, notification) {
+            return 0;
+        }
+
         let mut wakers = Wakers::default();
-        let notified = lock(self.list()).notify(n, notification, &mut wakers);
+        let notified = shared.lock().notify(n, notification, &mut wakers);
         // Clear of the lock: a wake is somebody else's code, which may come back to this event.
         wakers.wake();
 
@@ -284,9 +334,9 @@ impl Default for Event {
 
 impl fmt::Debug for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (listeners, notified) = match self.list.get() {
-            Some(list) => {
-                let list = lock(list);
+        let (listeners, notified) = match self.shared.get() {
+            Some(shared) => {
+                let list = shared.lock();
 
                 (list.len, list.notified)
             }
@@ -318,7 +368,7 @@ impl fmt::Debug for Event {
 pub struct EventListener {
     /// What the listener shares with its event, kept alive by the listener as much as by the
     /// event.
-    list: Arc<Mutex<List>>,
+    shared: Arc<Shared>,
     /// The slot of this listener's entry in the list, until it has completed.
     key: Option<usize>,
 }
@@ -339,10 +389,10 @@ impl Future for EventListener {
         // Nothing but a notification can have changed this listener's entry in between: nobody
         // else polls it. A clone left unused is dropped as this returns, clear of the lock too.
         let mut clone = None;
-        let mut polled = lock(&this.list).poll(key, cx.waker(), &mut clone);
+        let mut polled = this.shared.lock().poll(key, cx.waker(), &mut clone);
         if let Polled::WantsClone = polled {
             clone = Some(cx.waker().clone());
-            polled = lock(&this.list).poll(key, cx.waker(), &mut clone);
+            polled = this.shared.lock().poll(key, cx.waker(), &mut clone);
         }
 
         match polled {
@@ -373,7 +423,7 @@ impl Drop for EventListener {
 
         let mut wakers = Wakers::default();
         let removed = {
-            let mut list = lock(&self.list);
+            let mut list = self.shared.lock();
             let removed = list.remove(key);
             // Passed on as it was sent: a counting notification only if no other listener is
             // notified at this point, an additional one regardless.
@@ -397,13 +447,103 @@ impl fmt::Debug for EventListener {
         // A listener that completed was notified before it did.
         let notified = self
             .key
-            .is_none_or(|key| matches!(lock(&self.list).entry(key).state, State::Notified(_)));
+            .is_none_or(|key| matches!(self.shared.lock().entry(key).state, State::Notified(_)));
 
         f.debug_struct("EventListener")
             .field("notified", &notified)
             .finish()
     }
 }
+
+/// What an event and its listeners share: the list of the listeners, behind a lock, and the word
+/// that tells a notification, without the lock, whether it would reach any of them.
+struct Shared {
+    /// The listeners, taken through [`Shared::lock`] alone.
+    list: Mutex<List>,
+    /// How many listeners are notified, while any listener waits, or [`NONE_WAITING`] while none
+    /// does, as the list said when its lock was let go of.
+    ///
+    /// Written under the lock alone, so the order of the writes is the order the lock was taken
+    /// in, and the latest says what the list says. Read without it by a notification, and only to
+    /// tell whether to take the lock: one that takes it counts again under it.
+    ///
+    /// Written with `Release` and read with `Acquire`, so that a notification that skips the lock
+    /// still comes after the change to the list that the word it read was written of, and after
+    /// whatever came before that change, as it would had it taken the lock: the drop of the last
+    /// listener, say. Keeping the look from missing a `listen` is the business of the fences of
+    /// the module documentation, which no ordering of the word's own accesses could do.
+    notified: AtomicUsize,
+}
+
+impl Shared {
+    /// The list, locked, which writes [`Shared::notified`] as it lets go.
+    fn lock(&self) -> Locked<'_> {
+        Locked {
+            list: lock(&self.list),
+            word: &self.notified,
+        }
+    }
+
+    /// Whether `notification`, sent to `n` listeners, would reach any of them, as told by the word,
+    /// without the lock.
+    fn would_reach(&self, n: usize, notification: Notification) -> bool {
+        let notified = self.notified.load(Ordering::Acquire);
+
+        match notification {
+            // Counts the listeners notified already, against `n`. `NONE_WAITING` is past every
+            // `n`, as a notification reaches none where none waits.
+            Notification::Counting => notified < n,
+            Notification::Additional => n > 0 && notified != NONE_WAITING,
+        }
+    }
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            list: Mutex::default(),
+            notified: AtomicUsize::new(NONE_WAITING),
+        }
+    }
+}
+
+/// The list of an event, locked: it dereferences to the list, and writes what the list says to
+/// [`Shared::notified`] as it lets go of the lock.
+struct Locked<'a> {
+    list: MutexGuard<'a, List>,
+    word: &'a AtomicUsize,
+}
+
+impl Deref for Locked<'_> {
+    type Target = List;
+
+    fn deref(&self) -> &List {
+        &self.list
+    }
+}
+
+impl DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut List {
+        &mut self.list
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        // Written before `list` is dropped, which lets go of the lock: under the lock, as the word
+        // asks.
+        let notified = if self.list.notified < self.list.len {
+            self.list.notified
+        } else {
+            NONE_WAITING
+        };
+        self.word.store(notified, Ordering::Release);
+    }
+}
+
+/// What [`Shared::notified`] says while no listener waits: more than any count of listeners, so
+/// that a notification that counts them finds as many notified as it could ask for.
+const NONE_WAITING: usize = usize::MAX;
 
 /// The listeners of one event: their entries, in the slots of a slab, and the queue they form.
 #[derive(Default)]
