@@ -81,11 +81,12 @@
 //!   before that turn, which came before the notifier's, which came before the look, so the look
 //!   finds the word `listen` wrote or a later one.
 //! * `lock::Mutex` checks and changes its flag with `SeqCst` operations: a compare-exchange whose
-//!   failure is `SeqCst` to take it, and a `SeqCst` store to release it. All `SeqCst` operations
-//!   fall in one order, which keeps to the order each thread makes them in, and puts a read that
-//!   misses a write before that write. A check that missed the change would come before it, and a
-//!   look that missed the word before that word; with the change before the look and the word
-//!   before the check, the four would go round in a circle, which no order can.
+//!   failure is `SeqCst`, or a `SeqCst` `fetch_or`, to take it, and a `SeqCst` `fetch_sub` to
+//!   release it, or to stop counting a waiter that held newcomers back from it. All `SeqCst`
+//!   operations fall in one order, which keeps to the order each thread makes them in, and puts a
+//!   read that misses a write before that write. A check that missed the change would come before
+//!   it, and a look that missed the word before that word; with the change before the look and the
+//!   word before the check, the four would go round in a circle, which no order can.
 //!
 //! One thing the lock gave that a look without it does not: a notification that took the lock came
 //! before every later poll of a listener, so a listener it found notified already saw, on

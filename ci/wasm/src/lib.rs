@@ -64,6 +64,38 @@ pub extern "C" fn contended_write() -> u32 {
     0
 }
 
+/// A `lock` that waited and then found the mutex taken holds newcomers back: with no clock to tell
+/// how long it waited, the first such wake is enough.
+#[unsafe(no_mangle)]
+pub extern "C" fn starved_lock() -> u32 {
+    let mutex = Mutex::new(());
+    let holder = mutex.try_lock().expect("a new mutex is free");
+    let mut waiter = pin!(mutex.lock());
+    if !poll(waiter.as_mut()).is_pending() {
+        return 1;
+    }
+    drop(holder);
+    let Some(barging) = mutex.try_lock() else {
+        return 2;
+    };
+    if !poll(waiter.as_mut()).is_pending() {
+        return 3;
+    }
+    drop(barging);
+    if mutex.try_lock().is_some() {
+        return 4;
+    }
+    let Poll::Ready(guard) = poll(waiter.as_mut()) else {
+        return 5;
+    };
+    drop(guard);
+    if mutex.try_lock().is_none() {
+        return 6;
+    }
+
+    0
+}
+
 /// Polls `future` once, with a waker that goes nowhere.
 fn poll<F>(future: std::pin::Pin<&mut F>) -> Poll<F::Output>
 where

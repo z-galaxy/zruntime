@@ -176,7 +176,7 @@ where
     /// that comes out releases the lock when it is dropped.
     ///
     /// A lock that is free is taken at once, whichever tasks are waiting for it already: see
-    /// [no fairness](crate::lock#no-fairness).
+    /// [fairness](crate::lock#fairness).
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, the future
     /// stops holding readers back, and no other task waiting for the lock is left stranded.
@@ -265,8 +265,7 @@ where
     ///
     /// Returns `None` while a reader or a writer holds the lock. Writers waiting for it do not
     /// count: a lock that is free is taken ahead of them, as [`write`](RwLock::write) takes it (see
-    /// [no fairness](crate::lock#no-fairness)), and one of them is woken once this guard is
-    /// dropped.
+    /// [fairness](crate::lock#fairness)), and one of them is woken once this guard is dropped.
     ///
     /// # Example
     ///

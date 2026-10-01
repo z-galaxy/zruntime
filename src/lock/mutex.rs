@@ -8,9 +8,10 @@ use std::{
     cell::UnsafeCell,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use super::WaitStart;
 use crate::Event;
 
 /// A mutual-exclusion lock whose `lock` future waits without blocking the thread.
@@ -47,17 +48,26 @@ pub struct Mutex<T>
 where
     T: ?Sized,
 {
-    /// Whether a guard exists.
+    /// Whether a guard exists, in the [`LOCKED`] bit, and how many waiting `lock` calls hold
+    /// newcomers back, in multiples of [`STARVED`].
     ///
-    /// Taken with a compare-exchange, `Acquire` where it succeeds, and given back with a `SeqCst`
-    /// store, whose release half has the next holder see what the one before it did to the
-    /// value. A release between a `lock`'s check and its wait is not lost: `lock` takes its
-    /// listener before its second `try_lock`, as `Event` asks of its callers, so the release's
-    /// notification either reaches that listener or came before it was taken, and then the second
-    /// `try_lock` sees the release. The store and a compare-exchange that fails are `SeqCst` so
-    /// that the event orders the two against its own `SeqCst` accesses, with no fence, as its
-    /// `listen_unfenced` and `notify_unfenced` ask.
-    locked: AtomicBool,
+    /// Taken with a compare-exchange from `0` by a newcomer, which therefore fails while a waiter
+    /// holds newcomers back, and with a `fetch_or` by a `lock` that has waited; either is
+    /// `Acquire` where it takes the lock. Given back with a `SeqCst` `fetch_sub`, whose release
+    /// half has the next holder see what the one before it did to the value. A release between a
+    /// `lock`'s check and its wait is not lost: `lock` takes its listener before each check that
+    /// it waits after, as `Event` asks of its callers, so the release's notification either
+    /// reaches that listener or came before it was taken, and then the check sees the release.
+    /// The release and the checks that fail are `SeqCst` so that the event orders them against its
+    /// own `SeqCst` accesses, with no fence, as its `listen_unfenced` and `notify_unfenced` ask.
+    ///
+    /// A starved waiter counts itself in with a `Relaxed` `fetch_add`: every change to the state
+    /// is a read-modify-write, so a newcomer's compare-exchange that succeeds sees the latest
+    /// count, and a newcomer whose compare-exchange fails waits as any waiter does. The waiter
+    /// counts itself out with a `SeqCst` `fetch_sub`, followed by a notification where that
+    /// leaves the mutex free, as [`Starved`] says: like a release, that is a change that a
+    /// newcomer's failed check may have missed, and the event orders the two in the same way.
+    state: AtomicUsize,
     unlocked: Event,
     value: UnsafeCell<T>,
 }
@@ -87,7 +97,7 @@ impl<T> Mutex<T> {
     /// ```
     pub const fn new(value: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            state: AtomicUsize::new(0),
             unlocked: Event::new(),
             value: UnsafeCell::new(value),
         }
@@ -119,8 +129,8 @@ where
     ///
     /// The guard that comes out releases the lock when it is dropped.
     ///
-    /// A lock that is free is taken at once, whichever tasks are waiting for it already: see
-    /// [no fairness](crate::lock#no-fairness).
+    /// A lock that is free is taken at once, whichever tasks are waiting for it already, unless
+    /// one of them has waited for a while: see [fairness](crate::lock#fairness).
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
     /// other task waiting for it is left stranded.
@@ -149,23 +159,32 @@ where
     /// assert_eq!(waiter.join().expect("the other thread did not panic"), 5);
     /// ```
     pub async fn lock(&self) -> MutexGuard<'_, T> {
+        // When this call began to wait, once it has.
+        let mut since = None;
+        // Counts this call among the starved waiters once it is one, until the call ends.
+        let mut starved = None;
         loop {
-            if let Some(guard) = self.try_lock() {
+            if let Some(guard) = self.try_lock_as(since.is_some()) {
                 return guard;
+            }
+            if starved.is_none() && since.is_some_and(WaitStart::waited_long) {
+                starved = Some(Starved::new(self));
             }
             // Listen before re-checking so a release between the check and the wait is seen.
             let listener = self.unlocked.listen_unfenced();
-            if let Some(guard) = self.try_lock() {
+            if let Some(guard) = self.try_lock_as(since.is_some()) {
                 return guard;
             }
+            since.get_or_insert_with(WaitStart::now);
             listener.await;
         }
     }
 
     /// Acquires the lock if nobody holds it, without waiting.
     ///
-    /// Returns `None` while the mutex is held. A lock that is free is taken even while tasks wait
-    /// for it, as [`lock`](Mutex::lock) takes it: see [no fairness](crate::lock#no-fairness).
+    /// Returns `None` while the mutex is held, and while a task that has waited for it for a while
+    /// holds newcomers back. Other tasks waiting for it do not count: a lock that is free is taken
+    /// ahead of them, as [`lock`](Mutex::lock) takes it. See [fairness](crate::lock#fairness).
     ///
     /// # Example
     ///
@@ -181,8 +200,8 @@ where
     /// assert!(mutex.try_lock().is_some());
     /// ```
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::SeqCst)
+        self.state
+            .compare_exchange(0, LOCKED, Ordering::Acquire, Ordering::SeqCst)
             .ok()?;
 
         Some(MutexGuard(self))
@@ -205,6 +224,25 @@ where
     /// ```
     pub fn get_mut(&mut self) -> &mut T {
         self.value.get_mut()
+    }
+
+    /// Takes the mutex if nobody holds it: as a newcomer, held back by starved waiters, until the
+    /// `lock` call trying has `waited`, and whether or not they hold newcomers back from then on.
+    ///
+    /// A newcomer that starved waiters hold back from a free mutex waits all the same, and is not
+    /// stranded: a release notifies the event, and so does a starved waiter that stops counting
+    /// while the mutex is free; a notified listener that is dropped passes its notification on;
+    /// and a call that has waited takes a free mutex on each of its tries, the one after its wake
+    /// and the one after it listens again.
+    fn try_lock_as(&self, waited: bool) -> Option<MutexGuard<'_, T>> {
+        if !waited {
+            return self.try_lock();
+        }
+        if self.state.fetch_or(LOCKED, Ordering::SeqCst) & LOCKED != 0 {
+            return None;
+        }
+
+        Some(MutexGuard(self))
     }
 }
 
@@ -231,6 +269,8 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Mutex");
+        // Formats through `try_lock`, so a free mutex that a starved waiter holds newcomers back
+        // from prints as `<locked>`, as it does while a guard holds it.
         match self.try_lock() {
             Some(guard) => s.field("value", &&*guard),
             None => s.field("value", &format_args!("<locked>")),
@@ -262,7 +302,7 @@ where
     type Target = T;
 
     fn deref(&self) -> &T {
-        // SAFETY: the guard exists, so `locked` is set and only this guard clears it, and the
+        // SAFETY: the guard exists, so `LOCKED` is set and only this guard clears it, and the
         // guard's borrow of the mutex rules out `get_mut` and `into_inner`: no other reference to
         // the cell's contents can be live.
         unsafe { &*self.0.value.get() }
@@ -294,9 +334,53 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        self.0.locked.store(false, Ordering::SeqCst);
+        self.0.state.fetch_sub(LOCKED, Ordering::SeqCst);
         // A notification whose listener is dropped before polling it is passed on to the next
         // listener, so a `lock` future abandoned after being woken strands nobody behind it.
         self.0.unlocked.notify_unfenced(1);
     }
 }
+
+/// Counts a `lock` call among the starved waiters of its mutex for as long as it lives, holding
+/// newcomers back: from when the call, having waited for a while, finds the mutex taken after a
+/// release woke it, until the call ends, with the mutex taken or given up.
+///
+/// A call that took the mutex stops counting while it holds it, and its release wakes whoever its
+/// count held back. A call that gives up has to wake one of them itself, where it leaves the mutex
+/// free: its `lock` future drops its listener before this, so a notification the listener had is
+/// passed on while the count still holds newcomers back, and a newcomer that listens in between,
+/// finding the mutex free but not for it, would otherwise wait for good.
+struct Starved<'a, T>(&'a Mutex<T>)
+where
+    T: ?Sized;
+
+impl<'a, T> Starved<'a, T>
+where
+    T: ?Sized,
+{
+    fn new(mutex: &'a Mutex<T>) -> Self {
+        // Cannot overflow: every starved waiter holds a listener in the mutex's event, and there
+        // cannot be `usize::MAX / STARVED` of those.
+        mutex.state.fetch_add(STARVED, Ordering::Relaxed);
+
+        Self(mutex)
+    }
+}
+
+impl<T> Drop for Starved<'_, T>
+where
+    T: ?Sized,
+{
+    fn drop(&mut self) {
+        if self.0.state.fetch_sub(STARVED, Ordering::SeqCst) & LOCKED != 0 {
+            return;
+        }
+
+        self.0.unlocked.notify_unfenced(1);
+    }
+}
+
+/// The bit of [`Mutex::state`] that is set while a guard exists.
+const LOCKED: usize = 1;
+/// What a starved waiter adds to [`Mutex::state`], above the [`LOCKED`] bit.
+const STARVED: usize = 2;

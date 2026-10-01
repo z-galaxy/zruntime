@@ -51,15 +51,27 @@
 //! unwinds, or with the future that holds it, which releases the lock, and the next task to take it
 //! finds the value as the panicking code left it, which can be half-way through an update.
 //!
-//! # No fairness
+//! # Fairness
 //!
-//! The locks are not fair: tasks do not get a lock in the order they asked for it. [`Mutex::lock`],
-//! [`RwLock::read`] and [`RwLock::write`] each first try to take the lock, so a task whose try
-//! succeeds takes it ahead of the tasks that were already waiting for it: a `lock` or a `write`
-//! where the lock is free, a `read` where no writer holds or waits for it. A waiting task that is
-//! woken and finds the lock taken again goes back to waiting, behind the tasks that began to wait
-//! after it did. Under steady contention, a task can therefore wait for as long as other tasks keep
-//! taking the lock.
+//! The locks are not strictly fair: tasks do not always get a lock in the order they asked for it.
+//! [`Mutex::lock`], [`RwLock::read`] and [`RwLock::write`] each first try to take the lock, so a
+//! task whose try succeeds takes it ahead of the tasks that were already waiting for it: a `lock`
+//! or a `write` where the lock is free, a `read` where no writer holds or waits for it. A waiting
+//! task that is woken and finds the lock taken again goes back to waiting, behind the tasks that
+//! began to wait after it did. Under steady contention, this lets the task that is running take a
+//! lock as it is released, rather than leave it free until a waiting task has been woken and has
+//! run, which keeps a contended lock busy.
+//!
+//! How long newcomers can keep a task waiting for a [`Mutex`] this way is bounded. A task that has
+//! waited for it for a while, and is woken only to find it taken again, starts holding newcomers
+//! back, for as long as it waits: a `lock` that has not waited yet, and
+//! [`try_lock`](Mutex::try_lock), no longer take the mutex, even while it is free, but wait behind
+//! the task. A task that was waiting already can still get the mutex ahead of it, and the task,
+//! having lost that race, waits again behind every task that has begun to wait since.
+//!
+//! Where the standard library has no clock, as on `wasm32-unknown-unknown`, a task cannot tell how
+//! long it has waited, and holds newcomers back the first time it is woken only to find the lock
+//! taken.
 //!
 //! # Write preference
 //!
@@ -76,5 +88,48 @@
 mod mutex;
 mod rwlock;
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::time::{Duration, Instant};
+
 pub use mutex::{Mutex, MutexGuard};
 pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// When a `lock`, `read` or `write` call began to wait, so that it can tell once it has waited for
+/// long enough to hold newcomers back.
+///
+/// Where the standard library has no clock, as on `wasm32-unknown-unknown`, it keeps no time, and
+/// a call has waited for long enough as soon as it has waited at all: it then holds newcomers back
+/// the first time it is woken only to find the lock taken. There is no thread there to hand the
+/// lock over to, so nothing is saved by letting the running task take it again first.
+#[derive(Clone, Copy)]
+struct WaitStart {
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    at: Instant,
+}
+
+impl WaitStart {
+    fn now() -> Self {
+        Self {
+            #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+            at: Instant::now(),
+        }
+    }
+
+    /// Whether the call has waited for long enough to hold newcomers back, the next time it is
+    /// woken and cannot get in.
+    fn waited_long(self) -> bool {
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        return self.at.elapsed() >= PATIENCE;
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        return true;
+    }
+}
+
+/// How long a task waits for a lock before it may hold newcomers back.
+///
+/// Long next to a handoff of the lock between two threads, and short next to a delay a task would
+/// notice: for this long, a lock under steady contention keeps going to whichever task is running
+/// when it is released, rather than to a waiter that first has to be woken and scheduled. The same
+/// as async-lock's.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) const PATIENCE: Duration = Duration::from_micros(500);
