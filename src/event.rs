@@ -359,9 +359,14 @@ impl Event {
     /// against its caller's change to the condition, and hands back how many it reached.
     ///
     /// The lock is taken only where [`Shared::notified`] says the notification would reach a
-    /// listener, as the module documentation says.
+    /// listener, as the module documentation says. Inlined into each notification, so that its
+    /// look at the word comes with no part of what taking the lock costs, which [`Shared::send`]
+    /// keeps out of line.
+    #[inline]
     fn send(&self, n: usize, notification: Notification, order: Order) -> usize {
-        let shared = self.shared();
+        let Some(shared) = self.shared.get() else {
+            return self.send_to_new(n, notification, order);
+        };
         // A first look, with no fence before it, may only send the notification on to the lock,
         // which orders it against every `listen` by itself. Skipping the lock is left to a second
         // look, after the fence that pairs with the one `listen` makes before its caller's check,
@@ -374,12 +379,20 @@ impl Event {
             return 0;
         }
 
-        let mut wakers = Wakers::default();
-        let notified = shared.lock().notify(n, notification, &mut wakers);
-        // Clear of the lock: a wake is somebody else's code, which may come back to this event.
-        wakers.wake();
+        shared.send(n, notification)
+    }
 
-        notified
+    /// Sends a notification as [`Event::send`] does, on an event whose shared state nothing has
+    /// brought into being yet, which this does first, as the doc of [`Event::shared`] says.
+    ///
+    /// Kept out of line, as only the first use of an event comes here: in line, its call would
+    /// have every notification save registers on the way in, for a call that is all but never made.
+    #[cold]
+    #[inline(never)]
+    fn send_to_new(&self, n: usize, notification: Notification, order: Order) -> usize {
+        self.shared();
+
+        self.send(n, notification, order)
     }
 }
 
@@ -533,6 +546,21 @@ struct Shared {
 }
 
 impl Shared {
+    /// Sends `notification` to `n` listeners, as [`List::notify`] counts them, under the lock, and
+    /// hands back how many it reached, once it has woken the tasks they were polled by.
+    ///
+    /// Kept out of line: the registers it saves and the room it takes on the stack would otherwise
+    /// come with every notification, the ones that skip the lock included.
+    #[inline(never)]
+    fn send(&self, n: usize, notification: Notification) -> usize {
+        let mut wakers = Wakers::default();
+        let notified = self.lock().notify(n, notification, &mut wakers);
+        // Clear of the lock: a wake is somebody else's code, which may come back to this event.
+        wakers.wake();
+
+        notified
+    }
+
     /// The list, locked, which writes [`Shared::notified`] as it lets go.
     fn lock(&self) -> Locked<'_> {
         self.lock_writing(Ordering::Release)
