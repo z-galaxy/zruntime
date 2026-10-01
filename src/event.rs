@@ -44,8 +44,8 @@
 //! says that a listener waits and that they would reach one: for `notify(n)`, that fewer than `n`
 //! listeners are notified, and for `notify_additional(n)`, that `n` is not zero. Under the lock,
 //! they count again, as the list may have changed since the word was written. Letting go of a lock
-//! built on an event, with nobody waiting for it, thus costs a fence and a look rather than a turn
-//! with the lock of the list.
+//! built on an event, with nobody waiting for it, thus costs a fence and two looks rather than a
+//! turn with the lock of the list.
 //!
 //! The look must not miss a listener taken on another thread just before its caller checks the
 //! condition it waits for. Whoever notifies changes the condition, then looks at the word; whoever
@@ -53,14 +53,19 @@
 //! the one the other side writes. Nothing short of a `SeqCst` fence between the write and the read,
 //! on each side, keeps both reads from missing the other side's write, whatever orderings a caller
 //! changes and checks its condition with. So `listen` makes one once it has let go of the lock,
-//! with its listener counted in the word, and a notification makes one before it looks.
+//! with its listener counted in the word, and a notification makes one before the look that lets it
+//! skip the lock. It looks once before the fence as well, and takes the lock at once where that
+//! first look says it would reach a listener: the lock then orders it against every `listen` by
+//! itself, as it did before the word was there, so a notification that wakes a listener pays for no
+//! fence.
 //!
 //! One of the two fences comes before the other. If the notification's does, the caller's check
-//! sees the condition changed. If `listen`'s does, the look finds the word `listen` wrote or a
-//! later one, and the notification does what it would have done under the lock as that word was
-//! written: it skips the lock only where the listener was notified already, or enough listeners
-//! were for a notification that counts them, and where it takes the lock, it finds the list no
-//! earlier than as the word was written of, with the listener in it or notified since.
+//! sees the condition changed. If `listen`'s does, the look after the notification's fence finds
+//! the word `listen` wrote or a later one, and the notification does what it would have done under
+//! the lock as that word was written: it skips the lock only where the listener was notified
+//! already, or enough listeners were for a notification that counts them, and where it takes the
+//! lock, it finds the list no earlier than as the word was written of, with the listener in it or
+//! notified since.
 //!
 //! The fences are for callers the event knows nothing of. The locks and the broadcast channel of
 //! this crate order what they check and change against the word without them, through
@@ -356,11 +361,16 @@ impl Event {
     /// The lock is taken only where [`Shared::notified`] says the notification would reach a
     /// listener, as the module documentation says.
     fn send(&self, n: usize, notification: Notification, order: Order) -> usize {
-        // Between the caller's change to the condition and the look at the word: the fence that
-        // pairs with the one `listen` makes before its caller's check, where `order` has one.
-        order.fence();
         let shared = self.shared();
-        if !shared.would_reach(n, notification, order.look()) {
+        // A first look, with no fence before it, may only send the notification on to the lock,
+        // which orders it against every `listen` by itself. Skipping the lock is left to a second
+        // look, after the fence that pairs with the one `listen` makes before its caller's check,
+        // where `order` has one, as the module documentation says.
+        let mut reaches = shared.would_reach(n, notification, order.look());
+        if !reaches && order.fence() {
+            reaches = shared.would_reach(n, notification, order.look());
+        }
+        if !reaches {
             return 0;
         }
 
@@ -630,12 +640,16 @@ impl Order {
         }
     }
 
-    /// Makes the `SeqCst` fence, where this order has one.
-    fn fence(self) {
+    /// Makes the `SeqCst` fence, where this order has one, and tells whether it did.
+    fn fence(self) -> bool {
         match self {
-            Order::Fence => fence(Ordering::SeqCst),
+            Order::Fence => {
+                fence(Ordering::SeqCst);
+
+                true
+            }
             #[cfg(any(feature = "broadcast", feature = "lock"))]
-            Order::SeqCst => {}
+            Order::SeqCst => false,
         }
     }
 }
