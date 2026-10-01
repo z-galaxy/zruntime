@@ -1,8 +1,9 @@
 //! What `Event`'s listen and notify paths cost: taking a listener, sending a notification to
 //! nobody, waking one listener, waking a broadcast of a hundred, and `lock::Mutex`, built on an
-//! event, under four contending threads. `Event` needs no runtime, so no id here goes through
-//! `zruntime::block_on`: the single-threaded ones poll listeners by hand, and `mutex/4-threads`
-//! blocks on each `lock` with futures-lite's `block_on`.
+//! event, taken by one thread alone and under four contending threads. `Event` needs no runtime,
+//! so no id here goes through `zruntime::block_on`: the single-threaded ones poll listeners by hand
+//! or take the mutex with `try_lock`, and `mutex/4-threads` blocks on each `lock` with
+//! futures-lite's `block_on`.
 //!
 //! `listen-drop` times taking a listener and dropping it at once, on an event whose shared state
 //! is already allocated: the common case of a listener whose wait never has to happen because the
@@ -11,6 +12,10 @@
 //! `notify-none` times `notify(1)` on an initialised event with nobody listening: the path a
 //! lock's release takes when nobody is waiting for it, and so what `notify` costs even where
 //! there is nothing to wake.
+//!
+//! `mutex/uncontended` times taking and releasing zruntime's own `lock::Mutex` on one thread, with
+//! nobody else after it: the commonest use of a lock, whose release notifies the mutex's event with
+//! nobody listening.
 //!
 //! `notify-one` times taking a listener, notifying it, and polling it once to `Ready`: a waiter's
 //! whole life, from registering to being told the wait is over.
@@ -57,6 +62,12 @@ fn event_benches(c: &mut Criterion) {
     notify_none.notify(0);
     group.bench_function("notify-none", |b| {
         b.iter(|| black_box(notify_none.notify(1)));
+    });
+
+    let uncontended = Mutex::new(());
+    group.bench_function("mutex/uncontended", |b| {
+        // The guard is dropped at once: the mutex is taken and released.
+        b.iter(|| drop(black_box(uncontended.try_lock())));
     });
 
     let notify_one = Event::new();
