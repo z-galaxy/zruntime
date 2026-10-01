@@ -114,6 +114,8 @@ is behind the `event` feature, which builds without the runtime: see [Features](
   built on [`Event`]; it implies `event`, and needs no runtime either.
 * `lock`: the [`lock`] module, an async `Mutex` and `RwLock`, whose guards a task may hold across
   an await, built on [`Event`]; it implies `event`, and needs no runtime either.
+* `unblock`: [`unblock`], which runs a piece of blocking work on a thread of its own and hands
+  back a future of its outcome; it needs no runtime either.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
@@ -140,6 +142,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
+[`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
 [MIT]: (LICENSE)

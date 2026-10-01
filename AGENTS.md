@@ -37,6 +37,10 @@ A non-default `lock` feature, which implies `event` and adds no dependency, give
 an async `Mutex` and `RwLock` whose guards may be held across an await, moved here from zbus. They
 are built on `Event`, need no runtime and work under any executor.
 
+A non-default `unblock` feature, which adds no dependency, gives `zruntime::unblock`: a piece of
+blocking work run on a thread of its own, out of the way of the async tasks, and a future of its
+outcome, moved here from zbus. It needs no runtime and works under any executor.
+
 It is a single crate at the repository root — not a workspace.
 
 ## Common Development Commands
@@ -58,17 +62,18 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime, Event, broadcast and the locks each built alone: `--all-features` cannot
-# show that each builds without the others, and leaves out the no-op `error!` in `log.rs` that
-# replaces `tracing`'s
+# Check the runtime, Event, broadcast, the locks and unblock each built alone: `--all-features`
+# cannot show that each builds without the others, and leaves out the no-op `error!` in `log.rs`
+# that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
 cargo check --no-default-features --features lock
+cargo check --no-default-features --features unblock
 
-# Run what needs no runtime (Event, the locks, the broadcast channel) under Miri, as CI does; the
-# runtime polls with `ppoll`, which Miri cannot run
-cargo +nightly miri test --no-default-features --features lock,broadcast
+# Run what needs no runtime (Event, the locks, the broadcast channel, unblock) under Miri, as CI
+# does; the runtime polls with `ppoll`, which Miri cannot run
+cargo +nightly miri test --no-default-features --features lock,broadcast,unblock
 
 # Run the locks' waiting paths on `wasm32-unknown-unknown`, which has no clock, in Node, as CI
 # does
@@ -120,9 +125,12 @@ src/
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
+├── unblock.rs    # [unblock feature] Blocking work on a thread of its own, with no use of the
+│                 # runtime
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
                   # broadcast.rs: the broadcast channel, broadcast feature; lock.rs: the locks,
-                  # lock feature; helper.rs: helper feature
+                  # lock feature; helper.rs: helper feature; unblock.rs: unblock, unblock
+                  # feature
 ```
 
 ### Key Design Patterns
@@ -170,8 +178,8 @@ completion unobserved.
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast` and `lock` imply `event` and, like it, must not reach into the
-  runtime. CI builds and tests everything with every feature on, and checks `runtime`, `event`,
-  `broadcast` and `lock` each alone.
+  runtime; nor may `unblock`, which needs neither. CI builds and tests everything with every
+  feature on, and checks `runtime`, `event`, `broadcast`, `lock` and `unblock` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
@@ -191,3 +199,4 @@ completion unobserved.
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
+- `src/unblock.rs`: [unblock feature] `unblock`, blocking work on a thread of its own

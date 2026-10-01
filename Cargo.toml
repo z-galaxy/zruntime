@@ -34,6 +34,9 @@ helper = ["runtime"]
 broadcast = ["event", "dep:futures-core"]
 # The `lock` module: an async mutex and readers-writer lock, which need no runtime.
 lock = ["event"]
+# `unblock`: blocking work run on a thread of its own, out of the way of the async tasks; needs no
+# runtime.
+unblock = []
 
 [dependencies]
 futures-core = { version = "0.3.34", default-features = false, optional = true }

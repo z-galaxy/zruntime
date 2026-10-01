@@ -1,14 +1,16 @@
-//! Tests of a runtime as a whole, of the event that tasks wait for, and of the broadcast channel
-//! and the locks built on that event.
+//! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast channel and
+//! the locks built on that event, and of blocking work run on a thread of its own.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
 //! the `core` module, in both flavours wherever the test means the same in each. An event and its
 //! listeners, which need no runtime, are tested in the `event` module. What the type system is to
 //! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future
 //! that could not follow it to another, a lock handing its value to a thread that could not own
-//! it — can only be shown by code that does not compile, so it is shown here, by the doc tests of
-//! the items below. The broadcast channel and the locks, built on the event, are tested in the
-//! `broadcast` and `lock` modules.
+//! it, the future of blocking work doing the same with the value it resolves to — can only be
+//! shown by code that does not compile, so it is shown here, by the doc tests of the items below.
+//! The broadcast channel and the locks, built on the event, are tested in the `broadcast` and
+//! `lock` modules. Blocking work, which needs neither the runtime nor the event, is tested in the
+//! `unblock` module.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -25,6 +27,8 @@ mod event;
 mod helper;
 #[cfg(all(test, feature = "lock"))]
 mod lock;
+#[cfg(all(test, feature = "unblock"))]
+mod unblock;
 
 /// A local runtime's handle stays on its thread: it is neither `Send`...
 ///
@@ -350,3 +354,38 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// ```
 #[cfg(all(doctest, feature = "lock"))]
 struct LocksAreAsSendAndSyncAsTheirValues;
+
+/// The future of blocking work hands the value the work returned from the thread it ran on to
+/// whichever thread polls it, so it may be sent to another thread only where that value may be: a
+/// future that resolves to an `Rc`, which cannot be sent, is not `Send`...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Unblock<Rc<()>>>();
+/// ```
+///
+/// ...while one that resolves to a value that may be sent is `Send` and `Sync` both, even where
+/// that value is not `Sync` itself, which says the check above fails for the reason it was
+/// written for and no other.
+///
+/// ```
+/// use std::cell::Cell;
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// sent_and_shared::<zruntime::Unblock<u32>>();
+/// sent_and_shared::<zruntime::Unblock<Cell<u32>>>();
+/// ```
+#[cfg(all(doctest, feature = "unblock"))]
+struct UnblockIsSendAndSyncWhereItsOutcomeIsSend;
