@@ -6,21 +6,22 @@
 //! newcomers back and whom it does not hold back, what giving up a wait leaves behind, and what
 //! `try_lock` does. The readers-writer lock follows, with who it admits and who it keeps out, what
 //! a waiting writer does to the readers behind it, what giving up a wait leaves behind, what the
-//! calls that never wait do and do not look at, and how a writer that has waited for long holds
-//! newcomer writers back. Then come the tests that cover both locks: that a panic while a guard is
-//! held releases it, the smaller conveniences (borrowing the value, taking it back, making a lock,
-//! printing it) and that a lock may be a trait object.
+//! calls that never wait do and do not look at, how a writer that has waited for long holds
+//! newcomer writers back, and how a reader that has waited for long is let in ahead of the writers,
+//! starved or not, and holds every one of them back until it is in. Then come the tests that cover
+//! both locks: that a panic while a guard is held releases it, the smaller conveniences (borrowing
+//! the value, taking it back, making a lock, printing it) and that a lock may be a trait object.
 //!
 //! A task has waited for long once it has waited for `PATIENCE`, so the tests that need one sleep
 //! for that long after its first poll, which is all the time they take.
 //!
-//! The last nine drive one lock from many threads at once. The first two check that it never lets a
-//! holder in beside one it should keep out and that nothing deadlocks on the way, the next one that
-//! a thread that waits for a mutex is let in however steadily two others keep taking it, the next
+//! The last ten drive one lock from many threads at once. The first two check that it never lets a
+//! holder in beside one it should keep out and that nothing deadlocks on the way, the next two that
+//! a thread that waits for a lock is let in however steadily two others keep taking it, the next
 //! three that a release racing the start of a wait is not missed, the next two that a starved taker
 //! of a mutex, or a starved writer, giving up as a newcomer starts to wait does not strand it, and
 //! the last that a mutex whose waiters' wakers come back into it from their wake still admits one
-//! holder at a time and deadlocks nothing. All but the one that ends once the waiter is let in are
+//! holder at a time and deadlocks nothing. All but the two that end once the waiter is let in are
 //! shrunk under Miri, which runs them far more slowly.
 
 use std::{
@@ -447,6 +448,126 @@ fn a_starved_write_future_dropped_lets_newcomer_writers_in_again() {
     assert!(lock.try_write().is_some());
 }
 
+/// A reader that has waited for long is let in ahead of a writer that waits for the lock, which
+/// holds back every reader that has not waited. The release of the writer that holds the lock wakes
+/// the reader and the waiting writer; the reader, which runs first, finds the writer waiting and
+/// has waited for long, so it enters, as no writer holds the lock. The writer waits until the
+/// reader lets go, holding back the readers that come after, as it did before.
+#[test]
+fn a_reader_that_waited_long_enters_ahead_of_a_waiting_writer() {
+    let lock = RwLock::new(());
+    let first = ready(lock.write());
+    let mut reader = Box::pin(lock.read());
+    assert!(poll_once(&mut reader).is_pending());
+    let mut writer = Box::pin(lock.write());
+    assert!(poll_once(&mut writer).is_pending());
+    thread::sleep(PATIENCE);
+
+    drop(first);
+
+    let Poll::Ready(guard) = poll_once(&mut reader) else {
+        panic!("a reader that waited for long enters, though a writer waits for the lock");
+    };
+    assert!(poll_once(&mut writer).is_pending());
+    assert!(lock.try_read().is_none());
+    drop(guard);
+    assert!(poll_once(&mut writer).is_ready());
+}
+
+/// A reader that has waited for long holds every writer back until it is in. The writer woken
+/// beside it takes the lock first, as the reader has not found it taken yet; the reader then does,
+/// and from then on no writer takes the lock once it is free, neither one that waits for it nor
+/// `try_write`, until the reader has entered.
+#[test]
+fn a_starved_reader_holds_every_writer_back_until_it_is_in() {
+    let lock = RwLock::new(());
+    let first = ready(lock.write());
+    let mut reader = Box::pin(lock.read());
+    assert!(poll_once(&mut reader).is_pending());
+    let mut second = Box::pin(lock.write());
+    assert!(poll_once(&mut second).is_pending());
+    thread::sleep(PATIENCE);
+    drop(first);
+
+    // The writer runs first, and takes the lock before the reader has found it taken.
+    let Poll::Ready(second) = poll_once(&mut second) else {
+        panic!("the release of the first writer lets the second in");
+    };
+    // The reader finds the lock taken, having waited for long: it holds the writers back from now
+    // on.
+    assert!(poll_once(&mut reader).is_pending());
+    let mut third = Box::pin(lock.write());
+    assert!(poll_once(&mut third).is_pending());
+    drop(second);
+    assert!(poll_once(&mut third).is_pending());
+    assert!(lock.try_write().is_none());
+
+    let Poll::Ready(guard) = poll_once(&mut reader) else {
+        panic!("the release of the second writer lets the starved reader in");
+    };
+    drop(guard);
+    assert!(poll_once(&mut third).is_ready());
+}
+
+/// A reader that holds every writer back stops doing so when its `read` future is dropped: the
+/// writer it kept out of a free lock is woken and takes it. No reader took the lock, so none will
+/// release it and wake a writer: the dropped future has to.
+#[test]
+fn a_starved_read_future_dropped_lets_the_writers_in() {
+    let lock = RwLock::new(());
+    let first = ready(lock.write());
+    let mut reader = Box::pin(lock.read());
+    assert!(poll_once(&mut reader).is_pending());
+    let mut second = Box::pin(lock.write());
+    assert!(poll_once(&mut second).is_pending());
+    thread::sleep(PATIENCE);
+    drop(first);
+    let Poll::Ready(second) = poll_once(&mut second) else {
+        panic!("the release of the first writer lets the second in");
+    };
+    assert!(poll_once(&mut reader).is_pending());
+    let mut third = Box::pin(lock.write());
+    assert!(poll_once(&mut third).is_pending());
+    drop(second);
+    assert!(poll_once(&mut third).is_pending());
+
+    drop(reader);
+
+    assert!(poll_once(&mut third).is_ready());
+}
+
+/// A starved reader goes ahead of a starved writer: the writer holds newcomer writers back, but
+/// the reader holds every writer back, starved or not, until it is in. Readers that are not
+/// starved are held back by the waiting writer as before, and the writer gets the lock once the
+/// reader lets go.
+#[test]
+fn a_starved_reader_goes_ahead_of_a_starved_writer() {
+    let lock = RwLock::new(());
+    let first = ready(lock.write());
+    let mut reader = Box::pin(lock.read());
+    assert!(poll_once(&mut reader).is_pending());
+    let mut writer = Box::pin(lock.write());
+    assert!(poll_once(&mut writer).is_pending());
+    thread::sleep(PATIENCE);
+    drop(first);
+    let barging = lock
+        .try_write()
+        .expect("a free lock is taken, whoever waits for it");
+    // Both find the lock taken, having waited for long: both starve.
+    assert!(poll_once(&mut writer).is_pending());
+    assert!(poll_once(&mut reader).is_pending());
+
+    drop(barging);
+    assert!(lock.try_write().is_none());
+    assert!(poll_once(&mut writer).is_pending());
+    let Poll::Ready(guard) = poll_once(&mut reader) else {
+        panic!("the starved reader enters ahead of the starved writer");
+    };
+    assert!(lock.try_read().is_none());
+    drop(guard);
+    assert!(poll_once(&mut writer).is_ready());
+}
+
 /// A panic while a guard of a mutex is held drops the guard on the way out, which releases the
 /// mutex: nothing poisons it, and the next holder finds the value as the panicking code left it.
 #[test]
@@ -744,6 +865,57 @@ fn a_mutex_that_two_threads_keep_taking_still_lets_a_third_in() {
     }
 
     assert!(mutex.try_lock().is_some());
+}
+
+/// A reader that waits for a lock is let in, though two writers keep taking it: each takes it again
+/// as soon as it has let go, with a moment of holding it in between, so that a writer nearly always
+/// holds or waits for the lock, which keeps out a reader that has not waited for long. The reader
+/// gets in either by finding no writer holding or waiting in that instant or, once it has waited
+/// for long, by being let in ahead of the writers, which then wait for it; did it never get in, the
+/// timeout would catch it. No waiter is left counted as holding anyone back when they are done, or
+/// the lock would not be taken afterwards.
+#[test]
+#[timeout(15000)]
+fn an_rwlock_that_two_writers_keep_taking_still_lets_a_reader_in() {
+    let lock = Arc::new(RwLock::new(()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Barrier::new(3));
+
+    let writers: Vec<_> = (0..2)
+        .map(|_| {
+            let lock = lock.clone();
+            let stop = stop.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                // Lets the threads in together, so that the reader meets two writers from the
+                // start.
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let guard = block_on(lock.write());
+                    linger();
+                    drop(guard);
+                }
+            })
+        })
+        .collect();
+    let reader = thread::spawn({
+        let lock = lock.clone();
+        let stop = stop.clone();
+        move || {
+            start.wait();
+            let guard = block_on(lock.read());
+            // Lets the writers know that this thread has had its turn.
+            stop.store(true, Ordering::Relaxed);
+            drop(guard);
+        }
+    });
+    reader.join().unwrap();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    assert!(lock.try_write().is_some());
+    assert!(lock.try_read().is_some());
 }
 
 /// A `lock` that starts to wait just as the holder lets go is let in, wherever the release falls

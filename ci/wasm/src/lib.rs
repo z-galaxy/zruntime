@@ -128,6 +128,38 @@ pub extern "C" fn starved_write() -> u32 {
     0
 }
 
+/// A `read` that waited and then found a writer waiting enters ahead of that writer, as soon as no
+/// writer holds the lock, and the writer gets it once the reader lets go.
+#[unsafe(no_mangle)]
+pub extern "C" fn starved_read() -> u32 {
+    let lock = RwLock::new(());
+    let first = lock.try_write().expect("a new lock is free");
+    let mut reader = pin!(lock.read());
+    if !poll(reader.as_mut()).is_pending() {
+        return 1;
+    }
+    let mut writer = pin!(lock.write());
+    if !poll(writer.as_mut()).is_pending() {
+        return 2;
+    }
+    drop(first);
+    let Poll::Ready(guard) = poll(reader.as_mut()) else {
+        return 3;
+    };
+    if !poll(writer.as_mut()).is_pending() {
+        return 4;
+    }
+    if lock.try_read().is_some() {
+        return 5;
+    }
+    drop(guard);
+    if !poll(writer.as_mut()).is_ready() {
+        return 6;
+    }
+
+    0
+}
+
 /// Polls `future` once, with a waker that goes nowhere.
 fn poll<F>(future: std::pin::Pin<&mut F>) -> Poll<F::Output>
 where

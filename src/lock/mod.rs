@@ -72,6 +72,10 @@
 //!   that race, waits again behind every task that has begun to wait since.
 //! * An [`RwLock`] that such a writer waits for is no longer taken by a `write` that has not waited
 //!   yet, nor by [`try_write`](RwLock::try_write), in the same way.
+//! * A reader that has waited for a while, and is woken only to find a writer holding the
+//!   [`RwLock`] or waiting for it, is let in the next time no writer holds the lock, ahead of the
+//!   writers that wait for it, and no writer takes the lock until the reader is in. Other readers
+//!   are held back by a waiting writer as before: see [write preference](#write-preference).
 //!
 //! Where the standard library has no clock, as on `wasm32-unknown-unknown`, a task cannot tell how
 //! long it has waited, and holds newcomers back the first time it is woken only to find the lock
