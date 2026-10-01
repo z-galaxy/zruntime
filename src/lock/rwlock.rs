@@ -63,6 +63,10 @@ where
     T: ?Sized,
 {
     state: sync::Mutex<RwState>,
+    /// Where readers wait, and `writer_may_enter` where writers wait. Both are listened to and
+    /// notified without their fences, through `Event::listen_unfenced` and
+    /// `Event::notify_unfenced`: every check of the state is made under its lock, and every change
+    /// to it under that lock too, with the notification after, which the lock then orders.
     readers_may_enter: Event,
     writer_may_enter: Event,
     value: UnsafeCell<T>,
@@ -157,7 +161,7 @@ where
                 return guard;
             }
             // Listen before re-checking so a release between the check and the wait is seen.
-            let listener = self.readers_may_enter.listen();
+            let listener = self.readers_may_enter.listen_unfenced();
             if let Some(guard) = self.try_read() {
                 return guard;
             }
@@ -208,7 +212,7 @@ where
                 return guard;
             }
             // Listen before re-checking so a release between the check and the wait is seen.
-            let listener = self.writer_may_enter.listen();
+            let listener = self.writer_may_enter.listen_unfenced();
             if let Some(guard) = self.try_write() {
                 waiting.granted();
                 return guard;
@@ -401,7 +405,7 @@ where
         state.owner = Owner::Unlocked;
         drop(state);
 
-        self.0.writer_may_enter.notify(1);
+        self.0.writer_may_enter.notify_unfenced(1);
     }
 }
 
@@ -468,8 +472,8 @@ where
         // once they wake, so waking both sides can let nobody in early. A notification whose
         // listener is dropped before polling it is passed on to the next listener, so a `write`
         // future abandoned after being woken strands nobody behind it.
-        self.0.readers_may_enter.notify(usize::MAX);
-        self.0.writer_may_enter.notify(1);
+        self.0.readers_may_enter.notify_unfenced(usize::MAX);
+        self.0.writer_may_enter.notify_unfenced(1);
     }
 }
 
@@ -538,7 +542,7 @@ where
         }
         drop(state);
 
-        self.rwlock.readers_may_enter.notify(usize::MAX);
+        self.rwlock.readers_may_enter.notify_unfenced(usize::MAX);
     }
 }
 

@@ -62,14 +62,34 @@
 //! were for a notification that counts them, and where it takes the lock, it finds the list no
 //! earlier than as the word was written of, with the listener in it or notified since.
 //!
+//! The fences are for callers the event knows nothing of. The locks and the broadcast channel of
+//! this crate order what they check and change against the word without them, through
+//! `listen_unfenced`, which writes the word with `SeqCst` and makes no fence, and
+//! `notify_unfenced`, which looks at it with `SeqCst` and makes none. These run on every release of
+//! a lock and every send and receive of the channel, and a fence costs more than a `SeqCst` access
+//! on some targets: on aarch64, a fence is a `dmb ish`, which waits for every memory access before
+//! it to be done, where a `SeqCst` write and look are a plain `stlr` and `ldar`.
+//!
+//! * The broadcast channel and the readers-writer lock check and change what their waiters wait for
+//!   under a lock of their own, which orders the two by itself. If the notifier's turn with that
+//!   lock comes first, the check sees the change. If the waiter's turn does, its `listen` came
+//!   before that turn, which came before the notifier's, which came before the look, so the look
+//!   finds the word `listen` wrote or a later one.
+//! * `lock::Mutex` checks and changes its flag with `SeqCst` operations: a compare-exchange whose
+//!   failure is `SeqCst` to take it, and a `SeqCst` store to release it. All `SeqCst` operations
+//!   fall in one order, which keeps to the order each thread makes them in, and puts a read that
+//!   misses a write before that write. A check that missed the change would come before it, and a
+//!   look that missed the word before that word; with the change before the look and the word
+//!   before the check, the four would go round in a circle, which no order can.
+//!
 //! One thing the lock gave that a look without it does not: a notification that took the lock came
 //! before every later poll of a listener, so a listener it found notified already saw, on
 //! completing, whatever the notification's caller had changed. A notification that skips the lock
 //! lets go of nothing that a later poll takes, and a listener completing after it may check the
 //! condition and find it as it was. A caller that takes a new listener before its last check ahead
 //! of waiting again, as every caller in this crate does, sees the change on that check: the word
-//! written for the new listener comes after the one the notification looked at, which puts the
-//! notification's fence before the one `listen` makes.
+//! written for the new listener comes after the one the notification looked at, which orders the
+//! check after the change as above, through the fences, the `SeqCst` order, or the caller's lock.
 
 use std::{
     fmt,
@@ -197,16 +217,7 @@ impl Event {
     /// from then on can reach it, whether it has been polled yet or not. Take it before the last
     /// check of the condition it is for, as [listen, then check](Event#listen-then-check) says.
     pub fn listen(&self) -> EventListener {
-        let shared = self.shared();
-        let key = shared.lock().insert();
-        // Between the word written with the listener counted and the caller's check of the
-        // condition: the fence that pairs with the one a notification makes before its look.
-        fence(Ordering::SeqCst);
-
-        EventListener {
-            shared: shared.clone(),
-            key: Some(key),
-        }
+        self.add_listener(Order::Fence)
     }
 
     /// Notifies the oldest listeners not notified yet, until at least `n` listeners are notified
@@ -246,7 +257,7 @@ impl Event {
     /// assert!(Pin::new(&mut second).poll(&mut cx).is_ready());
     /// ```
     pub fn notify(&self, n: usize) -> usize {
-        self.send(n, Notification::Counting)
+        self.send(n, Notification::Counting, Order::Fence)
     }
 
     /// Notifies up to `n` more listeners, regardless of how many are notified already.
@@ -281,7 +292,7 @@ impl Event {
     /// assert!(Pin::new(&mut second).poll(&mut cx).is_ready());
     /// ```
     pub fn notify_additional(&self, n: usize) -> usize {
-        self.send(n, Notification::Additional)
+        self.send(n, Notification::Additional, Order::Fence)
     }
 
     /// How many slots the queue of this event has, vacant ones included, or `None` before
@@ -289,6 +300,26 @@ impl Event {
     #[cfg(test)]
     pub(crate) fn slots(&self) -> Option<usize> {
         self.shared.get().map(|shared| shared.lock().slots.len())
+    }
+
+    /// A listener to this event, as [`Event::listen`] takes one, but ordered against its caller's
+    /// check of the condition by a `SeqCst` write of the word instead of a fence.
+    ///
+    /// For a caller in this crate that checks the condition with a `SeqCst` operation, or under a
+    /// lock that whoever changes the condition takes too, as the module documentation says.
+    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    pub(crate) fn listen_unfenced(&self) -> EventListener {
+        self.add_listener(Order::SeqCst)
+    }
+
+    /// Notifies as [`Event::notify`] does, but ordered against its caller's change to the condition
+    /// by a `SeqCst` look at the word instead of a fence.
+    ///
+    /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
+    /// lock that whoever checks the condition takes too, as the module documentation says.
+    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    pub(crate) fn notify_unfenced(&self, n: usize) -> usize {
+        self.send(n, Notification::Counting, Order::SeqCst)
     }
 
     /// What this event and its listeners share, brought into being here where nothing has yet.
@@ -303,17 +334,33 @@ impl Event {
         self.shared.get_or_init(Arc::default)
     }
 
-    /// Sends `notification` to `n` listeners, as [`List::notify`] counts them, and hands back how
-    /// many it reached.
+    /// Puts a fresh listener in the queue, ordered by `order` against its caller's check of the
+    /// condition, and hands it out.
+    fn add_listener(&self, order: Order) -> EventListener {
+        let shared = self.shared();
+        // The guard writes the word with the listener counted, as `order` asks.
+        let key = shared.lock_writing(order.write()).insert();
+        // Between that word and the caller's check of the condition: the fence that pairs with the
+        // one a notification makes before its look, where `order` has one.
+        order.fence();
+
+        EventListener {
+            shared: shared.clone(),
+            key: Some(key),
+        }
+    }
+
+    /// Sends `notification` to `n` listeners, as [`List::notify`] counts them, ordered by `order`
+    /// against its caller's change to the condition, and hands back how many it reached.
     ///
     /// The lock is taken only where [`Shared::notified`] says the notification would reach a
     /// listener, as the module documentation says.
-    fn send(&self, n: usize, notification: Notification) -> usize {
+    fn send(&self, n: usize, notification: Notification, order: Order) -> usize {
         // Between the caller's change to the condition and the look at the word: the fence that
-        // pairs with the one `listen` makes before its caller's check.
-        fence(Ordering::SeqCst);
+        // pairs with the one `listen` makes before its caller's check, where `order` has one.
+        order.fence();
         let shared = self.shared();
-        if !shared.would_reach(n, notification) {
+        if !shared.would_reach(n, notification, order.look()) {
             return 0;
         }
 
@@ -478,16 +525,23 @@ struct Shared {
 impl Shared {
     /// The list, locked, which writes [`Shared::notified`] as it lets go.
     fn lock(&self) -> Locked<'_> {
+        self.lock_writing(Ordering::Release)
+    }
+
+    /// The list, locked, which writes [`Shared::notified`] with `write` as it lets go: `Release`,
+    /// or `SeqCst` for a listener put in it by `listen_unfenced`.
+    fn lock_writing(&self, write: Ordering) -> Locked<'_> {
         Locked {
             list: lock(&self.list),
             word: &self.notified,
+            write,
         }
     }
 
     /// Whether `notification`, sent to `n` listeners, would reach any of them, as told by the word,
-    /// without the lock.
-    fn would_reach(&self, n: usize, notification: Notification) -> bool {
-        let notified = self.notified.load(Ordering::Acquire);
+    /// loaded with `look`, without the lock.
+    fn would_reach(&self, n: usize, notification: Notification, look: Ordering) -> bool {
+        let notified = self.notified.load(look);
 
         match notification {
             // Counts the listeners notified already, against `n`. `NONE_WAITING` is past every
@@ -512,6 +566,8 @@ impl Default for Shared {
 struct Locked<'a> {
     list: MutexGuard<'a, List>,
     word: &'a AtomicUsize,
+    /// How the word is written.
+    write: Ordering,
 }
 
 impl Deref for Locked<'_> {
@@ -537,7 +593,50 @@ impl Drop for Locked<'_> {
         } else {
             NONE_WAITING
         };
-        self.word.store(notified, Ordering::Release);
+        self.word.store(notified, self.write);
+    }
+}
+
+/// How a `listen` or a notification is ordered against its caller's check of the condition, or
+/// change to it, which the module documentation goes through.
+#[derive(Clone, Copy)]
+enum Order {
+    /// By a `SeqCst` fence, whatever orderings the caller checks or changes the condition with:
+    /// what [`Event::listen`], [`Event::notify`] and [`Event::notify_additional`] do.
+    Fence,
+    /// By a `SeqCst` write or look at the word: what `Event::listen_unfenced` and
+    /// `Event::notify_unfenced` do, for a caller in this crate that checks and changes the
+    /// condition with `SeqCst` operations, or under a lock of its own.
+    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    SeqCst,
+}
+
+impl Order {
+    /// How `listen` writes the word with its listener counted.
+    fn write(self) -> Ordering {
+        match self {
+            Order::Fence => Ordering::Release,
+            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            Order::SeqCst => Ordering::SeqCst,
+        }
+    }
+
+    /// How a notification looks at the word.
+    fn look(self) -> Ordering {
+        match self {
+            Order::Fence => Ordering::Acquire,
+            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            Order::SeqCst => Ordering::SeqCst,
+        }
+    }
+
+    /// Makes the `SeqCst` fence, where this order has one.
+    fn fence(self) {
+        match self {
+            Order::Fence => fence(Ordering::SeqCst),
+            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            Order::SeqCst => {}
+        }
     }
 }
 

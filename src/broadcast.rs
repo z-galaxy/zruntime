@@ -598,7 +598,7 @@ impl<T: Clone> Sender<T> {
         drop(inner);
 
         // Notify all awaiting receive operations.
-        self.channel.recv_ops.notify(usize::MAX);
+        self.channel.recv_ops.notify_unfenced(usize::MAX);
 
         Ok(ret)
     }
@@ -1085,7 +1085,7 @@ impl<T: Clone> Receiver<T> {
         if popped && !overflow {
             // Notify 1 awaiting sender that there is now room. If there is still room in the
             // queue, the notified operation will notify another awaiting sender.
-            self.channel.send_ops.notify(1);
+            self.channel.send_ops.notify_unfenced(1);
         }
 
         received
@@ -1231,7 +1231,7 @@ impl<T: Clone> Receiver<T> {
                 match self.listener.as_mut() {
                     None => {
                         // Start listening and then try receiving again.
-                        self.listener = Some(self.channel.recv_ops.listen());
+                        self.listener = Some(self.channel.recv_ops.listen_unfenced());
                     }
                     Some(_) => {
                         // Go back to the outer loop to poll the listener.
@@ -1282,11 +1282,11 @@ impl<T> Drop for Receiver<T> {
         } else if senders_fail {
             // Every waiting sender is to find out, and each one that does not send passes nothing
             // on.
-            self.channel.send_ops.notify(usize::MAX);
+            self.channel.send_ops.notify_unfenced(usize::MAX);
         } else if room {
             // Notify 1 awaiting sender that there is now room. If there is still room in the
             // queue, the notified operation will notify another awaiting sender.
-            self.channel.send_ops.notify(1);
+            self.channel.send_ops.notify_unfenced(1);
         }
 
         // Dropped after the notification, so that a message whose `Drop` panics cannot keep a
@@ -1650,7 +1650,7 @@ impl<T: Clone> Future for Send<'_, T> {
 
                     if room {
                         // Not full still, so notify the next awaiting sender.
-                        channel.send_ops.notify(1);
+                        channel.send_ops.notify_unfenced(1);
                     }
 
                     return Poll::Ready(Ok(msg));
@@ -1678,7 +1678,7 @@ impl<T: Clone> Future for Send<'_, T> {
             match &mut this.listener {
                 None => {
                     // Start listening and then try sending again.
-                    this.listener = Some(channel.send_ops.listen());
+                    this.listener = Some(channel.send_ops.listen_unfenced());
                 }
                 Some(listener) => {
                     // Wait for a notification.
@@ -1719,7 +1719,7 @@ impl<T: Clone> Future for Recv<'_, T> {
             match &mut this.listener {
                 None => {
                     // Start listening and then try receiving again.
-                    this.listener = Some(this.receiver.channel.recv_ops.listen());
+                    this.listener = Some(this.receiver.channel.recv_ops.listen_unfenced());
                 }
                 Some(listener) => {
                     // Wait for a notification.
@@ -1929,6 +1929,11 @@ impl fmt::Display for TryRecvError {
 /// listener being taken and its caller checking what it waits for, as long as whoever notifies has
 /// changed that before it notifies, which is the order every operation here keeps. And every
 /// operation that waits listens first and checks after, as [`Event`] asks.
+///
+/// The channel listens and notifies without the event's fences, through `Event::listen_unfenced`
+/// and `Event::notify_unfenced`. Every operation checks what it waits for under this lock, and
+/// every one that changes it does so under this lock and notifies after: the lock then orders a
+/// check after the change, or the listener taken before the check ahead of the notification.
 #[derive(Debug)]
 struct Channel<T> {
     inner: Mutex<Inner<T>>,
@@ -1967,7 +1972,7 @@ impl<T> Channel<T> {
         if first {
             // Notify 1 awaiting sender that there is now a receiver. If there is still room in
             // the queue, the notified operation will notify another awaiting sender.
-            self.send_ops.notify(1);
+            self.send_ops.notify_unfenced(1);
         }
 
         receiver
@@ -1988,8 +1993,8 @@ impl<T> Channel<T> {
 
     /// Notifies every operation waiting on the channel that it is closed.
     fn notify_closed(&self) {
-        self.send_ops.notify(usize::MAX);
-        self.recv_ops.notify(usize::MAX);
+        self.send_ops.notify_unfenced(usize::MAX);
+        self.recv_ops.notify_unfenced(usize::MAX);
     }
 
     /// Sets the channel's capacity, and tells a waiting sender if that made room.
@@ -2004,7 +2009,7 @@ impl<T> Channel<T> {
         if grown {
             // Notify 1 awaiting sender that there is now room. If there is still room in the
             // queue, the notified operation will notify another awaiting sender.
-            self.send_ops.notify(1);
+            self.send_ops.notify_unfenced(1);
         }
 
         // Dropped last, once the lock is let go of and the senders are told: a message's `Drop` is
@@ -2019,7 +2024,7 @@ impl<T> Channel<T> {
         if overflow && !was {
             // A full queue stays full in overflow mode, so a sender that goes through passes
             // nothing on: every waiting sender is to hear of it, and go through.
-            self.send_ops.notify(usize::MAX);
+            self.send_ops.notify_unfenced(usize::MAX);
         }
     }
 
@@ -2030,7 +2035,7 @@ impl<T> Channel<T> {
 
         if was && !await_active {
             // The senders waiting for an active receiver are to give up, each with an error.
-            self.send_ops.notify(usize::MAX);
+            self.send_ops.notify_unfenced(usize::MAX);
         }
     }
 }
