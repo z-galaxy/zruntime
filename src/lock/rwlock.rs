@@ -6,12 +6,13 @@
 
 use std::{
     cell::UnsafeCell,
-    fmt,
+    fmt, mem,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     sync::{self, PoisonError},
 };
 
+use super::WaitStart;
 use crate::Event;
 
 /// A readers-writer lock whose `read` and `write` futures wait without blocking the thread.
@@ -33,10 +34,14 @@ use crate::Event;
 ///
 /// The lock prefers writers: while a writer waits for it, new readers wait too, so that a steady
 /// stream of readers cannot keep the writer out for good. The other side of it is that writers
-/// coming one after the other keep readers out for as long as they keep coming. A writer counts as
-/// waiting from the first poll of its [`write`](RwLock::write) future until that future completes
-/// or is dropped, so a `write` that is given up, by a timeout say, stops holding readers back: they
-/// are let in again unless another writer holds or waits for the lock.
+/// coming one after the other would keep readers out for as long as they kept coming, so a reader
+/// that has waited for a while is let in the next time no writer holds the lock, ahead of the
+/// writers waiting for it: see [fairness](crate::lock#fairness). Until such a reader is in, no
+/// writer takes the lock, even while it is free, so a reader whose task is slow to run keeps the
+/// writers waiting, as a waiting writer keeps new readers waiting. A writer counts as waiting from
+/// the first poll of its [`write`](RwLock::write) future until that future completes or is
+/// dropped, so a `write` that is given up, by a timeout say, stops holding readers back: they are
+/// let in again unless another writer holds or waits for the lock.
 ///
 /// A task that holds a read guard must therefore not ask for another one. If a writer arrives in
 /// between, the second [`read`](RwLock::read) waits for that writer, the writer waits for the first
@@ -101,6 +106,8 @@ impl<T> RwLock<T> {
             state: sync::Mutex::new(RwState {
                 owner: Owner::Unlocked,
                 writers_waiting: 0,
+                writers_starved: 0,
+                readers_starved: 0,
             }),
             readers_may_enter: Event::new(),
             writer_may_enter: Event::new(),
@@ -136,7 +143,8 @@ where
     /// when it is dropped.
     ///
     /// A task that holds a read guard must not call this again: see
-    /// [write preference](RwLock#write-preference).
+    /// [write preference](RwLock#write-preference). A reader that has waited for a while is let in
+    /// ahead of the writers waiting for the lock: see [fairness](crate::lock#fairness).
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
     /// other task waiting for it is left stranded.
@@ -156,15 +164,22 @@ where
     /// });
     /// ```
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
+        let mut reader = WaitingReader {
+            rwlock: self,
+            since: None,
+            starved: false,
+        };
         loop {
-            if let Some(guard) = self.try_read() {
+            if let Some(guard) = reader.try_read() {
                 return guard;
             }
+            reader.lost();
             // Listen before re-checking so a release between the check and the wait is seen.
             let listener = self.readers_may_enter.listen_unfenced();
-            if let Some(guard) = self.try_read() {
+            if let Some(guard) = reader.try_read() {
                 return guard;
             }
+            reader.since.get_or_insert_with(WaitStart::now);
             listener.await;
         }
     }
@@ -175,8 +190,8 @@ where
     /// cannot keep it out for good: see [write preference](RwLock#write-preference). The guard
     /// that comes out releases the lock when it is dropped.
     ///
-    /// A lock that is free is taken at once, whichever tasks are waiting for it already: see
-    /// [no fairness](crate::lock#no-fairness).
+    /// A lock that is free is taken at once, whichever writers are waiting for it already, unless
+    /// a task waiting for it has waited for a while: see [fairness](crate::lock#fairness).
     ///
     /// Dropping the future before it completes gives up the wait. The lock is not taken, the future
     /// stops holding readers back, and no other task waiting for the lock is left stranded.
@@ -205,18 +220,18 @@ where
     /// assert_eq!(waiter.join().expect("the other thread did not panic"), 5);
     /// ```
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let waiting = WaitingWriter::register(self);
+        let mut writer = WaitingWriter::register(self);
         loop {
-            if let Some(guard) = self.try_write() {
-                waiting.granted();
+            if let Some(guard) = writer.try_write() {
                 return guard;
             }
+            writer.lost();
             // Listen before re-checking so a release between the check and the wait is seen.
             let listener = self.writer_may_enter.listen_unfenced();
-            if let Some(guard) = self.try_write() {
-                waiting.granted();
+            if let Some(guard) = writer.try_write() {
                 return guard;
             }
+            writer.since.get_or_insert_with(WaitStart::now);
             listener.await;
         }
     }
@@ -245,28 +260,19 @@ where
     /// ```
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         let mut state = lock(&self.state);
-        if state.writers_waiting > 0 {
+        if state.writers_waiting > 0 || !state.admit_reader() {
             return None;
         }
-        state.owner = match state.owner {
-            Owner::Writing => return None,
-            Owner::Unlocked => Owner::Reading(NonZeroUsize::MIN),
-            Owner::Reading(readers) => Owner::Reading(
-                readers
-                    .checked_add(1)
-                    .expect("more readers than a usize counts"),
-            ),
-        };
 
         Some(RwLockReadGuard(self))
     }
 
     /// Acquires exclusive access if nobody holds the lock, without waiting.
     ///
-    /// Returns `None` while a reader or a writer holds the lock. Writers waiting for it do not
-    /// count: a lock that is free is taken ahead of them, as [`write`](RwLock::write) takes it (see
-    /// [no fairness](crate::lock#no-fairness)), and one of them is woken once this guard is
-    /// dropped.
+    /// Returns `None` while a reader or a writer holds the lock, and while a task that has waited
+    /// for it for a while holds newcomers back. Other writers waiting for it do not count: a lock
+    /// that is free is taken ahead of them, as [`write`](RwLock::write) takes it (see
+    /// [fairness](crate::lock#fairness)), and one of them is woken once this guard is dropped.
     ///
     /// # Example
     ///
@@ -285,10 +291,9 @@ where
     /// ```
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
         let mut state = lock(&self.state);
-        if !matches!(state.owner, Owner::Unlocked) {
+        if state.writers_starved > 0 || !state.admit_writer() {
             return None;
         }
-        state.owner = Owner::Writing;
 
         Some(RwLockWriteGuard(self))
     }
@@ -468,10 +473,10 @@ where
 {
     fn drop(&mut self) {
         lock(&self.0.state).owner = Owner::Unlocked;
-        // Who gets in next is settled by `try_read` and `try_write` on the state the waiters find
-        // once they wake, so waking both sides can let nobody in early. A notification whose
-        // listener is dropped before polling it is passed on to the next listener, so a `write`
-        // future abandoned after being woken strands nobody behind it.
+        // Who gets in next is settled by the waiters' tries on the state they find once they wake,
+        // so waking both sides can let nobody in early. A notification whose listener is dropped
+        // before polling it is passed on to the next listener, so a `write` future abandoned after
+        // being woken strands nobody behind it.
         self.0.readers_may_enter.notify_unfenced(usize::MAX);
         self.0.writer_may_enter.notify_unfenced(1);
     }
@@ -483,7 +488,39 @@ where
 /// across an await.
 struct RwState {
     owner: Owner,
+    /// The `write` calls that wait, from their first poll until they have the lock or give up.
     writers_waiting: usize,
+    /// The waiting writers that hold newcomer writers back.
+    writers_starved: usize,
+    /// The waiting readers that are let in ahead of waiting writers, and hold every writer back.
+    readers_starved: usize,
+}
+
+impl RwState {
+    /// Counts one more reader in, unless a writer holds the lock.
+    fn admit_reader(&mut self) -> bool {
+        self.owner = match self.owner {
+            Owner::Writing => return false,
+            Owner::Unlocked => Owner::Reading(NonZeroUsize::MIN),
+            Owner::Reading(readers) => Owner::Reading(
+                readers
+                    .checked_add(1)
+                    .expect("more readers than a usize counts"),
+            ),
+        };
+
+        true
+    }
+
+    /// Lets a writer in, unless someone holds the lock or a starved reader waits for it.
+    fn admit_writer(&mut self) -> bool {
+        if !matches!(self.owner, Owner::Unlocked) || self.readers_starved > 0 {
+            return false;
+        }
+        self.owner = Owner::Writing;
+
+        true
+    }
 }
 
 /// Who currently holds the lock, if anyone.
@@ -496,16 +533,94 @@ enum Owner {
     Writing,
 }
 
+/// An [`RwLock::read`] call.
+///
+/// Once it has waited for a while, and is woken only to find a writer holding the lock or waiting
+/// for it, it is starved: it then enters whenever no writer holds the lock, and holds every writer
+/// back until it has entered or given up.
+struct WaitingReader<'a, T>
+where
+    T: ?Sized,
+{
+    rwlock: &'a RwLock<T>,
+    /// When the call began to wait, if it has.
+    since: Option<WaitStart>,
+    /// Whether this reader counts in [`RwState::readers_starved`].
+    starved: bool,
+}
+
+impl<'a, T> WaitingReader<'a, T>
+where
+    T: ?Sized,
+{
+    /// Enters if no writer holds the lock, and, unless this reader is starved, none waits for it.
+    fn try_read(&mut self) -> Option<RwLockReadGuard<'a, T>> {
+        let mut state = lock(&self.rwlock.state);
+        if (!self.starved && state.writers_waiting > 0) || !state.admit_reader() {
+            return None;
+        }
+        if mem::take(&mut self.starved) {
+            state.readers_starved -= 1;
+        }
+
+        Some(RwLockReadGuard(self.rwlock))
+    }
+
+    /// Records that this call could not enter, after a notification woke it if it has waited.
+    ///
+    /// A reader that has waited for long by then is starved from then on.
+    fn lost(&mut self) {
+        let Some(since) = self.since else {
+            return;
+        };
+        if self.starved || !since.waited_long() {
+            return;
+        }
+        self.starved = true;
+        lock(&self.rwlock.state).readers_starved += 1;
+    }
+}
+
+impl<T> Drop for WaitingReader<'_, T>
+where
+    T: ?Sized,
+{
+    fn drop(&mut self) {
+        if !self.starved {
+            return;
+        }
+        let mut state = lock(&self.rwlock.state);
+        state.readers_starved -= 1;
+        if state.readers_starved > 0 || !matches!(state.owner, Owner::Unlocked) {
+            return;
+        }
+        drop(state);
+
+        // A writer woken while starved readers held it back has gone back to waiting, for the last
+        // of them to let go of the lock. None of them took it, so none will: wake a writer here.
+        self.rwlock.writer_may_enter.notify_unfenced(1);
+    }
+}
+
 /// Counts a `write` call as waiting for as long as its future lives, so that readers are held
 /// back only while a writer really is waiting: a `write` dropped before it is granted stops
 /// counting, and lets the readers it was holding back in again unless another writer holds or waits
 /// for the lock.
+///
+/// Once it has waited for a while, and is woken only to find the lock taken, or held back by
+/// starved readers, it is starved too: it then holds newcomer writers back until it has the lock or
+/// gives up.
 struct WaitingWriter<'a, T>
 where
     T: ?Sized,
 {
     rwlock: &'a RwLock<T>,
+    /// Whether this writer counts in [`RwState::writers_waiting`].
     counted: bool,
+    /// When the call began to wait, if it has.
+    since: Option<WaitStart>,
+    /// Whether this writer counts in [`RwState::writers_starved`].
+    starved: bool,
 }
 
 impl<'a, T> WaitingWriter<'a, T>
@@ -518,12 +633,40 @@ where
         Self {
             rwlock,
             counted: true,
+            since: None,
+            starved: false,
         }
     }
 
-    fn granted(mut self) {
+    /// Takes the lock if nobody holds it, no starved reader waits for it and, until this call has
+    /// waited, no starved writer holds newcomers back.
+    fn try_write(&mut self) -> Option<RwLockWriteGuard<'a, T>> {
+        let mut state = lock(&self.rwlock.state);
+        if (self.since.is_none() && state.writers_starved > 0) || !state.admit_writer() {
+            return None;
+        }
         self.counted = false;
-        lock(&self.rwlock.state).writers_waiting -= 1;
+        state.writers_waiting -= 1;
+        if mem::take(&mut self.starved) {
+            state.writers_starved -= 1;
+        }
+
+        Some(RwLockWriteGuard(self.rwlock))
+    }
+
+    /// Records that this call could not take the lock, after a notification woke it if it has
+    /// waited.
+    ///
+    /// A writer that has waited for long by then is starved from then on.
+    fn lost(&mut self) {
+        let Some(since) = self.since else {
+            return;
+        };
+        if self.starved || !since.waited_long() {
+            return;
+        }
+        self.starved = true;
+        lock(&self.rwlock.state).writers_starved += 1;
     }
 }
 
@@ -537,19 +680,29 @@ where
         }
         let mut state = lock(&self.rwlock.state);
         state.writers_waiting -= 1;
-        if state.writers_waiting > 0 || matches!(state.owner, Owner::Writing) {
-            return;
+        if self.starved {
+            state.writers_starved -= 1;
         }
+        let wake_readers = state.writers_waiting == 0 && !matches!(state.owner, Owner::Writing);
+        // The future drops its listener before this, so a notification the listener had is passed
+        // on while this writer still holds newcomer writers back: one that listened in between,
+        // finding the lock free but not for it, waits for this wake, with nobody else to wake it.
+        let wake_writer = self.starved && matches!(state.owner, Owner::Unlocked);
         drop(state);
 
-        self.rwlock.readers_may_enter.notify_unfenced(usize::MAX);
+        if wake_readers {
+            self.rwlock.readers_may_enter.notify_unfenced(usize::MAX);
+        }
+        if wake_writer {
+            self.rwlock.writer_may_enter.notify_unfenced(1);
+        }
     }
 }
 
 /// The state behind the lock, taken whether or not a panic poisoned it.
 ///
-/// Poisoning says nothing here: every path updates the state in a single assignment, so a panic
-/// elsewhere cannot leave it half-updated.
+/// Poisoning says nothing here: no path can panic part of the way through its changes to the
+/// state, so a panic elsewhere cannot leave it half-updated.
 fn lock(state: &sync::Mutex<RwState>) -> sync::MutexGuard<'_, RwState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }

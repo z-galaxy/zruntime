@@ -127,6 +127,29 @@ jobs:
       - name: Test Event, the locks and the broadcast channel under Miri
         run: cargo --locked miri test --no-default-features --features lock,broadcast
 
+  # Once a task starts to wait for a lock, the locks read the clock, where the target has one.
+  # On `wasm32-unknown-unknown` the standard library has none, and reading it panics, which no
+  # build can show: this runs the locks' waiting paths there, in Node.
+  wasm:
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ci/wasm
+      - name: Run the locks' waiting paths on wasm32-unknown-unknown
+        working-directory: ci/wasm
+        run: |
+          cargo --locked build --release --target wasm32-unknown-unknown
+          node run.mjs target/wasm32-unknown-unknown/release/zruntime_wasm_check.wasm
+
   doc_build:
     runs-on: ubuntu-latest
     env:

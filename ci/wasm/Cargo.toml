@@ -1,0 +1,15 @@
+[package]
+name = "zruntime-wasm-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Runs zruntime's contended locks on wasm32-unknown-unknown, which has no clock"
+
+# Its own workspace, so that it never joins zruntime's package or build.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zruntime = { path = "../..", default-features = false, features = ["lock"] }
