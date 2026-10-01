@@ -5,22 +5,23 @@
 //! first, with who it admits and who it keeps out, how a taker that has waited for long holds
 //! newcomers back and whom it does not hold back, what giving up a wait leaves behind, and what
 //! `try_lock` does. The readers-writer lock follows, with who it admits and who it keeps out, what
-//! a waiting writer does to the readers behind it, what giving up a wait leaves behind, and what
-//! the calls that never wait do and do not look at. Then come the tests that cover both locks: that
-//! a panic while a guard is held releases it, the smaller conveniences (borrowing the value, taking
-//! it back, making a lock, printing it) and that a lock may be a trait object.
+//! a waiting writer does to the readers behind it, what giving up a wait leaves behind, what the
+//! calls that never wait do and do not look at, and how a writer that has waited for long holds
+//! newcomer writers back. Then come the tests that cover both locks: that a panic while a guard is
+//! held releases it, the smaller conveniences (borrowing the value, taking it back, making a lock,
+//! printing it) and that a lock may be a trait object.
 //!
 //! A task has waited for long once it has waited for `PATIENCE`, so the tests that need one sleep
 //! for that long after its first poll, which is all the time they take.
 //!
-//! The last eight drive one lock from many threads at once. The first two check that it never lets
-//! a holder in beside one it should keep out and that nothing deadlocks on the way, the next one
-//! that a thread that waits for a mutex is let in however steadily two others keep taking it, the
-//! next three that a release racing the start of a wait is not missed, the next that a starved
-//! taker of a mutex giving up as a newcomer starts to wait does not strand it, and the last that a
-//! mutex whose waiters' wakers come back into it from their wake still admits one holder at a time
-//! and deadlocks nothing. All but the one that ends once the waiter is let in are shrunk under
-//! Miri, which runs them far more slowly.
+//! The last nine drive one lock from many threads at once. The first two check that it never lets a
+//! holder in beside one it should keep out and that nothing deadlocks on the way, the next one that
+//! a thread that waits for a mutex is let in however steadily two others keep taking it, the next
+//! three that a release racing the start of a wait is not missed, the next two that a starved taker
+//! of a mutex, or a starved writer, giving up as a newcomer starts to wait does not strand it, and
+//! the last that a mutex whose waiters' wakers come back into it from their wake still admits one
+//! holder at a time and deadlocks nothing. All but the one that ends once the waiter is let in are
+//! shrunk under Miri, which runs them far more slowly.
 
 use std::{
     fmt,
@@ -39,7 +40,7 @@ use std::{
 use futures_lite::future::block_on;
 use ntest::timeout;
 
-use crate::lock::{Mutex, MutexGuard, PATIENCE, RwLock};
+use crate::lock::{Mutex, MutexGuard, PATIENCE, RwLock, RwLockWriteGuard};
 
 /// A second taker waits while the first holds the mutex, and is let in once the first lets go.
 #[test]
@@ -367,8 +368,9 @@ fn try_read_fails_while_a_writer_waits() {
     assert!(lock.try_read().is_some());
 }
 
-/// `try_write` looks at who holds the lock and not at who waits for it: where the lock is free and
-/// a writer waits, it takes the lock ahead of that writer. The writer finds the lock taken and goes
+/// `try_write` looks at who holds the lock and not at who waits for it, unless a writer has waited
+/// for long (see the tests that follow): where the lock is free and a writer that has not waited
+/// for long waits, it takes the lock ahead of that writer. The writer finds the lock taken and goes
 /// back to waiting, and gets it once the guard `try_write` gave is dropped.
 #[test]
 fn try_write_takes_a_free_lock_while_a_writer_waits() {
@@ -390,6 +392,59 @@ fn try_write_takes_a_free_lock_while_a_writer_waits() {
         panic!("the release of the barging guard lets the waiting writer in");
     };
     assert_eq!(*guard, 2);
+}
+
+/// A writer that has waited for long holds newcomer writers back once it has lost a race for the
+/// lock, as a taker of a mutex does. The release that wakes it is not enough: the first newcomer
+/// still takes the free lock ahead of it, and it is by finding the lock taken again that it starts
+/// to hold newcomers back. From then on a free lock is not taken by `try_write`, nor by a `write`
+/// that has not waited yet, which waits behind the writer; the writer itself takes the free lock,
+/// and newcomers may take it again once it has.
+#[test]
+fn a_writer_that_waited_long_holds_newcomer_writers_back() {
+    let lock = RwLock::new(());
+    let holder = ready(lock.write());
+    let mut waiter = Box::pin(lock.write());
+    assert!(poll_once(&mut waiter).is_pending());
+    thread::sleep(PATIENCE);
+    // The release wakes the waiter, which has not run yet when the first newcomer comes.
+    drop(holder);
+    let barging = ready(lock.write());
+
+    // The waiter finds the lock taken, having waited for long: it holds newcomers back from now on.
+    assert!(poll_once(&mut waiter).is_pending());
+    drop(barging);
+    assert!(lock.try_write().is_none());
+    let mut newcomer = Box::pin(lock.write());
+    assert!(poll_once(&mut newcomer).is_pending());
+
+    let Poll::Ready(guard) = poll_once(&mut waiter) else {
+        panic!("the release of the barging guard lets the starved writer in");
+    };
+    drop(guard);
+    assert!(poll_once(&mut newcomer).is_ready());
+    assert!(lock.try_write().is_some());
+}
+
+/// A writer that holds newcomer writers back stops doing so when its `write` future is dropped:
+/// the lock that was free, and yet not taken by a newcomer, is taken by one again, with no release
+/// needed.
+#[test]
+fn a_starved_write_future_dropped_lets_newcomer_writers_in_again() {
+    let lock = RwLock::new(());
+    let holder = ready(lock.write());
+    let mut waiter = Box::pin(lock.write());
+    assert!(poll_once(&mut waiter).is_pending());
+    thread::sleep(PATIENCE);
+    drop(holder);
+    let barging = ready(lock.write());
+    assert!(poll_once(&mut waiter).is_pending());
+    drop(barging);
+    assert!(lock.try_write().is_none());
+
+    drop(waiter);
+
+    assert!(lock.try_write().is_some());
 }
 
 /// A panic while a guard of a mutex is held drops the guard on the way out, which releases the
@@ -776,6 +831,24 @@ fn a_starved_lock_future_dropped_racing_a_lock_does_not_strand_it() {
     );
 }
 
+/// A `write` that starts to wait just as a starved writer's `write` future is dropped is let in,
+/// as a `lock` is when a starved taker of a mutex goes (see the test above).
+#[test]
+#[timeout(15000)]
+fn a_starved_write_future_dropped_racing_a_write_does_not_strand_it() {
+    let rounds = if cfg!(miri) { 20 } else { 2_000 };
+    handoff(
+        Arc::new(RwLock::new(())),
+        rounds,
+        |lock, start_waiting| {
+            let starved = starved_write(lock);
+            start_waiting();
+            drop(starved);
+        },
+        |lock| drop(block_on(lock.write())),
+    );
+}
+
 /// Wakers that come back into the lock from their wake, each taking it and letting go at once or
 /// listening for it and giving up, while threads take and release it: nothing deadlocks, and the
 /// lock still admits one holder at a time.
@@ -858,6 +931,27 @@ fn starved_lock(mutex: &Mutex<()>) -> Pin<Box<impl Future<Output = MutexGuard<'_
     drop(barging);
     assert!(
         mutex.try_lock().is_none(),
+        "the waiter holds newcomers back"
+    );
+
+    waiter
+}
+
+/// A `write` future of `lock` that holds newcomer writers back, on a lock that is free and whose
+/// last release notified it: the future has waited for long, and then found the lock taken.
+fn starved_write(lock: &RwLock<()>) -> Pin<Box<impl Future<Output = RwLockWriteGuard<'_, ()>>>> {
+    let holder = lock
+        .try_write()
+        .expect("nothing holds the lock between rounds");
+    let mut waiter = Box::pin(lock.write());
+    assert!(poll_once(&mut waiter).is_pending());
+    thread::sleep(PATIENCE);
+    drop(holder);
+    let barging = lock.try_write().expect("the release left the lock free");
+    assert!(poll_once(&mut waiter).is_pending());
+    drop(barging);
+    assert!(
+        lock.try_write().is_none(),
         "the waiter holds newcomers back"
     );
 

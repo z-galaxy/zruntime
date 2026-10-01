@@ -62,12 +62,16 @@
 //! lock as it is released, rather than leave it free until a waiting task has been woken and has
 //! run, which keeps a contended lock busy.
 //!
-//! How long newcomers can keep a task waiting for a [`Mutex`] this way is bounded. A task that has
-//! waited for it for a while, and is woken only to find it taken again, starts holding newcomers
-//! back, for as long as it waits: a `lock` that has not waited yet, and
-//! [`try_lock`](Mutex::try_lock), no longer take the mutex, even while it is free, but wait behind
-//! the task. A task that was waiting already can still get the mutex ahead of it, and the task,
-//! having lost that race, waits again behind every task that has begun to wait since.
+//! How long newcomers can keep a task waiting this way is bounded. A task that has waited for a
+//! lock for a while, and is woken only to find it taken again, starts holding newcomers back, for
+//! as long as it waits:
+//!
+//! * A [`Mutex`] that such a task waits for is no longer taken by a `lock` that has not waited yet,
+//!   nor by [`try_lock`](Mutex::try_lock), even while it is free: those wait behind the task. A
+//!   task that was waiting already can still get the mutex ahead of it, and the task, having lost
+//!   that race, waits again behind every task that has begun to wait since.
+//! * An [`RwLock`] that such a writer waits for is no longer taken by a `write` that has not waited
+//!   yet, nor by [`try_write`](RwLock::try_write), in the same way.
 //!
 //! Where the standard library has no clock, as on `wasm32-unknown-unknown`, a task cannot tell how
 //! long it has waited, and holds newcomers back the first time it is woken only to find the lock

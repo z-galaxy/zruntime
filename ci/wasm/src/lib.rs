@@ -96,6 +96,38 @@ pub extern "C" fn starved_lock() -> u32 {
     0
 }
 
+/// A `write` that waited and then found the lock taken holds newcomer writers back, as a `lock`
+/// does.
+#[unsafe(no_mangle)]
+pub extern "C" fn starved_write() -> u32 {
+    let lock = RwLock::new(());
+    let holder = lock.try_write().expect("a new lock is free");
+    let mut waiter = pin!(lock.write());
+    if !poll(waiter.as_mut()).is_pending() {
+        return 1;
+    }
+    drop(holder);
+    let Some(barging) = lock.try_write() else {
+        return 2;
+    };
+    if !poll(waiter.as_mut()).is_pending() {
+        return 3;
+    }
+    drop(barging);
+    if lock.try_write().is_some() {
+        return 4;
+    }
+    let Poll::Ready(guard) = poll(waiter.as_mut()) else {
+        return 5;
+    };
+    drop(guard);
+    if lock.try_write().is_none() {
+        return 6;
+    }
+
+    0
+}
+
 /// Polls `future` once, with a waker that goes nowhere.
 fn poll<F>(future: std::pin::Pin<&mut F>) -> Poll<F::Output>
 where
