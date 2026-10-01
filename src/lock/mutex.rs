@@ -49,11 +49,14 @@ where
 {
     /// Whether a guard exists.
     ///
-    /// Taken with an `Acquire` compare-exchange and given back with a `Release` store, so that a
-    /// holder sees what the one before it did to the value. A release between a `lock`'s check
-    /// and its wait is not lost: `lock` takes its listener before its second `try_lock`, as
-    /// `Event` asks of its callers, so the release's `notify` either reaches that listener or
-    /// came before it was taken, and then the second `try_lock` sees the release.
+    /// Taken with a compare-exchange, `Acquire` where it succeeds, and given back with a `SeqCst`
+    /// store, whose release half has the next holder see what the one before it did to the
+    /// value. A release between a `lock`'s check and its wait is not lost: `lock` takes its
+    /// listener before its second `try_lock`, as `Event` asks of its callers, so the release's
+    /// notification either reaches that listener or came before it was taken, and then the second
+    /// `try_lock` sees the release. The store and a compare-exchange that fails are `SeqCst` so
+    /// that the event orders the two against its own `SeqCst` accesses, with no fence, as its
+    /// `listen_unfenced` and `notify_unfenced` ask.
     locked: AtomicBool,
     unlocked: Event,
     value: UnsafeCell<T>,
@@ -151,7 +154,7 @@ where
                 return guard;
             }
             // Listen before re-checking so a release between the check and the wait is seen.
-            let listener = self.unlocked.listen();
+            let listener = self.unlocked.listen_unfenced();
             if let Some(guard) = self.try_lock() {
                 return guard;
             }
@@ -179,7 +182,7 @@ where
     /// ```
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         self.locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::SeqCst)
             .ok()?;
 
         Some(MutexGuard(self))
@@ -291,9 +294,9 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        self.0.locked.store(false, Ordering::Release);
+        self.0.locked.store(false, Ordering::SeqCst);
         // A notification whose listener is dropped before polling it is passed on to the next
         // listener, so a `lock` future abandoned after being woken strands nobody behind it.
-        self.0.unlocked.notify(1);
+        self.0.unlocked.notify_unfenced(1);
     }
 }

@@ -183,5 +183,6 @@ completion unobserved.
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
 - `src/reactor.rs`: I/O readiness and timers
 - `src/scheduler.rs`: Task storage and polling
-- `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex
+- `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
+  atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`

@@ -12,12 +12,18 @@
 //! or dropped, what outlives what, which wakers are kept, and that a waker may come back into the
 //! event it was woken or dropped by.
 //!
-//! The last three drive one event from many threads at once — through listeners polled for the
-//! first time while one notification for all of them is sent, and through listeners that give up
-//! the moment a notification reaches them — and check that no notification is lost on the way.
-//! They are shrunk under Miri, which runs them far more slowly. Driving an event from many threads
-//! through a lock built on it, and through wakers that come back into it, is tested with the
-//! locks, in the `lock` tests.
+//! The last five drive one event from many threads at once — through listeners taken just as
+//! another thread changes the condition they are for and notifies, through a listener dropped just
+//! as another thread notifies, through listeners polled for the first time while one notification
+//! for all of them is sent, and through listeners that give up the moment a notification reaches
+//! them — and check that no notification is lost on the way, and that one that finds nobody to
+//! reach comes after whatever left nobody there. They are shrunk under Miri, which runs them far
+//! more slowly, and which also lets an atomic load see an older value than the hardware would, as
+//! the memory model allows: under it, the first of them fails without the fence `listen` makes or
+//! the one a notification makes, and the second without the ordering of the word a notification
+//! looks at without the event's lock, which a run on the hardware alone can hide. Driving an event
+//! from many threads through a lock built on it, and through wakers that come back into it, is
+//! tested with the locks, in the `lock` tests.
 
 use std::{
     future::Future,
@@ -590,6 +596,86 @@ fn a_listener_takes_the_slot_of_one_gone() {
     }
 
     assert_eq!(event.slots(), Some(3));
+}
+
+/// Listeners taken on two threads just as a third changes the condition they are for and notifies
+/// are reached by the notification, unless the check that follows each listener's taking sees the
+/// change: the listen-then-check pattern, raced round after round.
+///
+/// The condition is changed and checked with `Relaxed` accesses, which order nothing on their
+/// own, so that only what the event itself does keeps the notification and a check from both
+/// missing the other side. A notification that did would leave a listening thread waiting for
+/// good, and the test timed out. With two listeners, a notification can also come in between the
+/// taking of one and that of the other, and then has to reach the first while the second's check
+/// sees the change.
+#[test]
+#[timeout(15000)]
+fn a_notification_racing_listeners_reaches_them_or_their_checks_see_the_change() {
+    const LISTENING: usize = 2;
+    let rounds = if cfg!(miri) { 30 } else { 10_000 };
+    let event = Arc::new(Event::new());
+    let changed_in = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(LISTENING + 1));
+
+    let listening: Vec<_> = (0..LISTENING)
+        .map(|_| {
+            let event = event.clone();
+            let changed_in = changed_in.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                for round in 1..=rounds {
+                    start.wait();
+                    let listener = event.listen();
+                    if changed_in.load(Ordering::Relaxed) < round {
+                        block_on(listener);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for round in 1..=rounds {
+        start.wait();
+        changed_in.store(round, Ordering::Relaxed);
+        event.notify(usize::MAX);
+    }
+    for thread in listening {
+        thread.join().unwrap();
+    }
+}
+
+/// A notification that finds the last listener dropped, and so reaches nobody, comes after that
+/// drop and whatever came before it, as it did when every notification took the event's lock.
+#[test]
+#[timeout(15000)]
+fn a_notification_finding_the_last_listener_dropped_comes_after_the_drop() {
+    let rounds = if cfg!(miri) { 30 } else { 1_000 };
+
+    for _ in 0..rounds {
+        let event = Arc::new(Event::new());
+        let listening = Arc::new(AtomicBool::new(false));
+        let before_drop = Arc::new(AtomicBool::new(false));
+        let dropper = thread::spawn({
+            let event = event.clone();
+            let listening = listening.clone();
+            let before_drop = before_drop.clone();
+            move || {
+                let listener = event.listen();
+                listening.store(true, Ordering::Release);
+                // Ordered before the notification below by nothing but the drop that follows.
+                before_drop.store(true, Ordering::Relaxed);
+                drop(listener);
+            }
+        });
+
+        while !listening.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        if event.notify(1) == 0 {
+            assert!(before_drop.load(Ordering::Relaxed));
+        }
+        dropper.join().unwrap();
+    }
 }
 
 /// Listeners polled for the first time on many threads, while one notification for all of them
