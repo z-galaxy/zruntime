@@ -70,6 +70,11 @@ cargo check --no-default-features --features lock
 # runtime polls with `ppoll`, which Miri cannot run
 cargo +nightly miri test --no-default-features --features lock,broadcast
 
+# Run the locks' waiting paths on `wasm32-unknown-unknown`, which has no clock, in Node, as CI
+# does
+cargo build --release --target wasm32-unknown-unknown --manifest-path ci/wasm/Cargo.toml
+node ci/wasm/run.mjs ci/wasm/target/wasm32-unknown-unknown/release/zruntime_wasm_check.wasm
+
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
 cargo check --all-features --target x86_64-apple-darwin
