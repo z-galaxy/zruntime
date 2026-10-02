@@ -25,6 +25,8 @@ pub mod lock;
 mod log;
 #[cfg(feature = "runtime")]
 mod mode;
+#[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
+pub mod net;
 #[cfg(feature = "runtime")]
 mod poll;
 #[cfg(feature = "runtime")]
@@ -33,6 +35,8 @@ mod reactor;
 mod runtime;
 #[cfg(feature = "runtime")]
 mod scheduler;
+#[cfg(feature = "unblock")]
+mod unblock;
 
 #[cfg(all(feature = "runtime", unix))]
 use std::os::fd::AsFd as AsSource;
@@ -61,6 +65,8 @@ pub use reactor::Registration;
 use runtime::Core;
 #[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
+#[cfg(feature = "unblock")]
+pub use unblock::{Unblock, unblock};
 
 /// Runs `future` to completion on the calling thread, running that thread's runtime alongside it.
 ///

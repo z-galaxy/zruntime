@@ -119,6 +119,16 @@ pub(crate) mod sealed {
         /// of a trait object.
         fn as_source(source: &Self::SourcePtr) -> BorrowedSource<'_>;
 
+        /// A source pointer to what `ptr` points to, sharing it with whoever holds `ptr`.
+        ///
+        /// What a socket of the `net` module hands its runtime to watch: the socket itself, which
+        /// that module goes on doing its I/O through. The bound is `Send + Sync` in either
+        /// flavour, which every socket it builds on is, so that one function serves both.
+        #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
+        fn source_ptr<T>(ptr: Self::Ptr<T>) -> Self::SourcePtr
+        where
+            T: AsSource + Send + Sync + 'static;
+
         /// Runs `future` to completion on the calling thread, driving `core` alongside it.
         ///
         /// A hook rather than a method of the core, so that a shared runtime which came out of a
@@ -185,6 +195,14 @@ pub(crate) mod sealed {
             borrow_source(&**source)
         }
 
+        #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
+        fn source_ptr<T>(ptr: Rc<T>) -> Rc<dyn AsSource>
+        where
+            T: AsSource + Send + Sync + 'static,
+        {
+            ptr
+        }
+
         fn block_on<F>(core: &Rc<Core<Self>>, future: F) -> F::Output
         where
             F: Future,
@@ -222,6 +240,14 @@ pub(crate) mod sealed {
 
         fn as_source(source: &Self::SourcePtr) -> BorrowedSource<'_> {
             borrow_source(&**source)
+        }
+
+        #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
+        fn source_ptr<T>(ptr: Arc<T>) -> Arc<dyn AsSource + Send + Sync>
+        where
+            T: AsSource + Send + Sync + 'static,
+        {
+            ptr
         }
 
         fn block_on<F>(core: &Arc<Core<Self>>, future: F) -> F::Output

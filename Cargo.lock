@@ -1023,6 +1023,7 @@ version = "0.1.0"
 dependencies = [
  "codspeed-criterion-compat",
  "futures-core",
+ "futures-io",
  "futures-lite",
  "futures-util",
  "ntest",

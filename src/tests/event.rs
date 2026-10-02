@@ -6,11 +6,11 @@
 //! clones of the waker as well, or notifies the event from inside a clone: a waker built on
 //! [`Wake`] is cloned by the standard library, where no test can see it. That vtable is the one
 //! piece of `unsafe` code here: the library's own is in the `lock` module and, on Windows, in the
-//! poller's calls into Winsock. They come in the order of what they pin down: that a listener is
-//! queued as it is taken, that nothing is kept for one taken later, the order listeners are
-//! notified in, what each kind of notification counts, what a notified listener does when polled
-//! or dropped, what outlives what, which wakers are kept, and that a waker may come back into the
-//! event it was woken or dropped by.
+//! poller's calls into Winsock and the `net` module's check of a connect under way. They come in
+//! the order of what they pin down: that a listener is queued as it is taken, that nothing is kept
+//! for one taken later, the order listeners are notified in, what each kind of notification
+//! counts, what a notified listener does when polled or dropped, what outlives what, which wakers
+//! are kept, and that a waker may come back into the event it was woken or dropped by.
 //!
 //! The last five drive one event from many threads at once — through listeners taken just as
 //! another thread changes the condition they are for and notifies, through a listener dropped just

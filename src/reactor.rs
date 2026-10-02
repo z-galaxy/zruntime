@@ -305,6 +305,14 @@ where
 
         Poll::Pending
     }
+
+    /// A handle on the runtime this registration's source is watched by.
+    #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+    pub(crate) fn runtime(&self) -> crate::Runtime<M> {
+        crate::Runtime {
+            core: self.core.clone(),
+        }
+    }
 }
 
 impl<M> Drop for Registration<M>
