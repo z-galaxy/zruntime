@@ -41,6 +41,14 @@ A non-default `unblock` feature, which adds no dependency, gives `zruntime::unbl
 blocking work run on a thread of its own, out of the way of the async tasks, and a future of its
 outcome, moved here from zbus. It needs no runtime and works under any executor.
 
+A non-default `tcp` feature, which implies `runtime` and adds `socket2`, `futures-io` and
+`futures-core` dependencies, gives the `zruntime::net` module's TCP sockets, `TcpListener` and
+`TcpStream`, as smol has in `smol::net`. They run on a `Runtime` of either flavour, connect
+without blocking the thread, take socket addresses rather than host names, and implement
+`futures-io`'s `AsyncRead` and `AsyncWrite`. Their non-blocking connect is carried over from zbus,
+whose own socket layer stays there: it drives its sockets through whichever runtime a connection
+runs on.
+
 It is a single crate at the repository root — not a workspace.
 
 ## Common Development Commands
@@ -62,14 +70,15 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime, Event, broadcast, the locks and unblock each built alone: `--all-features`
-# cannot show that each builds without the others, and leaves out the no-op `error!` in `log.rs`
-# that replaces `tracing`'s
+# Check the runtime, Event, broadcast, the locks, unblock and the TCP sockets each built alone:
+# `--all-features` cannot show that each builds without the others, and leaves out the no-op
+# `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
 cargo check --no-default-features --features lock
 cargo check --no-default-features --features unblock
+cargo check --no-default-features --features tcp
 
 # Run what needs no runtime (Event, the locks, the broadcast channel, unblock) under Miri, as CI
 # does; the runtime polls with `ppoll`, which Miri cannot run
@@ -120,6 +129,8 @@ src/
 ├── lock/         # [lock feature] Mutex and RwLock, built on Event, with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
+├── net/          # [tcp feature] Async sockets: io.rs, `Io<T, M>`, a socket and its registration,
+│                 # which every socket is built on; connect.rs, the non-blocking connect; tcp.rs
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
@@ -130,7 +141,7 @@ src/
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
                   # broadcast.rs: the broadcast channel, broadcast feature; lock.rs: the locks,
                   # lock feature; helper.rs: helper feature; unblock.rs: unblock, unblock
-                  # feature
+                  # feature; net/: the sockets, each family under its own feature
 ```
 
 ### Key Design Patterns
@@ -166,6 +177,13 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved.
 
+**Sockets (the `net` features)**: every socket is an `Io<T, M>`: the std socket, non-blocking, in
+the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
+`Mode::source_ptr`, and the `Registration` its I/O waits on. A registration keeps one waker per
+direction, so a socket serves one waiting reader and one waiting writer at a time; a stream
+implements `futures-io`'s traits for `&Stream` as well, which is how a reader and a writer share
+it. No socket is `Clone`.
+
 ## Development Guidelines
 
 - **MSRV**: 1.87.0
@@ -178,9 +196,10 @@ completion unobserved.
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast` and `lock` imply `event` and, like it, must not reach into the
-  runtime; nor may `unblock`, which needs neither. CI builds and tests everything with every
-  feature on, and checks `runtime`, `event`, `broadcast`, `lock` and `unblock` each alone.
-- **Testing**: The test suite needs no external services (no D-Bus, no network).
+  runtime; nor may `unblock`, which needs neither. `tcp` implies `runtime`. CI builds and tests
+  everything with every feature on, and checks `runtime`, `event`, `broadcast`, `lock`, `unblock`
+  and `tcp` each alone.
+- **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
 - **Dependencies**: Keep this crate's own dependency footprint small; it is meant to be pulled in
@@ -200,3 +219,5 @@ completion unobserved.
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
 - `src/unblock.rs`: [unblock feature] `unblock`, blocking work on a thread of its own
+- `src/net/io.rs`: [tcp feature] `Io<T, M>`, the socket and registration every socket is built on
+- `src/net/connect.rs`: [tcp feature] The non-blocking connect, and Winsock's check of one

@@ -37,9 +37,13 @@ lock = ["event"]
 # `unblock`: blocking work run on a thread of its own, out of the way of the async tasks; needs no
 # runtime.
 unblock = []
+# The `net` module's TCP sockets: `TcpListener` and `TcpStream`.
+tcp = ["runtime", "dep:socket2", "dep:futures-io", "dep:futures-core", "rustix?/net"]
 
 [dependencies]
 futures-core = { version = "0.3.34", default-features = false, optional = true }
+futures-io = { version = "0.3.34", optional = true }
+socket2 = { version = "0.6.5", optional = true }
 tracing = { version = "0.1.44", optional = true }
 
 [target."cfg(unix)".dependencies.rustix]

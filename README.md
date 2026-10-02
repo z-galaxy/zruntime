@@ -90,6 +90,14 @@ arrives while the helper holds the runtime is handed it straight away, so a prog
 `block_on` once per operation still runs each of them on its own thread rather than behind a
 thread of the runtime's own.
 
+## Sockets
+
+The non-default `tcp` feature adds ready-made async TCP sockets, as smol has in `smol::net`: the
+[`net`] module's `TcpListener` and `TcpStream`, which run on a runtime of either flavour. A stream
+implements the `AsyncRead` and `AsyncWrite` traits of `futures-io`, and connecting it never blocks
+the thread. The sockets take socket addresses rather than host names: a name is the caller's to
+look up, which the `unblock` feature can do off the thread.
+
 ## Events
 
 An [`Event`] is a notification that tasks can wait for. A task takes an [`EventListener`] from it
@@ -116,6 +124,8 @@ is behind the `event` feature, which builds without the runtime: see [Features](
   an await, built on [`Event`]; it implies `event`, and needs no runtime either.
 * `unblock`: [`unblock`], which runs a piece of blocking work on a thread of its own and hands
   back a future of its outcome; it needs no runtime either.
+* `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
+  and brings the `socket2`, `futures-io` and `futures-core` crates.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
@@ -143,6 +153,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
 [`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
+[`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
 [MIT]: (LICENSE)

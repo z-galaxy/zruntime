@@ -25,6 +25,8 @@ it last, and an event may be notified from any thread.
   await, built on [`Event`]; it implies `event`.
 * `unblock`: `unblock`, which runs a piece of blocking work on a thread of its own and hands back
   a future of its outcome; it needs no runtime.
+* `tcp`: the `net` module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
+  and brings the `socket2`, `futures-io` and `futures-core` crates.
 
 `event`, `runtime` and `tracing` are on by default, and `event` and `runtime` each build without
 the other: a crate that only notifies depends on zruntime with

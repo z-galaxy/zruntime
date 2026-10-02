@@ -1,5 +1,6 @@
 //! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast channel and
-//! the locks built on that event, and of blocking work run on a thread of its own.
+//! the locks built on that event, of blocking work run on a thread of its own, and of the sockets
+//! a runtime watches.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
 //! the `core` module, in both flavours wherever the test means the same in each. An event and its
@@ -10,7 +11,8 @@
 //! shown by code that does not compile, so it is shown here, by the doc tests of the items below.
 //! The broadcast channel and the locks, built on the event, are tested in the `broadcast` and
 //! `lock` modules. Blocking work, which needs neither the runtime nor the event, is tested in the
-//! `unblock` module.
+//! `unblock` module. The sockets of the `net` module are tested in the `net` module, one family of
+//! them to a module there, in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -27,6 +29,8 @@ mod event;
 mod helper;
 #[cfg(all(test, feature = "lock"))]
 mod lock;
+#[cfg(all(test, feature = "tcp"))]
+mod net;
 #[cfg(all(test, feature = "unblock"))]
 mod unblock;
 
@@ -389,3 +393,83 @@ struct LocksAreAsSendAndSyncAsTheirValues;
 /// ```
 #[cfg(all(doctest, feature = "unblock"))]
 struct UnblockIsSendAndSyncWhereItsOutcomeIsSend;
+
+/// A local runtime's sockets stay on its thread, as everything built on it does: a stream is not
+/// `Send`...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::TcpStream<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::net::TcpStream<zruntime::Local>>();
+/// ```
+///
+/// ...and a listener is not `Send` either...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::TcpListener<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::net::TcpListener<zruntime::Local>>();
+/// ```
+///
+/// ...and the stream of the connections a listener accepts borrows the listener, and a reference
+/// is `Send` only where what it refers to is `Sync`, so that stream is not `Send` either...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::Incoming<'static, zruntime::Local>>();
+/// ```
+///
+/// ...while the same sockets built on a shared runtime may go anywhere, and so may the stream of
+/// the connections a listener accepts: which is what says the checks above fail for the reason
+/// they were written for and no other.
+///
+/// ```
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// sent_and_shared::<zruntime::net::TcpStream<zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::TcpListener<zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::Incoming<'static, zruntime::Shared>>();
+/// ```
+#[cfg(all(doctest, feature = "tcp"))]
+struct LocalSocketsStayOnTheirThread;

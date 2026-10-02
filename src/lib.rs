@@ -25,6 +25,8 @@ pub mod lock;
 mod log;
 #[cfg(feature = "runtime")]
 mod mode;
+#[cfg(feature = "tcp")]
+pub mod net;
 #[cfg(feature = "runtime")]
 mod poll;
 #[cfg(feature = "runtime")]
