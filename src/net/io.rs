@@ -60,7 +60,7 @@ where
     }
 
     /// A handle on the runtime the socket is registered on.
-    #[cfg(feature = "tcp")]
+    #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
     pub(crate) fn runtime(&self) -> Runtime<M> {
         self.registration.runtime()
     }
@@ -130,8 +130,9 @@ where
 ///
 /// Those platforms have no `MSG_NOSIGNAL` for a write to ask for that with, so the socket sees to
 /// it itself, through its `SO_NOSIGPIPE` option. std and socket2 set the option on the sockets
-/// they make, but a socket handed to a `from_std` may come from elsewhere.
-#[cfg(feature = "tcp")]
+/// they make, but std's `pair` sets it on neither socket, and a socket handed to a `from_std` may
+/// come from elsewhere.
+#[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
 pub(crate) fn set_nosigpipe<S>(socket: &S) -> io::Result<()>
 where
     S: AsSource,

@@ -1,7 +1,8 @@
 //! Async sockets on a [`Runtime`].
 //!
 //! Each family of socket is behind a cargo feature of its own, none of them on by default: `tcp`
-//! brings `TcpListener` and `TcpStream`, and `udp` brings `UdpSocket`.
+//! brings `TcpListener` and `TcpStream`, `udp` brings `UdpSocket`, and `unix` brings the `unix`
+//! module, with `UnixListener`, `UnixStream` and `UnixDatagram`, on unix platforms only.
 //!
 //! # The runtime
 //!
@@ -26,10 +27,10 @@
 //! to connect to looks it up on a thread of its own (`unblock`, with the `unblock` feature, runs
 //! such work), and tries the addresses it finds in turn.
 //!
-//! A stream, `TcpStream`, implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`],
-//! so the extension traits of [`futures-lite`] or [`futures-util`] read from and write to it. So
-//! does a shared reference to one, which lets a reader and a writer share a stream. Closing a
-//! stream shuts its write half down, and the peer reads the end of the stream.
+//! The streams, `TcpStream` and `UnixStream`, implement the `AsyncRead` and `AsyncWrite` traits
+//! of [`futures-io`], so the extension traits of [`futures-lite`] or [`futures-util`] read from
+//! and write to them. So does a shared reference to one, which lets a reader and a writer share a
+//! stream. Closing a stream shuts its write half down, and the peer reads the end of the stream.
 //!
 //! A socket wakes one task per direction: one waiting to read and one waiting to write. Two tasks
 //! waiting in the same direction on one socket at once — to read, peek, accept or receive through
@@ -48,13 +49,15 @@
 //! [`Runtime::block_on`]: crate::Runtime::block_on
 //! [`SharedRuntime`]: crate::SharedRuntime
 
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
 mod connect;
 mod io;
 #[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(feature = "udp")]
 mod udp;
+#[cfg(all(feature = "unix", unix))]
+pub mod unix;
 
 #[cfg(feature = "tcp")]
 pub use tcp::{Incoming, TcpListener, TcpStream};

@@ -5,11 +5,46 @@ use std::io;
 use std::os::fd::{AsFd as AsSource, OwnedFd as Owned};
 #[cfg(windows)]
 use std::os::windows::io::{AsSocket as AsSource, OwnedSocket as Owned};
+#[cfg(all(feature = "unix", unix))]
+use std::time::Duration;
 
 use socket2::{Domain, SockAddr, SockRef, Socket, Type};
 
 use super::io::Io;
 use crate::{Mode, Runtime};
+
+/// [`connect`] for a unix socket, tried again for as long as a full listen backlog turns it away.
+///
+/// On Linux and Android, a blocking `connect(2)` on a unix socket waits in the kernel for room to
+/// open up in the listener's backlog; a non-blocking one is turned away at once with `EAGAIN`
+/// instead, and trying again needs a socket of its own. So there this loop is that same wait, done
+/// on the runtime's timer rather than in the kernel: it keeps trying for as long as the backlog
+/// stays full, and only whoever is awaiting this call bounds how long that is, through their own
+/// timeout or by dropping the future. FreeBSD and macOS refuse a connection to a full listener with
+/// `ECONNREFUSED` at once, blocking or not, so there is nothing to wait for, and the first
+/// attempt's error is the result.
+#[cfg(all(feature = "unix", unix))]
+pub(super) async fn connect_unix<S, M>(
+    runtime: &Runtime<M>,
+    address: &SockAddr,
+) -> io::Result<Io<S, M>>
+where
+    S: From<Owned> + AsSource + Send + Sync + 'static,
+    M: Mode,
+{
+    loop {
+        match connect(runtime, Domain::UNIX, address).await {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                runtime.sleep(BACKLOG_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// How long a connection a full listen backlog turned away waits before it is tried again.
+#[cfg(all(feature = "unix", unix))]
+const BACKLOG_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A stream socket of `domain`, connected to `address` and registered on `runtime`, as the std
 /// type `S`.
@@ -23,6 +58,11 @@ use crate::{Mode, Runtime};
 /// thread: the wait is for writable readiness, which the kernel reports once it is done with the
 /// connection either way, and [`outcome`] then says which way it went. The socket is registered
 /// before that wait and stays registered for the traffic that follows.
+///
+/// On Linux and Android, a unix socket whose listener's backlog is full is turned away at once
+/// rather than taken over, which fails with [`io::ErrorKind::WouldBlock`]: `connect_unix` waits
+/// that out. FreeBSD and macOS refuse such a connection with `ECONNREFUSED` at once instead,
+/// which fails the connect as it is.
 pub(super) async fn connect<S, M>(
     runtime: &Runtime<M>,
     domain: Domain,

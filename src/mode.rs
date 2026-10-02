@@ -124,7 +124,7 @@ pub(crate) mod sealed {
         /// What a socket of the `net` module hands its runtime to watch: the socket itself, which
         /// that module goes on doing its I/O through. The bound is `Send + Sync` in either
         /// flavour, which every socket it builds on is, so that one function serves both.
-        #[cfg(any(feature = "tcp", feature = "udp"))]
+        #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
         fn source_ptr<T>(ptr: Self::Ptr<T>) -> Self::SourcePtr
         where
             T: AsSource + Send + Sync + 'static;
@@ -195,7 +195,7 @@ pub(crate) mod sealed {
             borrow_source(&**source)
         }
 
-        #[cfg(any(feature = "tcp", feature = "udp"))]
+        #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
         fn source_ptr<T>(ptr: Rc<T>) -> Rc<dyn AsSource>
         where
             T: AsSource + Send + Sync + 'static,
@@ -242,7 +242,7 @@ pub(crate) mod sealed {
             borrow_source(&**source)
         }
 
-        #[cfg(any(feature = "tcp", feature = "udp"))]
+        #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
         fn source_ptr<T>(ptr: Arc<T>) -> Arc<dyn AsSource + Send + Sync>
         where
             T: AsSource + Send + Sync + 'static,

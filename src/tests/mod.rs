@@ -29,7 +29,10 @@ mod event;
 mod helper;
 #[cfg(all(test, feature = "lock"))]
 mod lock;
-#[cfg(all(test, any(feature = "tcp", feature = "udp")))]
+#[cfg(all(
+    test,
+    any(feature = "tcp", feature = "udp", all(feature = "unix", unix))
+))]
 mod net;
 #[cfg(all(test, feature = "unblock"))]
 mod unblock;
@@ -512,3 +515,104 @@ struct LocalSocketsStayOnTheirThread;
 /// ```
 #[cfg(all(doctest, feature = "udp"))]
 struct LocalUdpSocketsStayOnTheirThread;
+
+/// The unix-domain sockets built on a local runtime stay on its thread as well: a stream is
+/// neither `Send`...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::unix::UnixStream<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::net::unix::UnixStream<zruntime::Local>>();
+/// ```
+///
+/// ...and neither a listener nor a datagram socket is `Send` either...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::unix::UnixListener<zruntime::Local>>();
+/// ```
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::unix::UnixDatagram<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::net::unix::UnixListener<zruntime::Local>>();
+/// ```
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::net::unix::UnixDatagram<zruntime::Local>>();
+/// ```
+///
+/// ...and the stream of the connections a listener accepts borrows the listener, and a reference
+/// is `Send` only where what it refers to is `Sync`, so that stream is not `Send` either...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::unix::Incoming<'static, zruntime::Local>>();
+/// ```
+///
+/// ...while the same sockets built on a shared runtime may go anywhere, and so may the stream of
+/// the connections a listener accepts: which says the checks above fail for the reason they were
+/// written for and no other.
+///
+/// ```
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// sent_and_shared::<zruntime::net::unix::UnixStream<zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::unix::UnixListener<zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::unix::UnixDatagram<zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::unix::Incoming<'static, zruntime::Shared>>();
+/// ```
+#[cfg(all(doctest, feature = "unix", unix))]
+struct LocalUnixSocketsStayOnTheirThread;

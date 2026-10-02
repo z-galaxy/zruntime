@@ -11,9 +11,11 @@
 
 #[cfg(any(feature = "tcp", feature = "udp"))]
 use std::net::{Ipv4Addr, SocketAddr};
-#[cfg(any(feature = "tcp", feature = "udp"))]
-use std::{cell::Cell, future::poll_fn};
-use std::{future::Future, time::Duration};
+use std::{
+    cell::Cell,
+    future::{Future, poll_fn},
+    time::Duration,
+};
 
 #[cfg(feature = "tcp")]
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -24,6 +26,8 @@ use crate::{Mode, Runtime};
 mod tcp;
 #[cfg(feature = "udp")]
 mod udp;
+#[cfg(all(feature = "unix", unix))]
+mod unix;
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local` and
 /// a `shared` test that run its body with the mode parameter set to [`Local`](crate::Local) and to
@@ -77,7 +81,6 @@ where
 /// A call that waits for the right readiness is polled when it begins to wait and once for each
 /// wake after that; one that waits for the wrong readiness is woken at once, over and over, for as
 /// long as the other is not ready, which only a count of its polls tells from one that waits.
-#[cfg(any(feature = "tcp", feature = "udp"))]
 fn counting_polls<'a, F>(polls: &'a Cell<usize>, future: F) -> impl Future<Output = F::Output> + 'a
 where
     F: Future + 'a,
@@ -102,7 +105,7 @@ const DELAY: Duration = Duration::from_millis(50);
 ///
 /// They cycle through a prime number of values, so that the pattern does not line up with the size
 /// of any buffer on the way.
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }

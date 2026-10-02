@@ -92,12 +92,12 @@ thread of the runtime's own.
 
 ## Sockets
 
-The non-default `tcp` and `udp` features add ready-made async sockets, as smol has in
-`smol::net`: the [`net`] module's `TcpListener`, `TcpStream` and `UdpSocket`, which run on a
-runtime of either flavour. A stream implements the `AsyncRead` and `AsyncWrite` traits of
-`futures-io`, and connecting it never blocks the thread. The sockets take socket addresses rather
-than host names: a name is the caller's to look up, which the `unblock` feature can do off the
-thread.
+The non-default `tcp`, `udp` and `unix` features add ready-made async sockets, as smol has in
+`smol::net`: the [`net`] module's `TcpListener`, `TcpStream` and `UdpSocket`, and on unix its
+`unix` module's `UnixListener`, `UnixStream` and `UnixDatagram`, all of which run on a runtime of
+either flavour. A stream implements the `AsyncRead` and `AsyncWrite` traits of `futures-io`, and
+connecting it never blocks the thread. The TCP and UDP sockets take socket addresses rather than
+host names: a name is the caller's to look up, which the `unblock` feature can do off the thread.
 
 ## Events
 
@@ -128,6 +128,9 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 * `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
   and brings the `socket2`, `futures-io` and `futures-core` crates.
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
+* `unix`: the [`net`] module's `unix` module, with unix-domain sockets, on unix only; it implies
+  `runtime`, and brings the `socket2`, `futures-io` and `futures-core` crates and `rustix`'s
+  `net` feature.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
