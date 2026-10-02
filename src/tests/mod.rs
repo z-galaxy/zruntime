@@ -29,7 +29,7 @@ mod event;
 mod helper;
 #[cfg(all(test, feature = "lock"))]
 mod lock;
-#[cfg(all(test, feature = "tcp"))]
+#[cfg(all(test, any(feature = "tcp", feature = "udp")))]
 mod net;
 #[cfg(all(test, feature = "unblock"))]
 mod unblock;
@@ -473,3 +473,42 @@ struct UnblockIsSendAndSyncWhereItsOutcomeIsSend;
 /// ```
 #[cfg(all(doctest, feature = "tcp"))]
 struct LocalSocketsStayOnTheirThread;
+
+/// A UDP socket built on a local runtime stays on its thread as well: it is neither `Send`...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::UdpSocket<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::net::UdpSocket<zruntime::Local>>();
+/// ```
+///
+/// ...while one built on a shared runtime is both, which says the checks above fail for the reason
+/// they were written for and no other.
+///
+/// ```
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// sent_and_shared::<zruntime::net::UdpSocket<zruntime::Shared>>();
+/// ```
+#[cfg(all(doctest, feature = "udp"))]
+struct LocalUdpSocketsStayOnTheirThread;

@@ -39,6 +39,8 @@ lock = ["event"]
 unblock = []
 # The `net` module's TCP sockets: `TcpListener` and `TcpStream`.
 tcp = ["runtime", "dep:socket2", "dep:futures-io", "dep:futures-core", "rustix?/net"]
+# The `net` module's UDP socket: `UdpSocket`.
+udp = ["runtime"]
 
 [dependencies]
 futures-core = { version = "0.3.34", default-features = false, optional = true }

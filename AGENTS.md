@@ -47,7 +47,8 @@ A non-default `tcp` feature, which implies `runtime` and adds `socket2`, `future
 without blocking the thread, take socket addresses rather than host names, and implement
 `futures-io`'s `AsyncRead` and `AsyncWrite`. Their non-blocking connect is carried over from zbus,
 whose own socket layer stays there: it drives its sockets through whichever runtime a connection
-runs on.
+runs on. A non-default `udp` feature, which implies `runtime` and adds no dependency, gives the
+module's `UdpSocket`, likewise.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -70,7 +71,7 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime, Event, broadcast, the locks, unblock and the TCP sockets each built alone:
+# Check the runtime, Event, broadcast, the locks, unblock and each family of socket built alone:
 # `--all-features` cannot show that each builds without the others, and leaves out the no-op
 # `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
@@ -79,6 +80,7 @@ cargo check --no-default-features --features broadcast
 cargo check --no-default-features --features lock
 cargo check --no-default-features --features unblock
 cargo check --no-default-features --features tcp
+cargo check --no-default-features --features udp
 
 # Run what needs no runtime (Event, the locks, the broadcast channel, unblock) under Miri, as CI
 # does; the runtime polls with `ppoll`, which Miri cannot run
@@ -129,8 +131,9 @@ src/
 ├── lock/         # [lock feature] Mutex and RwLock, built on Event, with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
-├── net/          # [tcp feature] Async sockets: io.rs, `Io<T, M>`, a socket and its registration,
-│                 # which every socket is built on; connect.rs, the non-blocking connect; tcp.rs
+├── net/          # [tcp, udp features] Async sockets: io.rs, `Io<T, M>`, a socket and its
+│                 # registration, which every socket is built on; connect.rs, the non-blocking
+│                 # connect; tcp.rs; udp.rs
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
@@ -196,9 +199,9 @@ it. No socket is `Clone`.
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast` and `lock` imply `event` and, like it, must not reach into the
-  runtime; nor may `unblock`, which needs neither. `tcp` implies `runtime`. CI builds and tests
-  everything with every feature on, and checks `runtime`, `event`, `broadcast`, `lock`, `unblock`
-  and `tcp` each alone.
+  runtime; nor may `unblock`, which needs neither. `tcp` and `udp` imply `runtime`. CI builds and
+  tests everything with every feature on, and checks `runtime`, `event`, `broadcast`, `lock`,
+  `unblock`, `tcp` and `udp` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
@@ -219,5 +222,6 @@ it. No socket is `Clone`.
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
 - `src/unblock.rs`: [unblock feature] `unblock`, blocking work on a thread of its own
-- `src/net/io.rs`: [tcp feature] `Io<T, M>`, the socket and registration every socket is built on
+- `src/net/io.rs`: [tcp, udp features] `Io<T, M>`, the socket and registration every socket is
+  built on
 - `src/net/connect.rs`: [tcp feature] The non-blocking connect, and Winsock's check of one

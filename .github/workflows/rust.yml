@@ -30,9 +30,9 @@ jobs:
           cargo --locked check --all-features --target aarch64-linux-android
       # The features only add code, so the jobs build with all of them. That covers all of it but
       # the no-op `error!` that `log.rs` builds in place of `tracing`'s where that feature is off,
-      # and cannot show that `runtime`, `event`, `broadcast`, `lock`, `unblock` and `tcp` each
-      # build without the others: checking each alone covers them.
-      - name: Check build with runtime, event, broadcast, lock, unblock or tcp alone
+      # and cannot show that `runtime`, `event`, `broadcast`, `lock`, `unblock`, `tcp` and `udp`
+      # each build without the others: checking each alone covers them.
+      - name: Check build with runtime, event, broadcast, lock, unblock, tcp or udp alone
         run: |
           cargo --locked check --no-default-features --features runtime
           cargo --locked check --no-default-features --features event
@@ -40,6 +40,7 @@ jobs:
           cargo --locked check --no-default-features --features lock
           cargo --locked check --no-default-features --features unblock
           cargo --locked check --no-default-features --features tcp
+          cargo --locked check --no-default-features --features udp
 
   fmt:
     runs-on: ubuntu-latest

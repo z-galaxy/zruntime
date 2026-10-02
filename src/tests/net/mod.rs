@@ -9,19 +9,21 @@
 //! waits, a loopback address to bind to, a port that refuses connections, and a listener that has
 //! room for one connection only.
 
-use std::{
-    cell::Cell,
-    future::{Future, poll_fn},
-    net::{Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+#[cfg(any(feature = "tcp", feature = "udp"))]
+use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(any(feature = "tcp", feature = "udp"))]
+use std::{cell::Cell, future::poll_fn};
+use std::{future::Future, time::Duration};
 
+#[cfg(feature = "tcp")]
 use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::{Mode, Runtime};
 
 #[cfg(feature = "tcp")]
 mod tcp;
+#[cfg(feature = "udp")]
+mod udp;
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local` and
 /// a `shared` test that run its body with the mode parameter set to [`Local`](crate::Local) and to
@@ -75,6 +77,7 @@ where
 /// A call that waits for the right readiness is polled when it begins to wait and once for each
 /// wake after that; one that waits for the wrong readiness is woken at once, over and over, for as
 /// long as the other is not ready, which only a count of its polls tells from one that waits.
+#[cfg(any(feature = "tcp", feature = "udp"))]
 fn counting_polls<'a, F>(polls: &'a Cell<usize>, future: F) -> impl Future<Output = F::Output> + 'a
 where
     F: Future + 'a,
@@ -99,6 +102,7 @@ const DELAY: Duration = Duration::from_millis(50);
 ///
 /// They cycle through a prime number of values, so that the pattern does not line up with the size
 /// of any buffer on the way.
+#[cfg(feature = "tcp")]
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
@@ -111,6 +115,7 @@ fn pattern(len: usize) -> Vec<u8> {
 /// socket, which the kernel answers with a reset. A socket that is only bound would hold the port
 /// as well, but Apple's kernel drops an attempt at a socket that is bound and neither listens nor
 /// connects without an answer, so a connect there times out instead of being refused.
+#[cfg(feature = "tcp")]
 struct RefusedPort {
     socket: Socket,
     // What `socket` is connected to, kept open for as long as `socket` is: closing a listener
@@ -118,6 +123,7 @@ struct RefusedPort {
     _listener: Socket,
 }
 
+#[cfg(feature = "tcp")]
 impl RefusedPort {
     fn new() -> Self {
         let listener = bound(loopback());
@@ -155,7 +161,7 @@ impl RefusedPort {
 /// a backlog of zero is a queue of one. Other platforms' queues hold more than they are asked to,
 /// so a connection there would not be left pending, and the tests that need it are written for
 /// these two alone.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "tcp", any(target_os = "linux", target_os = "android")))]
 fn listener_with_room_for_one() -> (Socket, SocketAddr) {
     let socket = bound(loopback());
     socket.listen(0).expect("a bound socket can listen");
@@ -169,11 +175,13 @@ fn listener_with_room_for_one() -> (Socket, SocketAddr) {
 }
 
 /// The loopback address a socket binds to, with port `0` for the system to pick a free port.
+#[cfg(any(feature = "tcp", feature = "udp"))]
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
 
 /// A TCP socket bound to `address`, and not yet listening.
+#[cfg(feature = "tcp")]
 fn bound(address: SocketAddr) -> Socket {
     let socket = Socket::new(Domain::for_address(address), Type::STREAM, None)
         .expect("a TCP socket can be made");

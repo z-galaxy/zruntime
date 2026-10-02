@@ -60,6 +60,7 @@ where
     }
 
     /// A handle on the runtime the socket is registered on.
+    #[cfg(feature = "tcp")]
     pub(crate) fn runtime(&self) -> Runtime<M> {
         self.registration.runtime()
     }
