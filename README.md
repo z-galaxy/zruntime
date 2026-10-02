@@ -121,6 +121,9 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 * `helper`: the layer [described above](#the-helper-feature); it implies `runtime`.
 * `broadcast`: the [`broadcast`] module, an async multi-producer multi-consumer broadcast channel
   built on [`Event`]; it implies `event`, and needs no runtime either.
+* `mpmc`: the [`mpmc`] module, an async multi-producer multi-consumer channel, each of whose
+  messages one receiver gets, built on [`Event`]; it implies `event`, and needs no runtime
+  either.
 * `lock`: the [`lock`] module, an async `Mutex` and `RwLock`, whose guards a task may hold across
   an await, built on [`Event`]; it implies `event`, and needs no runtime either.
 * `unblock`: [`unblock`], which runs a piece of blocking work on a thread of its own and hands
@@ -156,6 +159,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Event`]: https://docs.rs/zruntime/latest/zruntime/struct.Event.html
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html
+[`mpmc`]: https://docs.rs/zruntime/latest/zruntime/mpmc/index.html
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
 [`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html

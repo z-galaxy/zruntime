@@ -1,23 +1,24 @@
-//! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast channel and
-//! the locks built on that event, of blocking work run on a thread of its own, and of the sockets
-//! a runtime watches.
+//! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast and MPMC
+//! channels and the locks built on that event, of blocking work run on a thread of its own, and of
+//! the sockets a runtime watches.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
 //! the `core` module, in both flavours wherever the test means the same in each. An event and its
 //! listeners, which need no runtime, are tested in the `event` module. What the type system is to
 //! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future
-//! that could not follow it to another, a lock handing its value to a thread that could not own
-//! it, the future of blocking work doing the same with the value it resolves to — can only be
-//! shown by code that does not compile, so it is shown here, by the doc tests of the items below.
-//! The broadcast channel and the locks, built on the event, are tested in the `broadcast` and
-//! `lock` modules. Blocking work, which needs neither the runtime nor the event, is tested in the
-//! `unblock` module. The sockets of the `net` module are tested in the `net` module, one family of
-//! them to a module there, in both flavours wherever the test means the same in each.
+//! that could not follow it to another, a lock or a channel handing its value or its messages to a
+//! thread that could not own them, the future of blocking work doing the same with the value it
+//! resolves to — can only be shown by code that does not compile, so it is shown here, by the doc
+//! tests of the items below. The broadcast channel, the MPMC channel and the locks, built on the
+//! event, are tested in the `broadcast`, `mpmc` and `lock` modules. Blocking work, which needs
+//! neither the runtime nor the event, is tested in the `unblock` module. The sockets of the `net`
+//! module are tested in the `net` module, one family of them to a module there, in both flavours
+//! wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
-//! where both are. The broadcast channel and the locks are features of their own as well, each
-//! built on the event and with no use of the runtime.
+//! where both are. The broadcast channel, the MPMC channel and the locks are features of their own
+//! as well, each built on the event and with no use of the runtime.
 
 #[cfg(all(test, feature = "broadcast"))]
 mod broadcast;
@@ -29,6 +30,8 @@ mod event;
 mod helper;
 #[cfg(all(test, feature = "lock"))]
 mod lock;
+#[cfg(all(test, feature = "mpmc"))]
+mod mpmc;
 #[cfg(all(
     test,
     any(feature = "tcp", feature = "udp", all(feature = "unix", unix))
@@ -361,6 +364,98 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// ```
 #[cfg(all(doctest, feature = "lock"))]
 struct LocksAreAsSendAndSyncAsTheirValues;
+
+/// A channel moves its messages from the threads that send them to the threads that receive them,
+/// so an end of it may go to another thread, or be shared with one, only where its messages may be
+/// sent: a sender of an `Rc`, which cannot be sent, is not `Send`...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::mpmc::Sender<Rc<()>>>();
+/// ```
+///
+/// ...nor `Sync`, since sharing it lets one thread after another send an `Rc`...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::mpmc::Sender<Rc<()>>>();
+/// ```
+///
+/// ...and a receiver of an `Rc` is not `Send` either, for it would hand the `Rc`s it receives to
+/// the thread it goes to...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::mpmc::Receiver<Rc<()>>>();
+/// ```
+///
+/// ...nor `Sync`, since sharing it lets one thread after another receive one.
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::mpmc::Receiver<Rc<()>>>();
+/// ```
+///
+/// Where the messages may be sent, both ends are `Send` and `Sync`, even where the messages are not
+/// `Sync` themselves, as a `Cell` is not: the channel moves a message and never shows one by
+/// reference, so it asks no more of it. The futures that send and receive are `Send` there too, as
+/// a task that waits on a channel needs them to be. Which says the checks above fail for the reason
+/// they were written for and no other.
+///
+/// ```
+/// use std::{cell::Cell, num::NonZeroUsize};
+///
+/// use zruntime::mpmc::{Receiver, Sender, bounded};
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// fn sent_future<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent_and_shared::<Sender<Cell<u8>>>();
+/// sent_and_shared::<Receiver<Cell<u8>>>();
+///
+/// let (sender, receiver) = bounded(NonZeroUsize::MIN);
+/// sent_future(sender.send(Cell::new(0u8)));
+/// sent_future(receiver.recv());
+/// ```
+#[cfg(all(doctest, feature = "mpmc"))]
+struct ChannelEndsAreSendAndSyncWhereTheirMessagesAreSend;
 
 /// The future of blocking work hands the value the work returned from the thread it ran on to
 /// whichever thread polls it, so it may be sent to another thread only where that value may be: a

@@ -67,19 +67,20 @@
 //! lock, it finds the list no earlier than as the word was written of, with the listener in it or
 //! notified since.
 //!
-//! The fences are for callers the event knows nothing of. The locks and the broadcast channel of
-//! this crate order what they check and change against the word without them, through
-//! `listen_unfenced`, which writes the word with `SeqCst` and makes no fence, and
-//! `notify_unfenced`, which looks at it with `SeqCst` and makes none. These run on every release of
-//! a lock and every send and receive of the channel, and a fence costs more than a `SeqCst` access
-//! on some targets: on aarch64, a fence is a `dmb ish`, which waits for every memory access before
-//! it to be done, where a `SeqCst` write and look are a plain `stlr` and `ldar`.
+//! The fences are for callers the event knows nothing of. The locks and the channels of this crate
+//! order what they check and change against the word without them, through `listen_unfenced`,
+//! which writes the word with `SeqCst` and makes no fence, and `notify_unfenced` and
+//! `notify_additional_unfenced`, which look at it with `SeqCst` and make none. These run on every
+//! release of a lock and every send and receive of a channel, and a fence costs more than a
+//! `SeqCst` access on some targets: on aarch64, a fence is a `dmb ish`, which waits for every
+//! memory access before it to be done, where a `SeqCst` write and look are a plain `stlr` and
+//! `ldar`.
 //!
-//! * The broadcast channel and the readers-writer lock check and change what their waiters wait for
-//!   under a lock of their own, which orders the two by itself. If the notifier's turn with that
-//!   lock comes first, the check sees the change. If the waiter's turn does, its `listen` came
-//!   before that turn, which came before the notifier's, which came before the look, so the look
-//!   finds the word `listen` wrote or a later one.
+//! * The broadcast channel, the MPMC channel and the readers-writer lock check and change what
+//!   their waiters wait for under a lock of their own, which orders the two by itself. If the
+//!   notifier's turn with that lock comes first, the check sees the change. If the waiter's turn
+//!   does, its `listen` came before that turn, which came before the notifier's, which came before
+//!   the look, so the look finds the word `listen` wrote or a later one.
 //! * `lock::Mutex` checks and changes its flag with `SeqCst` operations: a compare-exchange whose
 //!   failure is `SeqCst`, or a `SeqCst` `fetch_or`, to take it, and a `SeqCst` `fetch_sub` to
 //!   release it, or to stop counting a waiter that held newcomers back from it. All `SeqCst`
@@ -317,7 +318,7 @@ impl Event {
     ///
     /// For a caller in this crate that checks the condition with a `SeqCst` operation, or under a
     /// lock that whoever changes the condition takes too, as the module documentation says.
-    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
     pub(crate) fn listen_unfenced(&self) -> EventListener {
         self.add_listener(Order::SeqCst)
     }
@@ -327,9 +328,19 @@ impl Event {
     ///
     /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
     /// lock that whoever checks the condition takes too, as the module documentation says.
-    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
     pub(crate) fn notify_unfenced(&self, n: usize) -> usize {
         self.send(n, Notification::Counting, Order::SeqCst)
+    }
+
+    /// Notifies as [`Event::notify_additional`] does, but ordered against its caller's change to
+    /// the condition by a `SeqCst` look at the word instead of a fence.
+    ///
+    /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
+    /// lock that whoever checks the condition takes too, as the module documentation says.
+    #[cfg(feature = "mpmc")]
+    pub(crate) fn notify_additional_unfenced(&self, n: usize) -> usize {
+        self.send(n, Notification::Additional, Order::SeqCst)
     }
 
     /// What this event and its listeners share, brought into being here where nothing has yet.
@@ -647,10 +658,11 @@ enum Order {
     /// By a `SeqCst` fence, whatever orderings the caller checks or changes the condition with:
     /// what [`Event::listen`], [`Event::notify`] and [`Event::notify_additional`] do.
     Fence,
-    /// By a `SeqCst` write or look at the word: what `Event::listen_unfenced` and
-    /// `Event::notify_unfenced` do, for a caller in this crate that checks and changes the
-    /// condition with `SeqCst` operations, or under a lock of its own.
-    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    /// By a `SeqCst` write or look at the word: what `Event::listen_unfenced`,
+    /// `Event::notify_unfenced` and `Event::notify_additional_unfenced` do, for a caller in this
+    /// crate that checks and changes the condition with `SeqCst` operations, or under a lock of its
+    /// own.
+    #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
     SeqCst,
 }
 
@@ -659,7 +671,7 @@ impl Order {
     fn write(self) -> Ordering {
         match self {
             Order::Fence => Ordering::Release,
-            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
             Order::SeqCst => Ordering::SeqCst,
         }
     }
@@ -668,7 +680,7 @@ impl Order {
     fn look(self) -> Ordering {
         match self {
             Order::Fence => Ordering::Acquire,
-            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
             Order::SeqCst => Ordering::SeqCst,
         }
     }
@@ -681,7 +693,7 @@ impl Order {
 
                 true
             }
-            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
             Order::SeqCst => false,
         }
     }

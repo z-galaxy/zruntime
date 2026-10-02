@@ -60,6 +60,9 @@
 //! of the receivers, while this channel delivers each message to every receiver (in other words,
 //! it broadcasts) by cloning it for each receiver.
 //!
+//! A channel of that kind, built on [`Event`] like this one, is this crate's `mpmc` module,
+//! behind the `mpmc` feature.
+//!
 //! # Difference with other broadcast channels
 //!
 //! * [`broadcaster`]: It has no sender and receiver split: both sides use clones of the same
