@@ -60,7 +60,10 @@ futures-util = { version = "0.3.34", default-features = false, features = ["allo
 ntest = "0.9.5"
 socket2 = { version = "0.6.5", features = ["all"] }
 
+# A single codegen unit, so that how the compiler splits a crate into units, and so what it
+# inlines, cannot shift the numbers when unrelated code changes.
 [profile.bench]
+codegen-units = 1
 debug = true
 strip = "none"
 
