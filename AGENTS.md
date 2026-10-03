@@ -192,7 +192,7 @@ it. No socket is `Clone`.
 
 ## Development Guidelines
 
-- **MSRV**: 1.87.0
+- **MSRV**: 1.88.0
 - **Commit style**: Emoji prefix only, no package prefix — this is a single crate (e.g.,
   "🐛 Fix timer rounding").
 - **Changelog**: `CHANGELOG.md` is managed by [release-plz] — do **not** hand-edit it. Write a
