@@ -1,5 +1,5 @@
 //! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast and MPMC
-//! channels and the locks built on that event, of blocking work run on a thread of its own, and of
+//! channels and the locks built on that event, of blocking work run on a pool of threads, and of
 //! the sockets a runtime watches.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in

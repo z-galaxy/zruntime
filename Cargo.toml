@@ -37,7 +37,7 @@ broadcast = ["event", "dep:futures-core"]
 mpmc = ["event", "dep:futures-core"]
 # The `lock` module: an async mutex and readers-writer lock, which need no runtime.
 lock = ["event"]
-# `unblock`: blocking work run on a thread of its own, out of the way of the async tasks; needs no
+# `unblock`: blocking work run on a pool of threads, out of the way of the async tasks; needs no
 # runtime.
 unblock = []
 # The `net` module's TCP sockets: `TcpListener` and `TcpStream`.

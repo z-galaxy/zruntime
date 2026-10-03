@@ -126,8 +126,8 @@ is behind the `event` feature, which builds without the runtime: see [Features](
   either.
 * `lock`: the [`lock`] module, an async `Mutex` and `RwLock`, whose guards a task may hold across
   an await, built on [`Event`]; it implies `event`, and needs no runtime either.
-* `unblock`: [`unblock`], which runs a piece of blocking work on a thread of its own and hands
-  back a future of its outcome; it needs no runtime either.
+* `unblock`: [`unblock`], which runs a piece of blocking work on a pool of threads kept for it
+  and hands back a future of its outcome; it needs no runtime either.
 * `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
   and brings the `socket2`, `futures-io` and `futures-core` crates.
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
