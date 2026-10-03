@@ -1,8 +1,10 @@
-//! Blocking work run on a pool of threads, out of the way of the async tasks.
+//! Blocking work run on a pool of threads, out of the way of the async tasks, and [`Unblock`], an
+//! adapter that runs each operation on a blocking I/O handle as such work.
 //!
 //! The work needs no runtime: [`unblock()`] hands back a plain future, which works under any
-//! executor.
+//! executor, and so does the adapter.
 
+mod io;
 pub(crate) mod pool;
 
 use std::{
@@ -18,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+pub use io::Unblock;
 use pool::Pool;
 
 /// Runs `work` on a thread of a pool kept for blocking work, and hands back a future of what it

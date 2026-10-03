@@ -42,9 +42,13 @@ A non-default `lock` feature, which implies `event` and adds no dependency, give
 an async `Mutex` and `RwLock` whose guards may be held across an await, moved here from zbus. They
 are built on `Event`, need no runtime and work under any executor.
 
-A non-default `unblock` feature, which adds no dependency, gives `zruntime::unblock`: a piece of
-blocking work run on a pool of threads kept for it, out of the way of the async tasks, and a future
-of its outcome, moved here from zbus. It needs no runtime and works under any executor.
+A non-default `unblock` feature, which adds `futures-io` and `futures-core` dependencies, gives
+`zruntime::unblock`: a piece of blocking work run on a pool of threads kept for it, out of the way
+of the async tasks, and a future of its outcome, moved here from zbus. It also gives
+`zruntime::Unblock`, as smol has `smol::Unblock`: an adapter that gives a blocking I/O handle (a
+file, the standard input, an iterator) `futures-io`'s `AsyncRead`, `AsyncWrite` and `AsyncSeek`
+and `futures-core`'s `Stream` by running each operation on it as such work. Both need no runtime
+and work under any executor.
 
 A non-default `tcp` feature, which implies `runtime` and adds `socket2`, `futures-io` and
 `futures-core` dependencies, gives the `zruntime::net` module's TCP sockets, `TcpListener` and
@@ -157,13 +161,13 @@ src/
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
-├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), with no use of
-│                 # the runtime
+├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
+│                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
                   # broadcast.rs: the broadcast channel, broadcast feature; mpmc.rs: the MPMC
                   # channel, mpmc feature; lock.rs: the locks, lock feature; helper.rs: helper
-                  # feature; unblock/: unblock and its pool, unblock feature; net/: the sockets,
-                  # each family under its own feature
+                  # feature; unblock/: unblock, its pool and Unblock, unblock feature; net/: the
+                  # sockets, each family under its own feature
 ```
 
 ### Key Design Patterns
@@ -241,7 +245,8 @@ it. No socket is `Clone`.
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
-- `src/unblock/`: [unblock feature] `unblock`, blocking work on a pool of threads (`pool.rs`)
+- `src/unblock/`: [unblock feature] `unblock`, blocking work on a pool of threads (`pool.rs`), and
+  `Unblock`, the async adapter of a blocking I/O handle built on it (`io.rs`)
 - `src/net/io.rs`: [tcp, udp, unix features] `Io<T, M>`, the socket and registration every
   socket is built on
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one

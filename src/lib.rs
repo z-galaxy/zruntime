@@ -68,7 +68,7 @@ use runtime::Core;
 #[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
 #[cfg(feature = "unblock")]
-pub use unblock::{BlockingWork, unblock};
+pub use unblock::{BlockingWork, Unblock, unblock};
 
 /// Runs `future` to completion on the calling thread, running that thread's runtime alongside it.
 ///

@@ -8,12 +8,12 @@
 //! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future
 //! that could not follow it to another, a lock or a channel handing its value or its messages to a
 //! thread that could not own them, the future of blocking work doing the same with the value it
-//! resolves to — can only be shown by code that does not compile, so it is shown here, by the doc
-//! tests of the items below. The broadcast channel, the MPMC channel and the locks, built on the
-//! event, are tested in the `broadcast`, `mpmc` and `lock` modules. Blocking work, which needs
-//! neither the runtime nor the event, is tested in the `unblock` module. The sockets of the `net`
-//! module are tested in the `net` module, one family of them to a module there, in both flavours
-//! wherever the test means the same in each.
+//! resolves to, and an adapter of a blocking handle with its handle — can only be shown by code
+//! that does not compile, so it is shown here, by the doc tests of the items below. The broadcast
+//! channel, the MPMC channel and the locks, built on the event, are tested in the `broadcast`,
+//! `mpmc` and `lock` modules. Blocking work, which needs neither the runtime nor the event, is
+//! tested in the `unblock` module. The sockets of the `net` module are tested in the `net` module,
+//! one family of them to a module there, in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -491,6 +491,77 @@ struct ChannelEndsAreSendAndSyncWhereTheirMessagesAreSend;
 /// ```
 #[cfg(all(doctest, feature = "unblock"))]
 struct BlockingWorkIsSendAndSyncWhereItsOutcomeIsSend;
+
+/// An adapter hands its handle to blocking work on another thread for each operation on it, so it
+/// may be sent to another thread only where the handle may be: an adapter of an `Rc`, which cannot
+/// be sent, is not `Send`...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Unblock<Rc<()>>>();
+/// ```
+///
+/// ...nor `Sync`, since sharing it would share the `Rc` with the threads of that work...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::Unblock<Rc<()>>>();
+/// ```
+///
+/// ...while one of a handle that may be sent is `Send` and `Sync` both, even where the handle is
+/// not `Sync` itself, as a boxed reader is not: nothing of the handle is reachable through a shared
+/// reference to the adapter. The futures of its methods are `Send` there as well, as a task that
+/// awaits one needs them to be, and the adapter is `Unpin` whatever the handle is. Which says the
+/// checks above fail for the reason they were written for and no other.
+///
+/// ```
+/// use std::{cell::Cell, io::Read, marker::PhantomPinned};
+///
+/// use zruntime::Unblock;
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// fn sent_future<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// fn unpinned<T>()
+/// where
+///     T: Unpin,
+/// {
+/// }
+///
+/// sent_and_shared::<Unblock<Box<dyn Read + Send>>>();
+/// sent_and_shared::<Unblock<Cell<u8>>>();
+/// unpinned::<Unblock<PhantomPinned>>();
+///
+/// let mut reader = Unblock::new(Cell::new(0u8));
+/// sent_future(reader.get_mut());
+/// sent_future(reader.with_mut(|cell| cell.get()));
+/// sent_future(reader.into_inner());
+/// ```
+#[cfg(all(doctest, feature = "unblock"))]
+struct UnblockIsSendAndSyncWhereItsHandleIsSend;
 
 /// A local runtime's sockets stay on its thread, as everything built on it does: a stream is not
 /// `Send`...
