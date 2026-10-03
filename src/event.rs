@@ -67,19 +67,20 @@
 //! lock, it finds the list no earlier than as the word was written of, with the listener in it or
 //! notified since.
 //!
-//! The fences are for callers the event knows nothing of. The locks and the broadcast channel of
-//! this crate order what they check and change against the word without them, through
-//! `listen_unfenced`, which writes the word with `SeqCst` and makes no fence, and
-//! `notify_unfenced`, which looks at it with `SeqCst` and makes none. These run on every release of
-//! a lock and every send and receive of the channel, and a fence costs more than a `SeqCst` access
-//! on some targets: on aarch64, a fence is a `dmb ish`, which waits for every memory access before
-//! it to be done, where a `SeqCst` write and look are a plain `stlr` and `ldar`.
+//! The fences are for callers the event knows nothing of. The locks and the channels of this crate
+//! order what they check and change against the word without them, through `listen_unfenced`,
+//! which writes the word with `SeqCst` and makes no fence, and `notify_unfenced` and
+//! `notify_additional_unfenced`, which look at it with `SeqCst` and make none. These run on every
+//! release of a lock and every send and receive of a channel, and a fence costs more than a
+//! `SeqCst` access on some targets: on aarch64, a fence is a `dmb ish`, which waits for every
+//! memory access before it to be done, where a `SeqCst` write and look are a plain `stlr` and
+//! `ldar`.
 //!
-//! * The broadcast channel and the readers-writer lock check and change what their waiters wait for
-//!   under a lock of their own, which orders the two by itself. If the notifier's turn with that
-//!   lock comes first, the check sees the change. If the waiter's turn does, its `listen` came
-//!   before that turn, which came before the notifier's, which came before the look, so the look
-//!   finds the word `listen` wrote or a later one.
+//! * The broadcast channel, the MPMC channel and the readers-writer lock check and change what
+//!   their waiters wait for under a lock of their own, which orders the two by itself. If the
+//!   notifier's turn with that lock comes first, the check sees the change. If the waiter's turn
+//!   does, its `listen` came before that turn, which came before the notifier's, which came before
+//!   the look, so the look finds the word `listen` wrote or a later one.
 //! * `lock::Mutex` checks and changes its flag with `SeqCst` operations: a compare-exchange whose
 //!   failure is `SeqCst`, or a `SeqCst` `fetch_or`, to take it, and a `SeqCst` `fetch_sub` to
 //!   release it, or to stop counting a waiter that held newcomers back from it. All `SeqCst`
@@ -98,10 +99,12 @@
 //! check after the change as above, through the fences, the `SeqCst` order, or the caller's lock.
 
 use std::{
+    any::Any,
     fmt,
     future::Future,
     mem,
     ops::{Deref, DerefMut},
+    panic::{self, AssertUnwindSafe},
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -151,7 +154,9 @@ use std::{
 /// is free to come back into the same event from its `wake`: to notify it, listen to it or drop
 /// one of its listeners. A listener polled on another thread in the meantime sees its
 /// notification and completes, so a task can be done with its listener while the thread that
-/// notified it still holds the waker it is waking.
+/// notified it still holds the waker it is waking. A waker that panics does not keep the others
+/// from being woken: every task a notification reached is woken, and the first panic reaches the
+/// caller once they all are.
 ///
 /// # Example
 ///
@@ -313,7 +318,7 @@ impl Event {
     ///
     /// For a caller in this crate that checks the condition with a `SeqCst` operation, or under a
     /// lock that whoever changes the condition takes too, as the module documentation says.
-    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
     pub(crate) fn listen_unfenced(&self) -> EventListener {
         self.add_listener(Order::SeqCst)
     }
@@ -323,9 +328,19 @@ impl Event {
     ///
     /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
     /// lock that whoever checks the condition takes too, as the module documentation says.
-    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
     pub(crate) fn notify_unfenced(&self, n: usize) -> usize {
         self.send(n, Notification::Counting, Order::SeqCst)
+    }
+
+    /// Notifies as [`Event::notify_additional`] does, but ordered against its caller's change to
+    /// the condition by a `SeqCst` look at the word instead of a fence.
+    ///
+    /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
+    /// lock that whoever checks the condition takes too, as the module documentation says.
+    #[cfg(feature = "mpmc")]
+    pub(crate) fn notify_additional_unfenced(&self, n: usize) -> usize {
+        self.send(n, Notification::Additional, Order::SeqCst)
     }
 
     /// What this event and its listeners share, brought into being here where nothing has yet.
@@ -643,10 +658,11 @@ enum Order {
     /// By a `SeqCst` fence, whatever orderings the caller checks or changes the condition with:
     /// what [`Event::listen`], [`Event::notify`] and [`Event::notify_additional`] do.
     Fence,
-    /// By a `SeqCst` write or look at the word: what `Event::listen_unfenced` and
-    /// `Event::notify_unfenced` do, for a caller in this crate that checks and changes the
-    /// condition with `SeqCst` operations, or under a lock of its own.
-    #[cfg(any(feature = "broadcast", feature = "lock"))]
+    /// By a `SeqCst` write or look at the word: what `Event::listen_unfenced`,
+    /// `Event::notify_unfenced` and `Event::notify_additional_unfenced` do, for a caller in this
+    /// crate that checks and changes the condition with `SeqCst` operations, or under a lock of its
+    /// own.
+    #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
     SeqCst,
 }
 
@@ -655,7 +671,7 @@ impl Order {
     fn write(self) -> Ordering {
         match self {
             Order::Fence => Ordering::Release,
-            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
             Order::SeqCst => Ordering::SeqCst,
         }
     }
@@ -664,7 +680,7 @@ impl Order {
     fn look(self) -> Ordering {
         match self {
             Order::Fence => Ordering::Acquire,
-            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
             Order::SeqCst => Ordering::SeqCst,
         }
     }
@@ -677,7 +693,7 @@ impl Order {
 
                 true
             }
-            #[cfg(any(feature = "broadcast", feature = "lock"))]
+            #[cfg(any(feature = "broadcast", feature = "lock", feature = "mpmc"))]
             Order::SeqCst => false,
         }
     }
@@ -914,11 +930,44 @@ impl Wakers {
         }
     }
 
-    /// Wakes each waker, in the order they were kept.
+    /// Wakes each waker, in the order they were kept, every one of them even where one before it
+    /// panics.
+    ///
+    /// Each waker's entry is marked notified already, so one left unwoken would leave its task
+    /// waiting for a notification that has come and gone. The first panic is raised again once
+    /// every waker has been woken. The payload of any after it is disposed of: dropped with a panic
+    /// of its own destructor caught, as that would otherwise escape the loop, past the wakers still
+    /// to wake.
     fn wake(self) {
+        let mut first_panic = None;
         for waker in self.first.into_iter().chain(self.rest) {
-            waker.wake();
+            if let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+                match first_panic {
+                    None => first_panic = Some(panic),
+                    Some(_) => dispose(panic),
+                }
+            }
         }
+
+        if let Some(panic) = first_panic {
+            panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Drops the payload of a panic that is to go no further, with a panic of its destructor caught.
+///
+/// The payload is somebody else's value, and its `Drop` may panic in turn. The payload of such a
+/// second panic is dropped too, the same way, and only one that panics a third time is leaked, so
+/// as not to follow a chain of destructors that each panic. The scheduler has a function like this
+/// one too, but this module does not use it: the runtime may be left out of the build, and an event
+/// needs none of it.
+fn dispose(payload: Box<dyn Any + Send>) {
+    let Err(payload) = panic::catch_unwind(AssertUnwindSafe(move || drop(payload))) else {
+        return;
+    };
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        mem::forget(payload);
     }
 }
 

@@ -2,7 +2,7 @@
 name = "zruntime"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 license = "MIT"
 authors = ["Zeeshan Ali Khan <zeeshanak@gnome.org>"]
 description = "A simple single-threaded Rust async runtime"
@@ -32,6 +32,9 @@ tracing = ["dep:tracing"]
 helper = ["runtime"]
 # The `broadcast` module: an async multi-producer multi-consumer broadcast channel.
 broadcast = ["event", "dep:futures-core"]
+# The `mpmc` module: an async multi-producer multi-consumer channel, each of whose messages one
+# receiver gets.
+mpmc = ["event", "dep:futures-core"]
 # The `lock` module: an async mutex and readers-writer lock, which need no runtime.
 lock = ["event"]
 # `unblock`: blocking work run on a thread of its own, out of the way of the async tasks; needs no
@@ -101,3 +104,8 @@ required-features = ["lock"]
 name = "broadcast"
 harness = false
 required-features = ["broadcast"]
+
+[[bench]]
+name = "mpmc"
+harness = false
+required-features = ["mpmc", "runtime"]

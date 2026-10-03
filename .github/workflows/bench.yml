@@ -40,11 +40,11 @@ jobs:
           cache-extra-identifier: ${{ runner.arch }}
           bins: cargo-codspeed
       # The benchmarks measure the helper layer (`block_on` per operation, the runtime of
-      # `SharedRuntime::current`), which is behind the `helper` feature; the `broadcast` feature
-      # builds the broadcast channel benchmark too, and the `lock` feature the event and connection
-      # ones, which use the locks.
+      # `SharedRuntime::current`), which is behind the `helper` feature; the `broadcast` and `mpmc`
+      # features build the two channel benchmarks too, and the `lock` feature the event and
+      # connection ones, which use the locks.
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -m walltime --features helper,broadcast,lock
+        run: cargo codspeed build -m walltime --features helper,broadcast,lock,mpmc
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
         with:

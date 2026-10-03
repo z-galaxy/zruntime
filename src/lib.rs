@@ -25,6 +25,8 @@ pub mod lock;
 mod log;
 #[cfg(feature = "runtime")]
 mod mode;
+#[cfg(feature = "mpmc")]
+pub mod mpmc;
 #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
 pub mod net;
 #[cfg(feature = "runtime")]

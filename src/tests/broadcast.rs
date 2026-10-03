@@ -7,7 +7,7 @@
 //! they are meant for, which they check with wakers that only set a flag.
 
 use std::{
-    future::Future,
+    future::{self, Future},
     marker::PhantomPinned,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -294,13 +294,28 @@ fn open_channel() {
 
     let (receiver_sync_send, receiver_sync_recv) = mpsc::channel();
     let (sender_sync_send, sender_sync_recv) = mpsc::channel();
+    let (activated_send, activated_recv) = mpsc::channel();
 
     thread::scope(|scope| {
         scope.spawn(move || {
             block_on(async move {
-                receiver_sync_send.send(()).unwrap();
+                // Both sends are left waiting for an active receiver, and polled again only once
+                // the other thread has activated one. A send tries to send before it looks at its
+                // listener, so a receiver activated in between `join`'s polls of the two would
+                // have the second send its message straight away, ahead of the first's.
+                let mut send1 = s1.broadcast(7);
+                let mut send2 = s2.broadcast(8);
+                future::poll_fn(|cx| {
+                    assert!(Pin::new(&mut send1).poll(cx).is_pending());
+                    assert!(Pin::new(&mut send2).poll(cx).is_pending());
 
-                let (result1, result2) = join(s1.broadcast(7), s2.broadcast(8)).await;
+                    Poll::Ready(())
+                })
+                .await;
+                receiver_sync_send.send(()).unwrap();
+                activated_recv.recv().unwrap();
+
+                let (result1, result2) = join(send1, send2).await;
                 result1.unwrap();
                 result2.unwrap();
 
@@ -317,9 +332,9 @@ fn open_channel() {
         scope.spawn(move || {
             block_on(async move {
                 receiver_sync_recv.recv().unwrap();
-                sleep(ms(5));
 
                 let mut r = inactive.activate_cloned();
+                activated_send.send(()).unwrap();
                 assert_eq!(r.next().await.unwrap(), 7);
                 assert_eq!(r.recv().await.unwrap(), 8);
                 drop(r);

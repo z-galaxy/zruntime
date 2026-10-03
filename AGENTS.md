@@ -33,6 +33,11 @@ A non-default `broadcast` feature, which implies `event` and adds a `futures-cor
 gives `zruntime::broadcast`: an async multi-producer multi-consumer broadcast channel, moved here
 from async-broadcast. It is built on `Event`, needs no runtime and works under any executor.
 
+A non-default `mpmc` feature, which implies `event` and adds a `futures-core` dependency, gives
+`zruntime::mpmc`: an async multi-producer multi-consumer channel, bounded or unbounded, each of
+whose messages one receiver gets. It is built on `Event`, needs no runtime and works under any
+executor.
+
 A non-default `lock` feature, which implies `event` and adds no dependency, gives `zruntime::lock`:
 an async `Mutex` and `RwLock` whose guards may be held across an await, moved here from zbus. They
 are built on `Event`, need no runtime and work under any executor.
@@ -73,21 +78,22 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime, Event, broadcast, the locks, unblock and each family of socket built alone:
-# `--all-features` cannot show that each builds without the others, and leaves out the no-op
-# `error!` in `log.rs` that replaces `tracing`'s
+# Check the runtime, Event, the two channels, the locks, unblock and each family of socket built
+# alone: `--all-features` cannot show that each builds without the others, and leaves out the
+# no-op `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
+cargo check --no-default-features --features mpmc
 cargo check --no-default-features --features lock
 cargo check --no-default-features --features unblock
 cargo check --no-default-features --features tcp
 cargo check --no-default-features --features udp
 cargo check --no-default-features --features unix
 
-# Run what needs no runtime (Event, the locks, the broadcast channel, unblock) under Miri, as CI
-# does; the runtime polls with `ppoll`, which Miri cannot run
-cargo +nightly miri test --no-default-features --features lock,broadcast,unblock
+# Run what needs no runtime (Event, the locks, the two channels, unblock) under Miri, as CI does;
+# the runtime polls with `ppoll`, which Miri cannot run
+cargo +nightly miri test --no-default-features --features lock,broadcast,mpmc,unblock
 
 # Run the locks' waiting paths on `wasm32-unknown-unknown`, which has no clock, in Node, as CI
 # does
@@ -116,6 +122,10 @@ cargo bench --features helper,lock
 
 # The broadcast channel's benchmark needs the broadcast feature and no runtime
 cargo bench --features broadcast --bench broadcast
+
+# The MPMC channel's benchmark needs the mpmc feature and the default runtime one: its task ids
+# run on a LocalRuntime
+cargo bench --features mpmc --bench mpmc
 ```
 
 ## Architecture Overview
@@ -131,6 +141,8 @@ src/
 │                 # README examples it cannot run
 ├── broadcast.rs  # [broadcast feature] The async multi-producer multi-consumer broadcast channel,
 │                 # built on Event, with no use of the runtime
+├── mpmc.rs       # [mpmc feature] The async multi-producer multi-consumer channel, each
+│                 # message to one receiver, built on Event, with no use of the runtime
 ├── lock/         # [lock feature] Mutex and RwLock, built on Event, with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
@@ -145,9 +157,10 @@ src/
 ├── unblock.rs    # [unblock feature] Blocking work on a thread of its own, with no use of the
 │                 # runtime
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
-                  # broadcast.rs: the broadcast channel, broadcast feature; lock.rs: the locks,
-                  # lock feature; helper.rs: helper feature; unblock.rs: unblock, unblock
-                  # feature; net/: the sockets, each family under its own feature
+                  # broadcast.rs: the broadcast channel, broadcast feature; mpmc.rs: the MPMC
+                  # channel, mpmc feature; lock.rs: the locks, lock feature; helper.rs: helper
+                  # feature; unblock.rs: unblock, unblock feature; net/: the sockets, each
+                  # family under its own feature
 ```
 
 ### Key Design Patterns
@@ -192,7 +205,7 @@ it. No socket is `Clone`.
 
 ## Development Guidelines
 
-- **MSRV**: 1.87.0
+- **MSRV**: 1.88.0
 - **Commit style**: Emoji prefix only, no package prefix — this is a single crate (e.g.,
   "🐛 Fix timer rounding").
 - **Changelog**: `CHANGELOG.md` is managed by [release-plz] — do **not** hand-edit it. Write a
@@ -201,10 +214,11 @@ it. No socket is `Clone`.
 - **Features**: `runtime` and `event` each build without the other. Nothing in `event.rs` may reach
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
-  tests without it). `broadcast` and `lock` imply `event` and, like it, must not reach into the
-  runtime; nor may `unblock`, which needs neither. `tcp`, `udp` and `unix` imply `runtime`, and
-  `unix` builds nothing on Windows. CI builds and tests everything with every feature on, and
-  checks `runtime`, `event`, `broadcast`, `lock`, `unblock`, `tcp`, `udp` and `unix` each alone.
+  tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
+  into the runtime; nor may `unblock`, which needs neither. `tcp`, `udp` and `unix` imply
+  `runtime`, and `unix` builds nothing on Windows. CI builds and tests everything with every
+  feature on, and checks `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `tcp`, `udp`
+  and `unix` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).

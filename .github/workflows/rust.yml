@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
-      MSRV: 1.87.0
+      MSRV: 1.88.0
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -30,14 +30,15 @@ jobs:
           cargo --locked check --all-features --target aarch64-linux-android
       # The features only add code, so the jobs build with all of them. That covers all of it but
       # the no-op `error!` that `log.rs` builds in place of `tracing`'s where that feature is off,
-      # and cannot show that `runtime`, `event`, `broadcast`, `lock`, `unblock`, `tcp`, `udp` and
-      # `unix` each build without the others: checking each alone covers them, and `unix`, which
-      # builds nothing on Windows, is checked to build nothing there with no warning.
-      - name: Check build with runtime, event, broadcast, lock, unblock, tcp, udp or unix alone
+      # and cannot show that `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `tcp`,
+      # `udp` and `unix` each build without the others: checking each alone covers them, and
+      # `unix`, which builds nothing on Windows, is checked to build nothing there with no warning.
+      - name: Check build with runtime, event, broadcast, mpmc, lock, unblock, tcp, udp, unix alone
         run: |
           cargo --locked check --no-default-features --features runtime
           cargo --locked check --no-default-features --features event
           cargo --locked check --no-default-features --features broadcast
+          cargo --locked check --no-default-features --features mpmc
           cargo --locked check --no-default-features --features lock
           cargo --locked check --no-default-features --features unblock
           cargo --locked check --no-default-features --features tcp
@@ -115,7 +116,7 @@ jobs:
         run: cargo --locked test --all-features
 
   # Miri checks the lock module's `unsafe` code, and the concurrency of everything that needs no
-  # runtime: Event, the locks, the broadcast channel and unblock, doc tests included. The runtime
+  # runtime: Event, the locks, the two channels and unblock, doc tests included. The runtime
   # itself polls with `ppoll`, which Miri cannot run, so its tests are left out.
   miri:
     runs-on: ubuntu-latest
@@ -130,8 +131,8 @@ jobs:
           toolchain: nightly
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
-      - name: Test Event, the locks, the broadcast channel and unblock under Miri
-        run: cargo --locked miri test --no-default-features --features lock,broadcast,unblock
+      - name: Test Event, the locks, the two channels and unblock under Miri
+        run: cargo --locked miri test --no-default-features --features lock,broadcast,mpmc,unblock
 
   # Once a task starts to wait for a lock, the locks read the clock, where the target has one.
   # On `wasm32-unknown-unknown` the standard library has none, and reading it panics, which no

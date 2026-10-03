@@ -110,11 +110,18 @@ fn is_in_progress(error: &io::Error) -> bool {
 /// `select`, which puts the socket in `writefds` once the connection is made and in `exceptfds`
 /// once it has failed, and in neither while it is still under way.
 ///
-/// Either way a connection still under way is reported as a would-block, which is what makes the
-/// wait a readiness wait like any other. Asked before the socket is known to be ready, as the
-/// registration's first attempt asks it, it says the connection is still under way and the caller
-/// waits; asked once the kernel has reported writability — which it does as soon as it is done
-/// with the connection, whichever way that went — it finds the settled answer.
+/// A unix connection can settle in between the two questions. One that fails there leaves its
+/// reason in `SO_ERROR` after the first question found none, and leaves the socket with no peer
+/// for the second: Linux and FreeBSD say so with `ENOTCONN`, but macOS answers `getpeername` on a
+/// socket that can neither send nor receive any more, as a refused one cannot, with `EINVAL`. So
+/// a `getpeername` that fails any other way than `ENOTCONN` sends the question back to
+/// `SO_ERROR`, which holds the reason by then.
+///
+/// On either platform, a connection still under way is reported as a would-block, which is what
+/// makes the wait a readiness wait like any other. Asked before the socket is known to be ready, as
+/// the registration's first attempt asks it, it says the connection is still under way and the
+/// caller waits; asked once the kernel has reported writability — which it does as soon as it is
+/// done with the connection, whichever way that went — it finds the settled answer.
 fn outcome<S>(socket: &S) -> io::Result<()>
 where
     S: AsSource,
@@ -130,7 +137,9 @@ where
                 Err(e) if e.kind() == io::ErrorKind::NotConnected => {
                     Err(io::ErrorKind::WouldBlock.into())
                 }
-                Err(e) => Err(e),
+                // The connection failed in between the two questions, and `SO_ERROR` holds the
+                // reason now, which is what to report rather than how `getpeername` failed.
+                Err(e) => Err(socket.take_error()?.unwrap_or(e)),
             },
         }
     }

@@ -10,7 +10,8 @@
 //! the order of what they pin down: that a listener is queued as it is taken, that nothing is kept
 //! for one taken later, the order listeners are notified in, what each kind of notification
 //! counts, what a notified listener does when polled or dropped, what outlives what, which wakers
-//! are kept, and that a waker may come back into the event it was woken or dropped by.
+//! are kept, that a waker may come back into the event it was woken or dropped by, and that one
+//! that panics as it is woken leaves the others woken all the same.
 //!
 //! The last five drive one event from many threads at once — through listeners taken just as
 //! another thread changes the condition they are for and notifies, through a listener dropped just
@@ -27,6 +28,7 @@
 
 use std::{
     future::Future,
+    panic::{self, AssertUnwindSafe},
     pin::Pin,
     ptr,
     sync::{
@@ -542,6 +544,68 @@ fn a_waker_woken_by_a_notification_is_dropped_clear_of_the_lock() {
     assert_eq!(format!("{event:?}"), "Event { listeners: 0, notified: 0 }");
 }
 
+/// A waker that panics as it is woken does not keep the tasks after it from being woken, by
+/// either kind of notification. Each of their listeners is marked notified before any waker is
+/// woken, so one left unwoken would wait for good, for a notification that came and went. The
+/// panic reaches whoever notified once every waker has been woken.
+#[test]
+#[timeout(15000)]
+fn a_waker_that_panics_does_not_keep_the_others_from_being_woken() {
+    for additional in [false, true] {
+        let event = Event::new();
+        let mut first = event.listen();
+        let mut second = event.listen();
+        let mut third = event.listen();
+        assert!(poll(&mut first, &Waker::from(Arc::new(PanicsOnWake))).is_pending());
+        let counters = poll_all([&mut second, &mut third]);
+
+        let notified = panic::catch_unwind(AssertUnwindSafe(|| {
+            if additional {
+                event.notify_additional(3)
+            } else {
+                event.notify(3)
+            }
+        }));
+
+        assert!(
+            notified.is_err(),
+            "the panic of the first waker reaches the caller"
+        );
+        for counter in &counters {
+            assert_eq!(counter.wakes(), 1, "additional: {additional}");
+        }
+        assert!(ready(&mut first));
+        assert!(ready(&mut second));
+        assert!(ready(&mut third));
+    }
+}
+
+/// A waker whose panic carries a payload that panics as it is dropped does not keep the tasks
+/// after it from being woken either: the event forgets that payload rather than drop it, as it is
+/// the first panic that reaches the caller.
+// Long enough for Miri, which takes seconds over each of the panics this raises.
+#[test]
+#[timeout(60000)]
+fn a_panic_whose_payload_panics_as_it_drops_does_not_keep_the_others_from_being_woken() {
+    let event = Event::new();
+    let mut first = event.listen();
+    let mut second = event.listen();
+    let mut third = event.listen();
+    assert!(poll(&mut first, &Waker::from(Arc::new(PanicsOnWake))).is_pending());
+    let payload_waker = Waker::from(Arc::new(PanicsWithPayloadOnWake));
+    assert!(poll(&mut second, &payload_waker).is_pending());
+    let counters = poll_all([&mut third]);
+
+    let notified = panic::catch_unwind(AssertUnwindSafe(|| event.notify(3)));
+
+    assert!(
+        notified.is_err(),
+        "the panic of the first waker reaches the caller"
+    );
+    assert_eq!(counters[0].wakes(), 1);
+    assert!(ready(&mut third));
+}
+
 /// An event and its listeners may be shared with, and sent to, any thread, and a listener may be
 /// polled through a plain `&mut` and kept for as long as its owner likes.
 #[test]
@@ -841,6 +905,33 @@ impl Wake for Counter {
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A waker that panics as it is woken.
+struct PanicsOnWake;
+
+impl Wake for PanicsOnWake {
+    fn wake(self: Arc<Self>) {
+        panic!("a waker that panics as it is woken");
+    }
+}
+
+/// A waker that panics as it is woken, with a payload that panics as it is dropped.
+struct PanicsWithPayloadOnWake;
+
+impl Wake for PanicsWithPayloadOnWake {
+    fn wake(self: Arc<Self>) {
+        panic::panic_any(PanicsOnDrop);
+    }
+}
+
+/// A panic payload that panics as it is dropped.
+struct PanicsOnDrop;
+
+impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        panic!("a panic payload that panics as it is dropped");
     }
 }
 

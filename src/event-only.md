@@ -21,6 +21,8 @@ it last, and an event may be notified from any thread.
   between `block_on` calls. It implies `runtime`.
 * `broadcast`: the `broadcast` module, an async multi-producer multi-consumer broadcast channel
   built on [`Event`]; it implies `event`.
+* `mpmc`: the `mpmc` module, an async multi-producer multi-consumer channel, each of whose
+  messages one receiver gets, built on [`Event`]; it implies `event`.
 * `lock`: the `lock` module, an async `Mutex` and `RwLock`, whose guards a task may hold across an
   await, built on [`Event`]; it implies `event`.
 * `unblock`: `unblock`, which runs a piece of blocking work on a thread of its own and hands back
