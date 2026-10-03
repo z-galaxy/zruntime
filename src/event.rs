@@ -98,10 +98,12 @@
 //! check after the change as above, through the fences, the `SeqCst` order, or the caller's lock.
 
 use std::{
+    any::Any,
     fmt,
     future::Future,
     mem,
     ops::{Deref, DerefMut},
+    panic::{self, AssertUnwindSafe},
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -151,7 +153,9 @@ use std::{
 /// is free to come back into the same event from its `wake`: to notify it, listen to it or drop
 /// one of its listeners. A listener polled on another thread in the meantime sees its
 /// notification and completes, so a task can be done with its listener while the thread that
-/// notified it still holds the waker it is waking.
+/// notified it still holds the waker it is waking. A waker that panics does not keep the others
+/// from being woken: every task a notification reached is woken, and the first panic reaches the
+/// caller once they all are.
 ///
 /// # Example
 ///
@@ -914,11 +918,44 @@ impl Wakers {
         }
     }
 
-    /// Wakes each waker, in the order they were kept.
+    /// Wakes each waker, in the order they were kept, every one of them even where one before it
+    /// panics.
+    ///
+    /// Each waker's entry is marked notified already, so one left unwoken would leave its task
+    /// waiting for a notification that has come and gone. The first panic is raised again once
+    /// every waker has been woken. The payload of any after it is disposed of: dropped with a panic
+    /// of its own destructor caught, as that would otherwise escape the loop, past the wakers still
+    /// to wake.
     fn wake(self) {
+        let mut first_panic = None;
         for waker in self.first.into_iter().chain(self.rest) {
-            waker.wake();
+            if let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+                match first_panic {
+                    None => first_panic = Some(panic),
+                    Some(_) => dispose(panic),
+                }
+            }
         }
+
+        if let Some(panic) = first_panic {
+            panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Drops the payload of a panic that is to go no further, with a panic of its destructor caught.
+///
+/// The payload is somebody else's value, and its `Drop` may panic in turn. The payload of such a
+/// second panic is dropped too, the same way, and only one that panics a third time is leaked, so
+/// as not to follow a chain of destructors that each panic. The scheduler has a function like this
+/// one too, but this module does not use it: the runtime may be left out of the build, and an event
+/// needs none of it.
+fn dispose(payload: Box<dyn Any + Send>) {
+    let Err(payload) = panic::catch_unwind(AssertUnwindSafe(move || drop(payload))) else {
+        return;
+    };
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        mem::forget(payload);
     }
 }
 
