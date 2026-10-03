@@ -130,6 +130,9 @@ is behind the `event` feature, which builds without the runtime: see [Features](
   and hands back a future of its outcome, and [`Unblock`], an adapter that gives a blocking I/O
   handle, such as a file or the standard input, the async I/O traits of `futures-io` that way; it
   needs no runtime either, and brings the `futures-io` and `futures-core` crates.
+* `fs`: the [`fs`] module, async access to the filesystem in the shape of `std::fs` and of smol's
+  `smol::fs`, with each operation run as blocking work on [`unblock`]'s pool; it implies `unblock`
+  and `lock`, and needs no runtime either.
 * `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
   and brings the `socket2`, `futures-io` and `futures-core` crates.
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
@@ -165,6 +168,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
 [`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
 [`Unblock`]: https://docs.rs/zruntime/latest/zruntime/struct.Unblock.html
+[`fs`]: https://docs.rs/zruntime/latest/zruntime/fs/index.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
