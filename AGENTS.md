@@ -122,6 +122,10 @@ cargo bench --features helper,lock
 
 # The broadcast channel's benchmark needs the broadcast feature and no runtime
 cargo bench --features broadcast --bench broadcast
+
+# The MPMC channel's benchmark needs the mpmc feature and the default runtime one: its task ids
+# run on a LocalRuntime
+cargo bench --features mpmc --bench mpmc
 ```
 
 ## Architecture Overview

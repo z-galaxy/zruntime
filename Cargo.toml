@@ -104,3 +104,8 @@ required-features = ["lock"]
 name = "broadcast"
 harness = false
 required-features = ["broadcast"]
+
+[[bench]]
+name = "mpmc"
+harness = false
+required-features = ["mpmc", "runtime"]
