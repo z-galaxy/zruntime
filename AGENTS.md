@@ -126,7 +126,7 @@ cargo doc --all-features
 
 ### Benchmarks
 ```bash
-# Run benchmarks (the runtime and connection ones need the helper feature: they measure the
+# Run benchmarks (the runtime, spawn and connection ones need the helper feature: they measure the
 # block_on-per-operation case; the event and connection ones need the lock feature, which implies
 # Event)
 cargo bench --features helper,lock
@@ -137,6 +137,9 @@ cargo bench --features broadcast --bench broadcast
 # The MPMC channel's benchmark needs the mpmc feature and the default runtime one: its task ids
 # run on a LocalRuntime
 cargo bench --features mpmc --bench mpmc
+
+# The channel and the mutex between contending threads need the mpmc and lock features
+cargo bench --features mpmc,lock --bench contention
 
 # The benchmark of handing work to `unblock` needs the unblock feature and no runtime
 cargo bench --features unblock --bench unblock

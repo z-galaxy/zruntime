@@ -98,6 +98,11 @@ harness = false
 required-features = ["helper"]
 
 [[bench]]
+name = "spawn"
+harness = false
+required-features = ["helper"]
+
+[[bench]]
 name = "connection"
 harness = false
 required-features = ["helper", "lock"]
@@ -116,6 +121,11 @@ required-features = ["broadcast"]
 name = "mpmc"
 harness = false
 required-features = ["mpmc", "runtime"]
+
+[[bench]]
+name = "contention"
+harness = false
+required-features = ["mpmc", "lock"]
 
 [[bench]]
 name = "unblock"

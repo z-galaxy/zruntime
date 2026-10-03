@@ -718,7 +718,7 @@ mod unix {
     /// A handle on the runtime this thread's `block_on` calls drive, brought into being in a
     /// `block_on` of its own and kept alive by the caller so that every later `block_on` on this
     /// thread resolves to the same runtime rather than a fresh one. Mirrors `runtime_handle` in
-    /// `benches/runtime.rs`.
+    /// `benches/common/executor.rs`.
     fn runtime_handle() -> SharedRuntime {
         zruntime::block_on(async { SharedRuntime::current().expect("a runtime for this thread") })
     }

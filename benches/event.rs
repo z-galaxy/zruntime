@@ -1,9 +1,9 @@
 //! What `Event`'s listen and notify paths cost: taking a listener, alone and dropped at once,
 //! sending a notification to nobody, waking one listener and a hundred taken beforehand, and
-//! `lock::Mutex`, built on an event, taken by one thread alone and under four contending threads.
-//! `Event` needs no runtime, so no id here goes through `zruntime::block_on`: the single-threaded
-//! ones poll listeners by hand or take the mutex with `try_lock`, and `mutex/4-threads` blocks on
-//! each `lock` with futures-lite's `block_on`.
+//! `lock::Mutex`, built on an event, taken by one thread alone. `Event` needs no runtime, so no id
+//! here goes through `zruntime::block_on`: they poll listeners by hand or take the mutex with
+//! `try_lock`, all on one thread. `mutex/4-threads`, the mutex taken by four contending threads,
+//! is in `contention.rs`, as only the clock can measure it.
 //!
 //! `listen` times taking a listener, alone, on an event whose shared state is already allocated:
 //! what every wait starts with. The listeners are taken a batch at a time and dropped once the
@@ -32,33 +32,16 @@
 //! to before the timing starts. The listeners it polls are then the only ones its notification can
 //! reach, however many iterations a harness sets up before it runs them: CodSpeed's CPU simulation
 //! sets up two for the one it measures.
-//!
-//! `mutex/4-threads` times zruntime's own `lock::Mutex` — built on an `Event`, which a release
-//! notifies once, to wake one waiter — taken and released 1000 times by each of four threads at
-//! once, a contended lock under real cross-thread wakes. The four threads are spawned once,
-//! before the group starts, and kept alive for every sample: a pair of barriers starts a round of
-//! 1000 lock/unlock each and waits for it to end, and only the time between the two is measured,
-//! so spawning and joining the threads is never counted as the lock's cost. Each thread is pinned
-//! to a CPU of its own, and they start each round together, so that every process measures the
-//! same placement of the threads, and all four contend from the first lock of a round on (see
-//! `common/crew.rs`).
 
 use std::{
     future::Future,
     hint::black_box,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
-use crew::{Crew, Round};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use zruntime::{Event, EventListener, lock::Mutex};
-
-#[path = "common/cpus.rs"]
-mod cpus;
-#[path = "common/crew.rs"]
-mod crew;
 
 /// Times `listen`, `notify` and the poll that resolves a listener, all on a single thread.
 fn event_benches(c: &mut Criterion) {
@@ -146,35 +129,5 @@ fn poll_once(listener: &mut EventListener) -> Poll<()> {
 /// a batch costs little next to them.
 const LISTENERS_PER_BATCH: u64 = 64;
 
-/// How many threads contend for the lock in `mutex/4-threads`.
-const MUTEX_THREADS: usize = 4;
-/// How many lock/unlock rounds each thread runs per timed sample of `mutex/4-threads`.
-const MUTEX_ROUNDS: usize = 1000;
-
-/// Times `lock::Mutex`, which is built on an event, taken and released [`MUTEX_ROUNDS`] times by
-/// each of [`MUTEX_THREADS`] threads at once.
-fn mutex_bench(c: &mut Criterion) {
-    let lock = Arc::new(Mutex::new(()));
-    let crew = Crew::spawn((0..MUTEX_THREADS).map(|_| {
-        let lock = lock.clone();
-        Box::new(move || {
-            for _ in 0..MUTEX_ROUNDS {
-                // The guard is dropped at once: the mutex is taken and released.
-                drop(futures_lite::future::block_on(lock.lock()));
-            }
-        }) as Round
-    }));
-
-    let mut group = c.benchmark_group("event");
-    group.sample_size(10);
-    group.throughput(Throughput::Elements((MUTEX_THREADS * MUTEX_ROUNDS) as u64));
-    group.bench_function("mutex/4-threads", |b| {
-        b.iter_custom(|iters| crew.time(iters))
-    });
-    group.finish();
-
-    crew.join();
-}
-
-criterion_group!(benches, event_benches, mutex_bench);
+criterion_group!(benches, event_benches);
 criterion_main!(benches);

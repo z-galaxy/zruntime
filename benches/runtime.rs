@@ -1,5 +1,7 @@
-//! What the runtime costs: a task spawn, a timer, watching a socket, and bytes moved through the
-//! reactor's readiness path, within one thread and across two. These are the runtime's share of
+//! What the runtime costs: a timer, watching a socket, and bytes moved through the reactor's
+//! readiness path, within one thread and across two. What spawning a task costs, which waits on no
+//! timer, socket or other thread, and so needs no clock to measure, is in `spawn.rs`. These are
+//! the runtime's share of
 //! what a connection built on it costs: the ids mirror what zbus measures of its connections (a
 //! connection's setup and teardown, a method call's round trip, a large body, a burst of
 //! concurrent calls to a peer on another thread) with the protocol taken out.
@@ -10,58 +12,26 @@
 //! inside the timed `block_on`; a `SharedRuntime` handle kept alive this way is also what a later
 //! `block_on` on the same thread resolves to, rather than a fresh runtime.
 //!
-//! The `spawn` and `timer` ids need nothing but the scheduler and the reactor's timers, so they
-//! run on every platform. The `io` and `cross-thread` ids need a unix socket pair to give the
-//! reactor's readiness path something to watch, so they are unix-only.
+//! The `timer` ids need nothing but the reactor's timers, so they run on every platform. The `io`
+//! and `cross-thread` ids need a unix socket pair to give the reactor's readiness path something to
+//! watch, so they are unix-only.
 
 use std::{
     future::{Future, poll_fn},
-    hint::black_box,
     pin::Pin,
     task::Poll,
     time::Duration,
 };
 
-use criterion::{Criterion, Throughput, async_executor::AsyncExecutor, criterion_group};
-use zruntime::{Shared, SharedRuntime, Sleep};
+use criterion::{Criterion, Throughput, criterion_group};
+use executor::{ZruntimeExecutor, runtime_handle};
+use zruntime::{Shared, Sleep};
 
 #[cfg(unix)]
 #[path = "common/cpus.rs"]
 mod cpus;
-
-/// Runs a routine's future to completion inside `zruntime::block_on`.
-struct ZruntimeExecutor;
-
-impl AsyncExecutor for ZruntimeExecutor {
-    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        zruntime::block_on(future)
-    }
-}
-
-/// A handle on the runtime this thread's `block_on` calls drive, brought into being in a
-/// `block_on` of its own and kept alive by the caller so that every later `block_on` on this
-/// thread resolves to the same runtime rather than a fresh one.
-fn runtime_handle() -> SharedRuntime {
-    zruntime::block_on(async { SharedRuntime::current().expect("a runtime for this thread") })
-}
-
-fn spawn_benches(c: &mut Criterion) {
-    let runtime = runtime_handle();
-
-    let mut group = c.benchmark_group("spawn");
-    group.throughput(Throughput::Elements(100));
-    group.bench_function("100-tasks", |b| {
-        b.to_async(ZruntimeExecutor).iter(|| async {
-            let tasks: Vec<_> = (0..100u32)
-                .map(|i| runtime.spawn("bench", async move { i }))
-                .collect();
-            for task in tasks {
-                black_box(task.await.unwrap());
-            }
-        });
-    });
-    group.finish();
-}
+#[path = "common/executor.rs"]
+mod executor;
 
 fn timer_benches(c: &mut Criterion) {
     let runtime = runtime_handle();
@@ -335,12 +305,11 @@ mod unix {
 #[cfg(unix)]
 criterion_group!(
     benches,
-    spawn_benches,
     timer_benches,
     unix::io_benches,
     unix::cross_thread_benches
 );
 #[cfg(not(unix))]
-criterion_group!(benches, spawn_benches, timer_benches);
+criterion_group!(benches, timer_benches);
 
 criterion::criterion_main!(benches);
