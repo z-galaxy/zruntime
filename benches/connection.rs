@@ -34,6 +34,7 @@ use std::{
     time::Duration,
 };
 
+use cpus::Cpus;
 use criterion::{
     BenchmarkGroup, Criterion, Throughput, async_executor::AsyncExecutor, criterion_group,
     criterion_main, measurement::Measurement,
@@ -41,6 +42,9 @@ use criterion::{
 use futures_lite::future;
 use futures_util::future::try_join_all;
 use zruntime::{Event, Shared, SharedRuntime, Task, lock};
+
+#[path = "common/cpus.rs"]
+mod cpus;
 
 /// Runs a routine's future to completion inside `zruntime::block_on`.
 struct ZruntimeExecutor;
@@ -118,7 +122,8 @@ type BuildFuture = Pin<Box<dyn Future<Output = (BoxedReader, BoxedWriter)>>>;
 /// [`BoxedReader`]/[`BoxedWriter`].
 ///
 /// The server's `block_on` runs until the client hangs up, which is when [`Connection::closed`]
-/// resolves.
+/// resolves. The two threads are pinned to a CPU each until then, so that every process measures
+/// the same placement of the two (see `common/cpus.rs`).
 fn run_burst_bench<M>(
     group: &mut BenchmarkGroup<'_, M>,
     id: &str,
@@ -127,7 +132,12 @@ fn run_burst_bench<M>(
 ) where
     M: Measurement,
 {
+    let cpus = Cpus::allowed();
+    let server_cpu = cpus.nth(1);
+    let _pinned = cpus.nth(0).pin();
+
     let server_thread = thread::spawn(move || {
+        let _pinned = server_cpu.pin();
         zruntime::block_on(async move {
             let runtime = SharedRuntime::current().expect("a runtime for this thread");
             let (reader, writer) = build_server(&runtime).await;

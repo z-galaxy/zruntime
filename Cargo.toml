@@ -71,6 +71,10 @@ optional = true
 [target."cfg(windows)".dev-dependencies]
 uds_windows = "1.2.1"
 
+# Pins the threads of the benchmarks to CPUs of their own (see `benches/common/cpus.rs`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1.5", features = ["thread"] }
+
 [dev-dependencies]
 criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }
 futures-lite = "2.6.1"

@@ -35,7 +35,9 @@
 //! once, a contended lock under real cross-thread wakes. The four threads are spawned once,
 //! before the group starts, and kept alive for every sample: a pair of barriers starts a round of
 //! 1000 lock/unlock each and waits for it to end, and only the time between the two is measured,
-//! so spawning and joining the threads is never counted as the lock's cost.
+//! so spawning and joining the threads is never counted as the lock's cost. Each thread is pinned
+//! to a CPU of its own, so that every process measures the same placement of the threads (see
+//! `common/cpus.rs`).
 
 use std::{
     future::Future,
@@ -49,6 +51,8 @@ use crew::{Crew, Round};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use zruntime::{Event, EventListener, lock::Mutex};
 
+#[path = "common/cpus.rs"]
+mod cpus;
 #[path = "common/crew.rs"]
 mod crew;
 

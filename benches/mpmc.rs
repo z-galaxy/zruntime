@@ -30,10 +30,12 @@
 //! Threads, each running its whole round inside one `block_on`, not one per operation. The
 //! threads are spawned once per id and kept alive for every sample: a pair of barriers starts a
 //! round and waits for it to end, and only the time between the two is measured, so spawning and
-//! joining the threads is never counted as the channel's cost. In a round each sender sends
-//! [`MESSAGES`] messages, and the receivers between them receive exactly as many as the senders
-//! send, each an equal share, so a round leaves the channel empty and the next starts as this one
-//! did. The throughput is in messages per round.
+//! joining the threads is never counted as the channel's cost. Each thread is pinned to a CPU of
+//! its own, so that every process measures the same placement of the threads (see
+//! `common/cpus.rs`). In a round each sender sends [`MESSAGES`] messages, and the receivers
+//! between them receive exactly as many as the senders send, each an equal share, so a round
+//! leaves the channel empty and the next starts as this one did. The throughput is in messages
+//! per round.
 //!
 //! - `spsc-cap16` and `spsc-cap1024`: one sender thread and one receiver thread, on a channel with
 //!   room for 16 messages and for 1024.
@@ -71,6 +73,8 @@ use zruntime::{
     mpmc::{Receiver, Sender, bounded, unbounded},
 };
 
+#[path = "common/cpus.rs"]
+mod cpus;
 #[path = "common/crew.rs"]
 mod crew;
 

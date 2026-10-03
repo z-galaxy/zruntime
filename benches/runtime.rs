@@ -25,6 +25,10 @@ use std::{
 use criterion::{Criterion, Throughput, async_executor::AsyncExecutor, criterion_group};
 use zruntime::{Shared, SharedRuntime, Sleep};
 
+#[cfg(unix)]
+#[path = "common/cpus.rs"]
+mod cpus;
+
 /// Runs a routine's future to completion inside `zruntime::block_on`.
 struct ZruntimeExecutor;
 
@@ -116,7 +120,7 @@ mod unix {
     use futures_lite::future;
     use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
-    use super::{ZruntimeExecutor, runtime_handle};
+    use super::{ZruntimeExecutor, cpus::Cpus, runtime_handle};
 
     const BIG: usize = 1024 * 1024;
     /// How many requests `cross-thread/1000-in-flight` has in flight at once.
@@ -192,8 +196,15 @@ mod unix {
         let mut group = c.benchmark_group("cross-thread");
         group.sample_size(10);
 
+        // The two threads are pinned to a CPU each, for as long as the group runs, so that every
+        // process measures the same placement of the two (see `common/cpus.rs`).
+        let cpus = Cpus::allowed();
+        let far_cpu = cpus.nth(1);
+        let _pinned = cpus.nth(0).pin();
+
         let (local, far) = pair();
         let far_thread = thread::spawn(move || {
+            let _pinned = far_cpu.pin();
             zruntime::block_on(async move {
                 let runtime = SharedRuntime::current().expect("a runtime for this thread");
                 let far_registration = register(&runtime, &far);
