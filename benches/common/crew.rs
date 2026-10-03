@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -22,7 +22,9 @@ pub type Round = Box<dyn FnMut() + Send>;
 /// between the two is measured.
 ///
 /// Each thread is pinned to a CPU of its own, for the reasons [`crate::cpus`] gives, and so is the
-/// thread that times them, for as long as it does.
+/// thread that times them, for as long as it does. The threads also start each round together,
+/// rather than as the barrier happens to wake them, one after another: a thread that got going
+/// first would run part of its round with nobody to contend with.
 pub struct Crew {
     cpus: Cpus,
     stop: Arc<AtomicBool>,
@@ -42,6 +44,9 @@ impl Crew {
         // The crew, and the thread that times it.
         let start = Arc::new(Barrier::new(count + 1));
         let end = Arc::new(Barrier::new(count + 1));
+        // How many times a thread has got to the start of a round. Each does once a round, so
+        // the `n`th round is under way on every thread once this reaches `n` times the count.
+        let arrivals = Arc::new(AtomicU64::new(0));
 
         let threads = rounds
             .into_iter()
@@ -51,13 +56,22 @@ impl Crew {
                 let stop = stop.clone();
                 let start = start.clone();
                 let end = end.clone();
+                let arrivals = arrivals.clone();
 
                 thread::spawn(move || {
                     let _pinned = cpu.pin();
+                    let mut started = 0;
                     loop {
                         start.wait();
                         if stop.load(Ordering::Acquire) {
                             return;
+                        }
+                        started += 1;
+                        arrivals.fetch_add(1, Ordering::AcqRel);
+                        // Yields rather than spins, so that a thread that shares its CPU, where
+                        // there are fewer CPUs than threads, gets there all the same.
+                        while arrivals.load(Ordering::Acquire) < started * count as u64 {
+                            thread::yield_now();
                         }
                         round();
                         end.wait();

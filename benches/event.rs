@@ -36,8 +36,9 @@
 //! before the group starts, and kept alive for every sample: a pair of barriers starts a round of
 //! 1000 lock/unlock each and waits for it to end, and only the time between the two is measured,
 //! so spawning and joining the threads is never counted as the lock's cost. Each thread is pinned
-//! to a CPU of its own, so that every process measures the same placement of the threads (see
-//! `common/cpus.rs`).
+//! to a CPU of its own, and they start each round together, so that every process measures the
+//! same placement of the threads, and all four contend from the first lock of a round on (see
+//! `common/crew.rs`).
 
 use std::{
     future::Future,
