@@ -41,17 +41,16 @@ use std::{
     future::Future,
     hint::black_box,
     pin::Pin,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     task::{Context, Poll, Waker},
-    thread,
-    time::{Duration, Instant},
 };
 
+use crew::{Crew, Round};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use zruntime::{Event, EventListener, lock::Mutex};
+
+#[path = "common/crew.rs"]
+mod crew;
 
 /// Times `listen`, `notify` and the poll that resolves a listener, all on a single thread.
 fn event_benches(c: &mut Criterion) {
@@ -143,61 +142,27 @@ const MUTEX_ROUNDS: usize = 1000;
 
 /// Times `lock::Mutex`, which is built on an event, taken and released [`MUTEX_ROUNDS`] times by
 /// each of [`MUTEX_THREADS`] threads at once.
-///
-/// The threads are spawned once, before the benchmark starts, and stay for every sample: each
-/// waits on `start`, runs its rounds, and waits on `end`, so a sample is timed from the main
-/// thread releasing `start` to every thread having reached `end`, with nothing of a thread's own
-/// startup or shutdown inside that span.
 fn mutex_bench(c: &mut Criterion) {
     let lock = Arc::new(Mutex::new(()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let start = Arc::new(Barrier::new(MUTEX_THREADS + 1));
-    let end = Arc::new(Barrier::new(MUTEX_THREADS + 1));
-    let threads: Vec<_> = (0..MUTEX_THREADS)
-        .map(|_| {
-            let lock = lock.clone();
-            let stop = stop.clone();
-            let start = start.clone();
-            let end = end.clone();
-            thread::spawn(move || {
-                loop {
-                    start.wait();
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    for _ in 0..MUTEX_ROUNDS {
-                        // The guard is dropped at once: the mutex is taken and released.
-                        drop(futures_lite::future::block_on(lock.lock()));
-                    }
-                    end.wait();
-                }
-            })
-        })
-        .collect();
+    let crew = Crew::spawn((0..MUTEX_THREADS).map(|_| {
+        let lock = lock.clone();
+        Box::new(move || {
+            for _ in 0..MUTEX_ROUNDS {
+                // The guard is dropped at once: the mutex is taken and released.
+                drop(futures_lite::future::block_on(lock.lock()));
+            }
+        }) as Round
+    }));
 
     let mut group = c.benchmark_group("event");
     group.sample_size(10);
     group.throughput(Throughput::Elements((MUTEX_THREADS * MUTEX_ROUNDS) as u64));
     group.bench_function("mutex/4-threads", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let started = Instant::now();
-                start.wait();
-                end.wait();
-                total += started.elapsed();
-            }
-
-            total
-        });
+        b.iter_custom(|iters| crew.time(iters))
     });
     group.finish();
 
-    stop.store(true, Ordering::Release);
-    start.wait();
-    for thread in threads {
-        thread.join().unwrap();
-    }
+    crew.join();
 }
 
 criterion_group!(benches, event_benches, mutex_bench);

@@ -59,17 +59,9 @@
 //! - `tasks-mpsc-4to1-cap16`: four sender tasks and one receiver task.
 //! - `tasks-mpmc-4to4-cap16`: four sender tasks and four receiver tasks.
 
-use std::{
-    hint::black_box,
-    num::NonZeroUsize,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
-};
+use std::{hint::black_box, num::NonZeroUsize};
 
+use crew::{Crew, Round};
 use criterion::{
     BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime,
 };
@@ -78,6 +70,9 @@ use zruntime::{
     LocalRuntime,
     mpmc::{Receiver, Sender, bounded, unbounded},
 };
+
+#[path = "common/crew.rs"]
+mod crew;
 
 /// Times every id, one after the other, in one group.
 fn channel_benches(c: &mut Criterion) {
@@ -92,7 +87,7 @@ fn channel_benches(c: &mut Criterion) {
     // second on four cores, so they take fewer samples than the ids above.
     group.sample_size(10);
 
-    let workers = vec![
+    let crews = vec![
         bench_threads(&mut group, "spsc-cap16", 1, 1, Some(16)),
         bench_threads(&mut group, "spsc-cap1024", 1, 1, Some(1024)),
         bench_threads(&mut group, "mpsc-4to1-cap16", 4, 1, Some(16)),
@@ -106,8 +101,8 @@ fn channel_benches(c: &mut Criterion) {
 
     group.finish();
 
-    for workers in workers {
-        workers.join();
+    for crew in crews {
+        crew.join();
     }
 }
 
@@ -153,62 +148,32 @@ fn burst(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, cap: Option<usize>)
 /// receiving them, on a channel of capacity `cap` (unbounded if `None`), one `block_on` per thread
 /// per round. Returns the threads, still parked, for the caller to join once it has timed
 /// whatever else it has.
-///
-/// The threads are spawned once, before the first sample, and stay for every sample: each waits
-/// on `start`, runs its round, and waits on `end`, so a sample is timed from the main thread
-/// releasing `start` to every thread having reached `end`, with nothing of a thread's own startup
-/// or shutdown inside that span.
 fn bench_threads(
     group: &mut BenchmarkGroup<'_, WallTime>,
     id: &str,
     senders: usize,
     receivers: usize,
     cap: Option<usize>,
-) -> Workers {
+) -> Crew {
     let share = receiver_share(senders, receivers);
     group.throughput(Throughput::Elements(senders as u64 * MESSAGES));
 
     let (s, r) = channel(cap);
     warm_up(&s, &r);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    // The senders and the receivers, and the main thread that times them.
-    let start = Arc::new(Barrier::new(senders + receivers + 1));
-    let end = Arc::new(Barrier::new(senders + receivers + 1));
-
-    let mut threads = Vec::with_capacity(senders + receivers);
-    for _ in 0..senders {
+    let sender_rounds = (0..senders).map(|_| {
         let s = s.clone();
-        threads.push(spawn_worker(&stop, &start, &end, move || {
-            block_on(send_n(&s, MESSAGES));
-        }));
-    }
-    for _ in 0..receivers {
-        let r = r.clone();
-        threads.push(spawn_worker(&stop, &start, &end, move || {
-            block_on(recv_n(&r, share));
-        }));
-    }
-
-    group.bench_function(id, |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let started = Instant::now();
-                start.wait();
-                end.wait();
-                total += started.elapsed();
-            }
-
-            total
-        });
+        Box::new(move || block_on(send_n(&s, MESSAGES))) as Round
     });
+    let receiver_rounds = (0..receivers).map(|_| {
+        let r = r.clone();
+        Box::new(move || block_on(recv_n(&r, share))) as Round
+    });
+    let crew = Crew::spawn(sender_rounds.chain(receiver_rounds));
 
-    Workers {
-        stop,
-        start,
-        threads,
-    }
+    group.bench_function(id, |b| b.iter_custom(|iters| crew.time(iters)));
+
+    crew
 }
 
 /// Times rounds of `senders` tasks sending [`MESSAGES`] messages each to `receivers` tasks
@@ -310,51 +275,6 @@ fn warm_up(s: &Sender<u64>, r: &Receiver<u64>) {
         s.send(0).await.unwrap();
         r.recv().await.unwrap();
     });
-}
-
-/// The threads of one id of `bench_threads`, waiting on `start` for a round that never comes.
-struct Workers {
-    stop: Arc<AtomicBool>,
-    start: Arc<Barrier>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl Workers {
-    /// Releases the threads with `stop` set, so that they exit, and joins them.
-    fn join(self) {
-        self.stop.store(true, Ordering::Release);
-        self.start.wait();
-        for thread in self.threads {
-            thread.join().unwrap();
-        }
-    }
-}
-
-/// Spawns a thread that waits on `start`, runs `round`, and waits on `end`, over and over, until
-/// `stop` is set by the time `start` releases it, when it exits instead of running a round.
-fn spawn_worker<F>(
-    stop: &Arc<AtomicBool>,
-    start: &Arc<Barrier>,
-    end: &Arc<Barrier>,
-    mut round: F,
-) -> JoinHandle<()>
-where
-    F: FnMut() + Send + 'static,
-{
-    let stop = stop.clone();
-    let start = start.clone();
-    let end = end.clone();
-
-    thread::spawn(move || {
-        loop {
-            start.wait();
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            round();
-            end.wait();
-        }
-    })
 }
 
 /// How many messages each sender of a threaded or a task id sends in a round.
