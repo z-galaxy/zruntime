@@ -1,4 +1,4 @@
-//! Tests of `zruntime::unblock`, the blocking work it runs on a thread of its own, and the future
+//! Tests of `zruntime::unblock`, the blocking work it hands to a pool of threads, and the future
 //! it hands back.
 //!
 //! The work needs no runtime, so these drive the future with the `block_on` of `futures-lite`, or
@@ -8,6 +8,9 @@
 //! runs on, that the future prints without its value, and, with wakers that show who still holds
 //! them, that a future dropped while the work goes on takes back the waker it left for the thread,
 //! and that the thread has let go of the waker before the future it woke can resolve.
+//!
+//! How the pool shares its threads out among the work handed to it is tested in the `pool`
+//! module, on pools of its own, small enough to fill.
 
 use std::{
     future::Future,
@@ -24,6 +27,9 @@ use ntest::timeout;
 
 use crate::unblock;
 
+mod io;
+mod pool;
+
 /// The future resolves to the value the work returned.
 #[test]
 #[timeout(15000)]
@@ -31,8 +37,8 @@ fn the_work_hands_its_value_back() {
     assert_eq!(block_on(unblock(|| 42)), 42);
 }
 
-/// The thread starts as the work is handed over, not as the future is first polled: the work runs
-/// although nothing has polled the future, and nothing ever does.
+/// The work goes to the pool as it is handed over, not as the future is first polled: the work
+/// runs although nothing has polled the future, and nothing ever does.
 #[test]
 #[timeout(15000)]
 fn the_work_starts_without_the_future_being_polled() {
@@ -57,7 +63,7 @@ fn a_panic_in_the_work_reaches_the_caller() {
     );
 }
 
-/// The work runs on a thread of its own, named for what it does.
+/// The work runs on a thread of the pool, named for what it does.
 #[test]
 #[timeout(15000)]
 fn the_work_runs_on_a_thread_named_for_it() {
@@ -74,8 +80,8 @@ fn a_future_prints_without_its_value() {
 
     let future = unblock(|| NotDebug);
 
-    assert_eq!(format!("{future:?}"), "Unblock { .. }");
-    // Awaited, so that the thread is on its way out by the time the test ends.
+    assert_eq!(format!("{future:?}"), "BlockingWork { .. }");
+    // Awaited, so that the thread is done with the work by the time the test ends.
     block_on(future);
 }
 

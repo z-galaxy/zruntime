@@ -42,9 +42,18 @@ A non-default `lock` feature, which implies `event` and adds no dependency, give
 an async `Mutex` and `RwLock` whose guards may be held across an await, moved here from zbus. They
 are built on `Event`, need no runtime and work under any executor.
 
-A non-default `unblock` feature, which adds no dependency, gives `zruntime::unblock`: a piece of
-blocking work run on a thread of its own, out of the way of the async tasks, and a future of its
-outcome, moved here from zbus. It needs no runtime and works under any executor.
+A non-default `unblock` feature, which adds `futures-io` and `futures-core` dependencies, gives
+`zruntime::unblock`: a piece of blocking work run on a pool of threads kept for it, out of the way
+of the async tasks, and a future of its outcome, moved here from zbus. It also gives
+`zruntime::Unblock`, as smol has `smol::Unblock`: an adapter that gives a blocking I/O handle (a
+file, the standard input, an iterator) `futures-io`'s `AsyncRead`, `AsyncWrite` and `AsyncSeek`
+and `futures-core`'s `Stream` by running each operation on it as such work. Both need no runtime
+and work under any executor.
+
+A non-default `fs` feature, which implies `unblock` and `lock` and adds no dependency of its own,
+gives `zruntime::fs`: async access to the filesystem in the shape of `std::fs`, as smol has in
+`smol::fs` (the async-fs crate), with each operation run as blocking work through `unblock`, and a
+`File` built on `Unblock`. It needs no runtime and works under any executor.
 
 A non-default `tcp` feature, which implies `runtime` and adds `socket2`, `futures-io` and
 `futures-core` dependencies, gives the `zruntime::net` module's TCP sockets, `TcpListener` and
@@ -78,21 +87,23 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Check the runtime, Event, the two channels, the locks, unblock and each family of socket built
-# alone: `--all-features` cannot show that each builds without the others, and leaves out the
-# no-op `error!` in `log.rs` that replaces `tracing`'s
+# Check the runtime, Event, the two channels, the locks, unblock, fs and each family of socket
+# built alone: `--all-features` cannot show that each builds without the others, and leaves out
+# the no-op `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
 cargo check --no-default-features --features mpmc
 cargo check --no-default-features --features lock
 cargo check --no-default-features --features unblock
+cargo check --no-default-features --features fs
 cargo check --no-default-features --features tcp
 cargo check --no-default-features --features udp
 cargo check --no-default-features --features unix
 
 # Run what needs no runtime (Event, the locks, the two channels, unblock) under Miri, as CI does;
-# the runtime polls with `ppoll`, which Miri cannot run
+# the runtime polls with `ppoll`, which Miri cannot run, and fs reaches the filesystem, which
+# Miri's isolation keeps it from
 cargo +nightly miri test --no-default-features --features lock,broadcast,mpmc,unblock
 
 # Run the locks' waiting paths on `wasm32-unknown-unknown`, which has no clock, in Node, as CI
@@ -126,6 +137,9 @@ cargo bench --features broadcast --bench broadcast
 # The MPMC channel's benchmark needs the mpmc feature and the default runtime one: its task ids
 # run on a LocalRuntime
 cargo bench --features mpmc --bench mpmc
+
+# The benchmark of handing work to `unblock` needs the unblock feature and no runtime
+cargo bench --features unblock --bench unblock
 ```
 
 ## Architecture Overview
@@ -143,6 +157,8 @@ src/
 │                 # built on Event, with no use of the runtime
 ├── mpmc.rs       # [mpmc feature] The async multi-producer multi-consumer channel, each
 │                 # message to one receiver, built on Event, with no use of the runtime
+├── fs/           # [fs feature] Async filesystem access, built on unblock and Unblock, with no
+│                 # use of the runtime
 ├── lock/         # [lock feature] Mutex and RwLock, built on Event, with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
@@ -154,13 +170,13 @@ src/
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
-├── unblock.rs    # [unblock feature] Blocking work on a thread of its own, with no use of the
-│                 # runtime
+├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
+│                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
                   # broadcast.rs: the broadcast channel, broadcast feature; mpmc.rs: the MPMC
                   # channel, mpmc feature; lock.rs: the locks, lock feature; helper.rs: helper
-                  # feature; unblock.rs: unblock, unblock feature; net/: the sockets, each
-                  # family under its own feature
+                  # feature; unblock/: unblock, its pool and Unblock, unblock feature; fs.rs: fs,
+                  # fs feature; net/: the sockets, each family under its own feature
 ```
 
 ### Key Design Patterns
@@ -215,10 +231,10 @@ it. No socket is `Clone`.
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
-  into the runtime; nor may `unblock`, which needs neither. `tcp`, `udp` and `unix` imply
-  `runtime`, and `unix` builds nothing on Windows. CI builds and tests everything with every
-  feature on, and checks `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `tcp`, `udp`
-  and `unix` each alone.
+  into the runtime; nor may `unblock`, which needs neither, or `fs`, which implies `unblock` and
+  `lock`. `tcp`, `udp` and `unix` imply `runtime`, and `unix` builds nothing on Windows. CI builds
+  and tests everything with every feature on, and checks `runtime`, `event`, `broadcast`, `mpmc`,
+  `lock`, `unblock`, `fs`, `tcp`, `udp` and `unix` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
@@ -238,7 +254,11 @@ it. No socket is `Clone`.
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
-- `src/unblock.rs`: [unblock feature] `unblock`, blocking work on a thread of its own
+- `src/unblock/`: [unblock feature] `unblock`, blocking work on a pool of threads (`pool.rs`), and
+  `Unblock`, the async adapter of a blocking I/O handle built on it (`io.rs`)
+- `src/fs/`: [fs feature] Async filesystem access: the free functions (`mod.rs`), `File` on
+  `Unblock` (`file.rs`), `ReadDir`/`DirEntry`/`DirBuilder` (`dir.rs`), `OpenOptions`
+  (`options.rs`), and the platform extension traits (`unix.rs`, `windows.rs`)
 - `src/net/io.rs`: [tcp, udp, unix features] `Io<T, M>`, the socket and registration every
   socket is built on
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one
