@@ -22,13 +22,16 @@
 //! nobody listening.
 //!
 //! `wake-one` times notifying one listener and polling it once to `Ready`: the end of a wait,
-//! from being told it is over to finding so, without its start, which `listen` times. The listeners
-//! are taken a batch at a time before the batch is timed, and each notification reaches the oldest
-//! of them, which is the one polled next.
+//! from being told it is over to finding so, without its start, which `listen` times.
 //!
-//! `wake-all/100` times waking a hundred listeners, taken before the timing starts, with one
-//! `notify(usize::MAX)` and polling each to `Ready`: a broadcast to every listener an event has,
-//! such as a connection announcing that it has closed.
+//! `wake-all/100` times waking a hundred listeners with one `notify(usize::MAX)` and polling each
+//! to `Ready`: a broadcast to every listener an event has, such as a connection announcing that it
+//! has closed.
+//!
+//! Each iteration of `wake-one` and `wake-all/100` notifies an event of its own, made and listened
+//! to before the timing starts. The listeners it polls are then the only ones its notification can
+//! reach, however many iterations a harness sets up before it runs them: CodSpeed's CPU simulation
+//! sets up two for the one it measures.
 //!
 //! `mutex/4-threads` times zruntime's own `lock::Mutex` — built on an `Event`, which a release
 //! notifies once, to wake one waiter — taken and released 1000 times by each of four threads at
@@ -92,43 +95,45 @@ fn event_benches(c: &mut Criterion) {
         b.iter(|| drop(black_box(uncontended.try_lock())));
     });
 
-    let wake_one = Event::new();
     group.bench_function("wake-one", |b| {
-        // A batch's listeners are all taken before it is timed, and each notification reaches the
-        // oldest of them still waiting: the one the same iteration polls. Each is handed back to be
-        // dropped once the batch has been timed.
+        // The event and its listener are handed back, to be dropped once the batch has been timed.
         b.iter_batched(
-            || wake_one.listen(),
-            |mut listener| {
-                assert_eq!(wake_one.notify(1), 1);
-                assert!(poll_once(&mut listener).is_ready());
+            || listened_to(1),
+            |(event, mut listeners)| {
+                assert_eq!(event.notify(1), 1);
+                assert!(poll_once(&mut listeners[0]).is_ready());
 
-                listener
+                (event, listeners)
             },
             BatchSize::NumIterations(LISTENERS_PER_BATCH),
         );
     });
 
     group.throughput(Throughput::Elements(100));
-    let wake_all = Event::new();
     group.bench_function("wake-all/100", |b| {
         b.iter_batched(
-            || (0..100).map(|_| wake_all.listen()).collect::<Vec<_>>(),
-            |mut listeners| {
-                assert_eq!(wake_all.notify(usize::MAX), 100);
+            || listened_to(100),
+            |(event, mut listeners)| {
+                assert_eq!(event.notify(usize::MAX), 100);
                 for listener in &mut listeners {
                     assert!(poll_once(listener).is_ready());
                 }
 
-                listeners
+                (event, listeners)
             },
-            // One iteration a batch: a notification to every listener there is would reach the
-            // listeners taken for the next iterations as well.
-            BatchSize::PerIteration,
+            BatchSize::SmallInput,
         );
     });
 
     group.finish();
+}
+
+/// A new event, and `count` listeners taken on it, the oldest first.
+fn listened_to(count: usize) -> (Event, Vec<EventListener>) {
+    let event = Event::new();
+    let listeners = (0..count).map(|_| event.listen()).collect();
+
+    (event, listeners)
 }
 
 /// Polls `listener` once, with a waker that goes nowhere, and hands back what the poll found.
@@ -136,8 +141,9 @@ fn poll_once(listener: &mut EventListener) -> Poll<()> {
     Pin::new(listener).poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// How many listeners `listen` and `wake-one` take for each timed batch: few enough to keep the
-/// event's queue short, and enough that reading the clock once a batch costs little next to them.
+/// How many iterations of `listen` and `wake-one` each timed batch runs: few enough to keep the
+/// queue of the event `listen` takes its listeners on short, and enough that reading the clock once
+/// a batch costs little next to them.
 const LISTENERS_PER_BATCH: u64 = 64;
 
 /// How many threads contend for the lock in `mutex/4-threads`.
