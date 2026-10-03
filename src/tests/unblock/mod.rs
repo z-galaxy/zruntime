@@ -27,6 +27,7 @@ use ntest::timeout;
 
 use crate::unblock;
 
+mod io;
 mod pool;
 
 /// The future resolves to the value the work returned.

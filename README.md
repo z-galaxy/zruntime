@@ -127,7 +127,9 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 * `lock`: the [`lock`] module, an async `Mutex` and `RwLock`, whose guards a task may hold across
   an await, built on [`Event`]; it implies `event`, and needs no runtime either.
 * `unblock`: [`unblock`], which runs a piece of blocking work on a pool of threads kept for it
-  and hands back a future of its outcome; it needs no runtime either.
+  and hands back a future of its outcome, and [`Unblock`], an adapter that gives a blocking I/O
+  handle, such as a file or the standard input, the async I/O traits of `futures-io` that way; it
+  needs no runtime either, and brings the `futures-io` and `futures-core` crates.
 * `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
   and brings the `socket2`, `futures-io` and `futures-core` crates.
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
@@ -162,6 +164,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`mpmc`]: https://docs.rs/zruntime/latest/zruntime/mpmc/index.html
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
 [`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
+[`Unblock`]: https://docs.rs/zruntime/latest/zruntime/struct.Unblock.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus

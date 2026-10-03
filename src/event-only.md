@@ -26,7 +26,9 @@ it last, and an event may be notified from any thread.
 * `lock`: the `lock` module, an async `Mutex` and `RwLock`, whose guards a task may hold across an
   await, built on [`Event`]; it implies `event`.
 * `unblock`: `unblock`, which runs a piece of blocking work on a pool of threads kept for it and
-  hands back a future of its outcome; it needs no runtime.
+  hands back a future of its outcome, and `Unblock`, an adapter that gives a blocking I/O handle
+  the async I/O traits of `futures-io` that way; it needs no runtime, and brings the `futures-io`
+  and `futures-core` crates.
 * `tcp`: the `net` module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
   and brings the `socket2`, `futures-io` and `futures-core` crates.
 * `udp`: the `net` module's `UdpSocket`; it implies `runtime`.
