@@ -29,6 +29,8 @@ it last, and an event may be notified from any thread.
   hands back a future of its outcome, and `Unblock`, an adapter that gives a blocking I/O handle
   the async I/O traits of `futures-io` that way; it needs no runtime, and brings the `futures-io`
   and `futures-core` crates.
+* `fs`: the `fs` module, async access to the filesystem, with each operation run as blocking work
+  on `unblock`'s pool; it implies `unblock` and `lock`, and needs no runtime.
 * `tcp`: the `net` module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
   and brings the `socket2`, `futures-io` and `futures-core` crates.
 * `udp`: the `net` module's `UdpSocket`; it implies `runtime`.

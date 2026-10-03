@@ -19,6 +19,8 @@ pub mod broadcast;
 mod driver;
 #[cfg(feature = "event")]
 mod event;
+#[cfg(feature = "fs")]
+pub mod fs;
 #[cfg(feature = "lock")]
 pub mod lock;
 #[cfg(feature = "runtime")]
