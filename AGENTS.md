@@ -145,6 +145,11 @@ cargo bench --features mpmc,lock --bench contention
 cargo bench --features unblock --bench unblock
 ```
 
+On CodSpeed, `.github/workflows/bench.yml` measures each bench target in one of two jobs: by CPU
+simulation, on a GitHub-hosted runner, the targets that run on one thread and wait on no timer or
+socket; by the clock, on a CodSpeed macro runner, those that wait on timers, sockets or other
+threads. A target holds benchmarks of one kind only, and a new one goes in the list of its job.
+
 ## Architecture Overview
 
 ```
