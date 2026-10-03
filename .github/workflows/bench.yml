@@ -41,10 +41,10 @@ jobs:
           bins: cargo-codspeed
       # The benchmarks measure the helper layer (`block_on` per operation, the runtime of
       # `SharedRuntime::current`), which is behind the `helper` feature; the `broadcast` and `mpmc`
-      # features build the two channel benchmarks too, and the `lock` feature the event and
-      # connection ones, which use the locks.
+      # features build the two channel benchmarks too, the `lock` feature the event and connection
+      # ones, which use the locks, and the `unblock` feature the one of blocking work.
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -m walltime --features helper,broadcast,lock,mpmc
+        run: cargo codspeed build -m walltime --features helper,broadcast,lock,mpmc,unblock
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
         with:
