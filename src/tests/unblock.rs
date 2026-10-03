@@ -74,7 +74,7 @@ fn a_future_prints_without_its_value() {
 
     let future = unblock(|| NotDebug);
 
-    assert_eq!(format!("{future:?}"), "Unblock { .. }");
+    assert_eq!(format!("{future:?}"), "BlockingWork { .. }");
     // Awaited, so that the thread is on its way out by the time the test ends.
     block_on(future);
 }

@@ -470,7 +470,7 @@ struct ChannelEndsAreSendAndSyncWhereTheirMessagesAreSend;
 /// {
 /// }
 ///
-/// sent::<zruntime::Unblock<Rc<()>>>();
+/// sent::<zruntime::BlockingWork<Rc<()>>>();
 /// ```
 ///
 /// ...while one that resolves to a value that may be sent is `Send` and `Sync` both, even where
@@ -486,11 +486,11 @@ struct ChannelEndsAreSendAndSyncWhereTheirMessagesAreSend;
 /// {
 /// }
 ///
-/// sent_and_shared::<zruntime::Unblock<u32>>();
-/// sent_and_shared::<zruntime::Unblock<Cell<u32>>>();
+/// sent_and_shared::<zruntime::BlockingWork<u32>>();
+/// sent_and_shared::<zruntime::BlockingWork<Cell<u32>>>();
 /// ```
 #[cfg(all(doctest, feature = "unblock"))]
-struct UnblockIsSendAndSyncWhereItsOutcomeIsSend;
+struct BlockingWorkIsSendAndSyncWhereItsOutcomeIsSend;
 
 /// A local runtime's sockets stay on its thread, as everything built on it does: a stream is not
 /// `Send`...

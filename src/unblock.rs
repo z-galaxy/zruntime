@@ -65,7 +65,7 @@ use std::{
 ///
 /// assert_eq!(block_on(answer), 42);
 /// ```
-pub fn unblock<T>(work: impl FnOnce() -> T + Send + 'static) -> Unblock<T>
+pub fn unblock<T>(work: impl FnOnce() -> T + Send + 'static) -> BlockingWork<T>
 where
     T: Send + 'static,
 {
@@ -87,7 +87,7 @@ where
         })
         .expect("failed to spawn a thread for blocking work");
 
-    Unblock(state)
+    BlockingWork(state)
 }
 
 /// The future of the work that [`unblock()`] runs on a thread of its own: it resolves to the value
@@ -100,9 +100,9 @@ where
 /// its end all the same. While it does, it holds nothing of the task that waited, or of the
 /// executor that ran it, so neither is kept alive by the work. Once the future has resolved, the
 /// thread holds nothing of theirs either.
-pub struct Unblock<T>(Arc<Mutex<State<T>>>);
+pub struct BlockingWork<T>(Arc<Mutex<State<T>>>);
 
-impl<T> Future for Unblock<T> {
+impl<T> Future for BlockingWork<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
@@ -133,7 +133,7 @@ impl<T> Future for Unblock<T> {
     }
 }
 
-impl<T> Drop for Unblock<T> {
+impl<T> Drop for BlockingWork<T> {
     fn drop(&mut self) {
         // Besides this future, only the thread takes the lock, and only once the work is over: to
         // store the outcome, and then in `Finish`, which takes the waker out and wakes it. So a
@@ -153,9 +153,9 @@ impl<T> Drop for Unblock<T> {
     }
 }
 
-impl<T> fmt::Debug for Unblock<T> {
+impl<T> fmt::Debug for BlockingWork<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Unblock").finish_non_exhaustive()
+        f.debug_struct("BlockingWork").finish_non_exhaustive()
     }
 }
 
@@ -180,7 +180,7 @@ type Outcome<T> = Result<T, Box<dyn Any + Send>>;
 /// Wakes whoever is waiting for the outcome as the thread leaves, before letting go of the lock
 /// the waiting side has to take to see that outcome.
 ///
-/// While this drop holds [`State`]'s lock, [`Unblock`] cannot take it and so cannot see the
+/// While this drop holds [`State`]'s lock, [`BlockingWork`] cannot take it and so cannot see the
 /// outcome stored under it; by the time it can, the waker this drop took out has been woken and,
 /// with nothing else left holding it, dropped. A poll that reaches the lock first, in the gap
 /// between the outcome being stored and this drop running, takes the waker itself instead,
@@ -191,7 +191,7 @@ type Outcome<T> = Result<T, Box<dyn Any + Send>>;
 /// Waking while still holding the lock cannot deadlock here: the lock is private to this
 /// hand-over, reachable from nowhere but the closure above and the future it wakes. A `wake` that
 /// drops that future, as an executor may with a task it can no longer run, finds the lock taken
-/// and leaves it be, the waker having been taken out already: see [`Unblock`]'s drop.
+/// and leaves it be, the waker having been taken out already: see [`BlockingWork`]'s drop.
 struct Finish<'a, T>(&'a Mutex<State<T>>);
 
 impl<T> Drop for Finish<'_, T> {
