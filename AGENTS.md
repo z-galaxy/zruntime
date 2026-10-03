@@ -126,7 +126,7 @@ cargo doc --all-features
 
 ### Benchmarks
 ```bash
-# Run benchmarks (the runtime and connection ones need the helper feature: they measure the
+# Run benchmarks (the runtime, spawn and connection ones need the helper feature: they measure the
 # block_on-per-operation case; the event and connection ones need the lock feature, which implies
 # Event)
 cargo bench --features helper,lock
@@ -138,9 +138,17 @@ cargo bench --features broadcast --bench broadcast
 # run on a LocalRuntime
 cargo bench --features mpmc --bench mpmc
 
+# The channel and the mutex between contending threads need the mpmc and lock features
+cargo bench --features mpmc,lock --bench contention
+
 # The benchmark of handing work to `unblock` needs the unblock feature and no runtime
 cargo bench --features unblock --bench unblock
 ```
+
+On CodSpeed, `.github/workflows/bench.yml` measures each bench target in one of two jobs: by CPU
+simulation, on a GitHub-hosted runner, the targets that run on one thread and wait on no timer or
+socket; by the clock, on a CodSpeed macro runner, those that wait on timers, sockets or other
+threads. A target holds benchmarks of one kind only, and a new one goes in the list of its job.
 
 ## Architecture Overview
 

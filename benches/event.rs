@@ -1,9 +1,9 @@
 //! What `Event`'s listen and notify paths cost: taking a listener, alone and dropped at once,
 //! sending a notification to nobody, waking one listener and a hundred taken beforehand, and
-//! `lock::Mutex`, built on an event, taken by one thread alone and under four contending threads.
-//! `Event` needs no runtime, so no id here goes through `zruntime::block_on`: the single-threaded
-//! ones poll listeners by hand or take the mutex with `try_lock`, and `mutex/4-threads` blocks on
-//! each `lock` with futures-lite's `block_on`.
+//! `lock::Mutex`, built on an event, taken by one thread alone. `Event` needs no runtime, so no id
+//! here goes through `zruntime::block_on`: they poll listeners by hand or take the mutex with
+//! `try_lock`, all on one thread. `mutex/4-threads`, the mutex taken by four contending threads,
+//! is in `contention.rs`, as only the clock can measure it.
 //!
 //! `listen` times taking a listener, alone, on an event whose shared state is already allocated:
 //! what every wait starts with. The listeners are taken a batch at a time and dropped once the
@@ -22,32 +22,22 @@
 //! nobody listening.
 //!
 //! `wake-one` times notifying one listener and polling it once to `Ready`: the end of a wait,
-//! from being told it is over to finding so, without its start, which `listen` times. The listeners
-//! are taken a batch at a time before the batch is timed, and each notification reaches the oldest
-//! of them, which is the one polled next.
+//! from being told it is over to finding so, without its start, which `listen` times.
 //!
-//! `wake-all/100` times waking a hundred listeners, taken before the timing starts, with one
-//! `notify(usize::MAX)` and polling each to `Ready`: a broadcast to every listener an event has,
-//! such as a connection announcing that it has closed.
+//! `wake-all/100` times waking a hundred listeners with one `notify(usize::MAX)` and polling each
+//! to `Ready`: a broadcast to every listener an event has, such as a connection announcing that it
+//! has closed.
 //!
-//! `mutex/4-threads` times zruntime's own `lock::Mutex` — built on an `Event`, which a release
-//! notifies once, to wake one waiter — taken and released 1000 times by each of four threads at
-//! once, a contended lock under real cross-thread wakes. The four threads are spawned once,
-//! before the group starts, and kept alive for every sample: a pair of barriers starts a round of
-//! 1000 lock/unlock each and waits for it to end, and only the time between the two is measured,
-//! so spawning and joining the threads is never counted as the lock's cost.
+//! Each iteration of `wake-one` and `wake-all/100` notifies an event of its own, made and listened
+//! to before the timing starts. The listeners it polls are then the only ones its notification can
+//! reach, however many iterations a harness sets up before it runs them: CodSpeed's CPU simulation
+//! sets up two for the one it measures.
 
 use std::{
     future::Future,
     hint::black_box,
     pin::Pin,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
-    },
     task::{Context, Poll, Waker},
-    thread,
-    time::{Duration, Instant},
 };
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -88,43 +78,45 @@ fn event_benches(c: &mut Criterion) {
         b.iter(|| drop(black_box(uncontended.try_lock())));
     });
 
-    let wake_one = Event::new();
     group.bench_function("wake-one", |b| {
-        // A batch's listeners are all taken before it is timed, and each notification reaches the
-        // oldest of them still waiting: the one the same iteration polls. Each is handed back to be
-        // dropped once the batch has been timed.
+        // The event and its listener are handed back, to be dropped once the batch has been timed.
         b.iter_batched(
-            || wake_one.listen(),
-            |mut listener| {
-                assert_eq!(wake_one.notify(1), 1);
-                assert!(poll_once(&mut listener).is_ready());
+            || listened_to(1),
+            |(event, mut listeners)| {
+                assert_eq!(event.notify(1), 1);
+                assert!(poll_once(&mut listeners[0]).is_ready());
 
-                listener
+                (event, listeners)
             },
             BatchSize::NumIterations(LISTENERS_PER_BATCH),
         );
     });
 
     group.throughput(Throughput::Elements(100));
-    let wake_all = Event::new();
     group.bench_function("wake-all/100", |b| {
         b.iter_batched(
-            || (0..100).map(|_| wake_all.listen()).collect::<Vec<_>>(),
-            |mut listeners| {
-                assert_eq!(wake_all.notify(usize::MAX), 100);
+            || listened_to(100),
+            |(event, mut listeners)| {
+                assert_eq!(event.notify(usize::MAX), 100);
                 for listener in &mut listeners {
                     assert!(poll_once(listener).is_ready());
                 }
 
-                listeners
+                (event, listeners)
             },
-            // One iteration a batch: a notification to every listener there is would reach the
-            // listeners taken for the next iterations as well.
-            BatchSize::PerIteration,
+            BatchSize::SmallInput,
         );
     });
 
     group.finish();
+}
+
+/// A new event, and `count` listeners taken on it, the oldest first.
+fn listened_to(count: usize) -> (Event, Vec<EventListener>) {
+    let event = Event::new();
+    let listeners = (0..count).map(|_| event.listen()).collect();
+
+    (event, listeners)
 }
 
 /// Polls `listener` once, with a waker that goes nowhere, and hands back what the poll found.
@@ -132,73 +124,10 @@ fn poll_once(listener: &mut EventListener) -> Poll<()> {
     Pin::new(listener).poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// How many listeners `listen` and `wake-one` take for each timed batch: few enough to keep the
-/// event's queue short, and enough that reading the clock once a batch costs little next to them.
+/// How many iterations of `listen` and `wake-one` each timed batch runs: few enough to keep the
+/// queue of the event `listen` takes its listeners on short, and enough that reading the clock once
+/// a batch costs little next to them.
 const LISTENERS_PER_BATCH: u64 = 64;
 
-/// How many threads contend for the lock in `mutex/4-threads`.
-const MUTEX_THREADS: usize = 4;
-/// How many lock/unlock rounds each thread runs per timed sample of `mutex/4-threads`.
-const MUTEX_ROUNDS: usize = 1000;
-
-/// Times `lock::Mutex`, which is built on an event, taken and released [`MUTEX_ROUNDS`] times by
-/// each of [`MUTEX_THREADS`] threads at once.
-///
-/// The threads are spawned once, before the benchmark starts, and stay for every sample: each
-/// waits on `start`, runs its rounds, and waits on `end`, so a sample is timed from the main
-/// thread releasing `start` to every thread having reached `end`, with nothing of a thread's own
-/// startup or shutdown inside that span.
-fn mutex_bench(c: &mut Criterion) {
-    let lock = Arc::new(Mutex::new(()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let start = Arc::new(Barrier::new(MUTEX_THREADS + 1));
-    let end = Arc::new(Barrier::new(MUTEX_THREADS + 1));
-    let threads: Vec<_> = (0..MUTEX_THREADS)
-        .map(|_| {
-            let lock = lock.clone();
-            let stop = stop.clone();
-            let start = start.clone();
-            let end = end.clone();
-            thread::spawn(move || {
-                loop {
-                    start.wait();
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    for _ in 0..MUTEX_ROUNDS {
-                        // The guard is dropped at once: the mutex is taken and released.
-                        drop(futures_lite::future::block_on(lock.lock()));
-                    }
-                    end.wait();
-                }
-            })
-        })
-        .collect();
-
-    let mut group = c.benchmark_group("event");
-    group.sample_size(10);
-    group.throughput(Throughput::Elements((MUTEX_THREADS * MUTEX_ROUNDS) as u64));
-    group.bench_function("mutex/4-threads", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let started = Instant::now();
-                start.wait();
-                end.wait();
-                total += started.elapsed();
-            }
-
-            total
-        });
-    });
-    group.finish();
-
-    stop.store(true, Ordering::Release);
-    start.wait();
-    for thread in threads {
-        thread.join().unwrap();
-    }
-}
-
-criterion_group!(benches, event_benches, mutex_bench);
+criterion_group!(benches, event_benches);
 criterion_main!(benches);
