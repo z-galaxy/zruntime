@@ -30,10 +30,10 @@ jobs:
           cargo --locked check --all-features --target aarch64-linux-android
       # The features only add code, so the jobs build with all of them. That covers all of it but
       # the no-op `error!` that `log.rs` builds in place of `tracing`'s where that feature is off,
-      # and cannot show that `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `tcp`,
-      # `udp` and `unix` each build without the others: checking each alone covers them, and
+      # and cannot show that `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `fs`,
+      # `tcp`, `udp` and `unix` each build without the others: checking each alone covers them, and
       # `unix`, which builds nothing on Windows, is checked to build nothing there with no warning.
-      - name: Check build with runtime, event, broadcast, mpmc, lock, unblock, tcp, udp, unix alone
+      - name: Check build with each feature alone
         run: |
           cargo --locked check --no-default-features --features runtime
           cargo --locked check --no-default-features --features event
@@ -41,6 +41,7 @@ jobs:
           cargo --locked check --no-default-features --features mpmc
           cargo --locked check --no-default-features --features lock
           cargo --locked check --no-default-features --features unblock
+          cargo --locked check --no-default-features --features fs
           cargo --locked check --no-default-features --features tcp
           cargo --locked check --no-default-features --features udp
           cargo --locked check --no-default-features --features unix
@@ -117,7 +118,8 @@ jobs:
 
   # Miri checks the lock module's `unsafe` code, and the concurrency of everything that needs no
   # runtime: Event, the locks, the two channels and unblock, doc tests included. The runtime
-  # itself polls with `ppoll`, which Miri cannot run, so its tests are left out.
+  # itself polls with `ppoll`, which Miri cannot run, and `fs` reaches the filesystem, which Miri's
+  # isolation keeps it from, so their tests are left out.
   miri:
     runs-on: ubuntu-latest
     needs: [fmt, clippy]

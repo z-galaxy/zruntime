@@ -37,9 +37,12 @@ broadcast = ["event", "dep:futures-core"]
 mpmc = ["event", "dep:futures-core"]
 # The `lock` module: an async mutex and readers-writer lock, which need no runtime.
 lock = ["event"]
-# `unblock`: blocking work run on a thread of its own, out of the way of the async tasks; needs no
-# runtime.
-unblock = []
+# `unblock`: blocking work run on a pool of threads, out of the way of the async tasks, and
+# `Unblock`, which gives a blocking I/O handle the async I/O traits through it; needs no runtime.
+unblock = ["dep:futures-io", "dep:futures-core"]
+# The `fs` module: async access to the filesystem, as blocking work on `unblock`'s pool of threads;
+# needs no runtime.
+fs = ["unblock", "lock"]
 # The `net` module's TCP sockets: `TcpListener` and `TcpStream`.
 tcp = ["runtime", "dep:socket2", "dep:futures-io", "dep:futures-core", "rustix?/net"]
 # The `net` module's UDP socket: `UdpSocket`.
@@ -109,3 +112,8 @@ required-features = ["broadcast"]
 name = "mpmc"
 harness = false
 required-features = ["mpmc", "runtime"]
+
+[[bench]]
+name = "unblock"
+harness = false
+required-features = ["unblock"]

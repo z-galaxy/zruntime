@@ -1,6 +1,6 @@
 //! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast and MPMC
-//! channels and the locks built on that event, of blocking work run on a thread of its own, and of
-//! the sockets a runtime watches.
+//! channels and the locks built on that event, of blocking work run on a pool of threads and the
+//! filesystem access built on it, and of the sockets a runtime watches.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
 //! the `core` module, in both flavours wherever the test means the same in each. An event and its
@@ -8,12 +8,13 @@
 //! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future
 //! that could not follow it to another, a lock or a channel handing its value or its messages to a
 //! thread that could not own them, the future of blocking work doing the same with the value it
-//! resolves to — can only be shown by code that does not compile, so it is shown here, by the doc
-//! tests of the items below. The broadcast channel, the MPMC channel and the locks, built on the
-//! event, are tested in the `broadcast`, `mpmc` and `lock` modules. Blocking work, which needs
-//! neither the runtime nor the event, is tested in the `unblock` module. The sockets of the `net`
-//! module are tested in the `net` module, one family of them to a module there, in both flavours
-//! wherever the test means the same in each.
+//! resolves to, and an adapter of a blocking handle with its handle — can only be shown by code
+//! that does not compile, so it is shown here, by the doc tests of the items below. The broadcast
+//! channel, the MPMC channel and the locks, built on the event, are tested in the `broadcast`,
+//! `mpmc` and `lock` modules. Blocking work, which needs neither the runtime nor the event, is
+//! tested in the `unblock` module, and the filesystem access of the `fs` module, built on it, in
+//! the `fs` module. The sockets of the `net` module are tested in the `net` module, one family of
+//! them to a module there, in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -26,6 +27,8 @@ mod broadcast;
 mod core;
 #[cfg(all(test, feature = "event"))]
 mod event;
+#[cfg(all(test, feature = "fs"))]
+mod fs;
 #[cfg(all(test, feature = "helper"))]
 mod helper;
 #[cfg(all(test, feature = "lock"))]
@@ -470,7 +473,7 @@ struct ChannelEndsAreSendAndSyncWhereTheirMessagesAreSend;
 /// {
 /// }
 ///
-/// sent::<zruntime::Unblock<Rc<()>>>();
+/// sent::<zruntime::BlockingWork<Rc<()>>>();
 /// ```
 ///
 /// ...while one that resolves to a value that may be sent is `Send` and `Sync` both, even where
@@ -486,11 +489,129 @@ struct ChannelEndsAreSendAndSyncWhereTheirMessagesAreSend;
 /// {
 /// }
 ///
-/// sent_and_shared::<zruntime::Unblock<u32>>();
-/// sent_and_shared::<zruntime::Unblock<Cell<u32>>>();
+/// sent_and_shared::<zruntime::BlockingWork<u32>>();
+/// sent_and_shared::<zruntime::BlockingWork<Cell<u32>>>();
 /// ```
 #[cfg(all(doctest, feature = "unblock"))]
-struct UnblockIsSendAndSyncWhereItsOutcomeIsSend;
+struct BlockingWorkIsSendAndSyncWhereItsOutcomeIsSend;
+
+/// An adapter hands its handle to blocking work on another thread for each operation on it, so it
+/// may be sent to another thread only where the handle may be: an adapter of an `Rc`, which cannot
+/// be sent, is not `Send`...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Unblock<Rc<()>>>();
+/// ```
+///
+/// ...nor `Sync`, since sharing it would share the `Rc` with the threads of that work...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::Unblock<Rc<()>>>();
+/// ```
+///
+/// ...while one of a handle that may be sent is `Send` and `Sync` both, even where the handle is
+/// not `Sync` itself, as a boxed reader is not: nothing of the handle is reachable through a shared
+/// reference to the adapter. The futures of its methods are `Send` there as well, as a task that
+/// awaits one needs them to be, and the adapter is `Unpin` whatever the handle is. Which says the
+/// checks above fail for the reason they were written for and no other.
+///
+/// ```
+/// use std::{cell::Cell, io::Read, marker::PhantomPinned};
+///
+/// use zruntime::Unblock;
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// fn sent_future<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// fn unpinned<T>()
+/// where
+///     T: Unpin,
+/// {
+/// }
+///
+/// sent_and_shared::<Unblock<Box<dyn Read + Send>>>();
+/// sent_and_shared::<Unblock<Cell<u8>>>();
+/// unpinned::<Unblock<PhantomPinned>>();
+///
+/// let mut reader = Unblock::new(Cell::new(0u8));
+/// sent_future(reader.get_mut());
+/// sent_future(reader.with_mut(|cell| cell.get()));
+/// sent_future(reader.into_inner());
+/// ```
+#[cfg(all(doctest, feature = "unblock"))]
+struct UnblockIsSendAndSyncWhereItsHandleIsSend;
+
+/// What the `fs` module hands out may be sent to another thread and shared with one, and so may
+/// the futures of its operations, which is what a task that awaits them on a shared runtime, or
+/// under any executor whose tasks move between threads, needs of them. That includes the futures
+/// of a file's methods that wait for its writes in flight, which hold the guard of the file's lock
+/// across that wait.
+///
+/// ```
+/// use std::path::Path;
+///
+/// use zruntime::fs::{self, DirBuilder, DirEntry, File, OpenOptions, ReadDir};
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// fn sent_future<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// fn futures_of(file: &File, path: &Path) {
+///     sent_future(File::open(path));
+///     sent_future(File::create(path));
+///     sent_future(file.sync_all());
+///     sent_future(file.sync_data());
+///     sent_future(file.set_len(0));
+///     sent_future(file.metadata());
+///     sent_future(OpenOptions::new().read(true).open(path));
+///     sent_future(DirBuilder::new().create(path));
+///     sent_future(fs::read(path));
+///     sent_future(fs::read_dir(path));
+///     sent_future(fs::write(path, b"bytes"));
+///     sent_future(fs::remove_dir_all(path));
+/// }
+///
+/// sent_and_shared::<File>();
+/// sent_and_shared::<ReadDir>();
+/// sent_and_shared::<DirEntry>();
+/// sent_and_shared::<OpenOptions>();
+/// sent_and_shared::<DirBuilder>();
+/// ```
+#[cfg(all(doctest, feature = "fs"))]
+struct FsTypesAndFuturesAreSendAndSync;
 
 /// A local runtime's sockets stay on its thread, as everything built on it does: a stream is not
 /// `Send`...
