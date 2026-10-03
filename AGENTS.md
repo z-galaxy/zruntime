@@ -126,6 +126,9 @@ cargo bench --features broadcast --bench broadcast
 # The MPMC channel's benchmark needs the mpmc feature and the default runtime one: its task ids
 # run on a LocalRuntime
 cargo bench --features mpmc --bench mpmc
+
+# The benchmark of handing work to `unblock` needs the unblock feature and no runtime
+cargo bench --features unblock --bench unblock
 ```
 
 ## Architecture Overview

@@ -109,3 +109,8 @@ required-features = ["broadcast"]
 name = "mpmc"
 harness = false
 required-features = ["mpmc", "runtime"]
+
+[[bench]]
+name = "unblock"
+harness = false
+required-features = ["unblock"]
