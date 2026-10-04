@@ -220,7 +220,7 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 `Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
-completion unobserved.
+completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
 
 **Sockets (the `net` features)**: every socket is an `Io<T, M>`: the std socket, non-blocking, in
 the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed

@@ -477,6 +477,17 @@ where
 
         Poll::Pending
     }
+
+    /// Whether the task has ended, told without polling it or taking its output.
+    ///
+    /// For a handle that is still here, neither detached nor dropped, the outcome is settled by
+    /// the task alone: by its wrapper, once the future has completed or panicked and been dropped,
+    /// and by the guard the wrapper holds, which goes after the future where the runtime goes
+    /// with the task. Either way, a settled outcome means the future, and everything it held, is
+    /// gone. It stays settled once the output has been taken.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join.state.lock().done
+    }
 }
 
 impl<T, M> Drop for JoinHandle<T, M>

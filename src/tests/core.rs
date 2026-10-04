@@ -203,6 +203,94 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A task is finished once its future has completed, whether or not anyone has awaited it
+    /// yet, and stays so once its output is taken; one that is left waiting is not.
+    fn a_task_is_finished_once_its_future_has_completed<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut completing = M::spawn(&runtime, "a task that finishes at once", async { 42 });
+        let waiting = M::spawn(&runtime, "a task that never finishes", pending::<()>());
+        // Neither has had its first poll.
+        assert!(!completing.is_finished());
+        assert!(!waiting.is_finished());
+
+        // A yield is one round of the loop, in which each task is polled once.
+        runtime.block_on(yield_now());
+
+        assert!(completing.is_finished());
+        assert!(!waiting.is_finished());
+        assert_eq!(runtime.block_on(&mut completing).unwrap(), 42);
+        assert!(completing.is_finished());
+    }
+}
+
+in_both_modes! {
+    /// A task that panics is finished, as one that completes is, and its handle reports the
+    /// failure all the same.
+    fn a_panicking_task_is_finished<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let panicking = M::spawn(&runtime, "a task that panics", async {
+            panic!("the task panicked on purpose");
+        });
+        assert!(!panicking.is_finished());
+
+        runtime.block_on(yield_now());
+
+        assert!(panicking.is_finished());
+        assert!(runtime.block_on(panicking).is_err());
+    }
+}
+
+in_both_modes! {
+    /// A task whose runtime goes before it ends is finished, whether it was polled before the
+    /// runtime went or never was.
+    fn a_task_is_finished_once_its_runtime_is_gone<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let polled = M::spawn(&runtime, "a task that never finishes", pending::<()>());
+        runtime.block_on(yield_now());
+        let never_polled = M::spawn(&runtime, "a task that is never polled", pending::<()>());
+        assert!(!polled.is_finished());
+        assert!(!never_polled.is_finished());
+
+        drop(runtime);
+
+        assert!(polled.is_finished());
+        assert!(never_polled.is_finished());
+    }
+}
+
+/// A task is not finished while its future is still being dropped, whether it ran to its end or
+/// went with its runtime, polled before that or not: what the future held is gone by the time
+/// anyone is told that the task is over.
+#[test]
+#[timeout(15000)]
+fn a_local_task_is_finished_only_once_its_future_is_dropped() {
+    for end in End::ALL {
+        let noted =
+            finished_as_future_drops(LocalRuntime::new().unwrap(), end, |runtime, future| {
+                runtime.spawn("a task that notes whether it is finished", future)
+            });
+
+        assert_eq!(noted, Some(false), "{end:?}");
+    }
+}
+
+/// A task is not finished while its future is still being dropped, whether it ran to its end or
+/// went with its runtime, polled before that or not: what the future held is gone by the time
+/// anyone is told that the task is over.
+#[test]
+#[timeout(15000)]
+fn a_shared_task_is_finished_only_once_its_future_is_dropped() {
+    for end in End::ALL {
+        let noted =
+            finished_as_future_drops(SharedRuntime::new().unwrap(), end, |runtime, future| {
+                runtime.spawn("a task that notes whether it is finished", future)
+            });
+
+        assert_eq!(noted, Some(false), "{end:?}");
+    }
+}
+
+in_both_modes! {
     /// A wake from another thread ends the wait the thread inside `block_on` is in.
     ///
     /// Nothing to watch and no deadline, so the wait is bounded by nothing but the notification
@@ -1057,6 +1145,102 @@ impl Future for ReadyThenPanicOnDrop {
 impl Drop for ReadyThenPanicOnDrop {
     fn drop(&mut self) {
         panic!("dropped with a panic on purpose");
+    }
+}
+
+/// Spawns on `runtime`, through `spawn`, a task whose future notes whether its own task is
+/// finished as the future is dropped, and has the task end as `end` says.
+///
+/// Gives what the future noted, `None` where it noted nothing, after checking that the task is
+/// finished once it has ended.
+fn finished_as_future_drops<M>(
+    runtime: Runtime<M>,
+    end: End,
+    spawn: impl FnOnce(&Runtime<M>, NoteFinishedOnDrop<M>) -> Task<(), M>,
+) -> Option<bool>
+where
+    M: Mode,
+{
+    let slot = Arc::new(Mutex::new(None));
+    let noted = Arc::new(Mutex::new(None));
+    let task = spawn(
+        &runtime,
+        NoteFinishedOnDrop {
+            ready: matches!(end, End::Completes),
+            task: slot.clone(),
+            noted: noted.clone(),
+        },
+    );
+    *slot.lock().unwrap() = Some(task);
+
+    match end {
+        End::Completes => runtime.block_on(yield_now()),
+        End::GoesWithItsRuntimePolled => {
+            runtime.block_on(yield_now());
+            drop(runtime);
+        }
+        End::GoesWithItsRuntimeUnpolled => drop(runtime),
+    }
+
+    assert!(slot.lock().unwrap().as_ref().unwrap().is_finished());
+
+    *noted.lock().unwrap()
+}
+
+/// How the task [`finished_as_future_drops`] spawns comes to its end.
+#[derive(Clone, Copy, Debug)]
+enum End {
+    /// Its future is ready on its first poll.
+    Completes,
+    /// Its future is left waiting by its first poll, and then goes with the runtime.
+    GoesWithItsRuntimePolled,
+    /// Its future goes with the runtime before it is ever polled.
+    GoesWithItsRuntimeUnpolled,
+}
+
+impl End {
+    const ALL: [Self; 3] = [
+        Self::Completes,
+        Self::GoesWithItsRuntimePolled,
+        Self::GoesWithItsRuntimeUnpolled,
+    ];
+}
+
+/// A future that is ready at once where `ready`, and waits for ever otherwise, and that notes
+/// whether the task it belongs to is finished when it is dropped.
+///
+/// The task is kept in a slot of the test's own, which the future reaches it through.
+struct NoteFinishedOnDrop<M>
+where
+    M: Mode,
+{
+    ready: bool,
+    task: Arc<Mutex<Option<Task<(), M>>>>,
+    noted: Arc<Mutex<Option<bool>>>,
+}
+
+impl<M> Future for NoteFinishedOnDrop<M>
+where
+    M: Mode,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<M> Drop for NoteFinishedOnDrop<M>
+where
+    M: Mode,
+{
+    fn drop(&mut self) {
+        let finished = self.task.lock().unwrap().as_ref().map(Task::is_finished);
+        *self.noted.lock().unwrap() = finished;
     }
 }
 

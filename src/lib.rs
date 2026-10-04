@@ -656,6 +656,32 @@ where
     pub fn detach(self) {
         self.0.detach();
     }
+
+    /// Whether the task has ended, told without polling it or taking its output.
+    ///
+    /// A task has ended once its future has completed or panicked, or has gone with the runtime
+    /// it was on. Either way, the future has been dropped, and everything it held with it, by the
+    /// time this says so.
+    ///
+    /// This stays `true` after the output has been taken by awaiting the task. It is how a caller
+    /// that has no use for the output yet, or ever, finds out that a task is over, where awaiting
+    /// the task would take that output.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let mut task = runtime.spawn("an answer", async { 42 });
+    /// assert!(!task.is_finished());
+    ///
+    /// assert_eq!(runtime.block_on(&mut task).unwrap(), 42);
+    /// assert!(task.is_finished());
+    /// ```
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
 }
 
 #[cfg(feature = "runtime")]
