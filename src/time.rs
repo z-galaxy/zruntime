@@ -25,6 +25,7 @@ use crate::{Local, Mode, reactor};
 /// `SharedRuntime::current` that nobody is inside `block_on` on — and a timer nobody ever polls
 /// costs nothing at all. A timer holds its runtime, so a task holding one keeps that runtime
 /// alive: nothing here takes a runtime down while it has work.
+#[must_use = "futures do nothing unless .awaited"]
 pub struct Sleep<M = Local>(pub(crate) reactor::Sleep<M>)
 where
     M: Mode;
