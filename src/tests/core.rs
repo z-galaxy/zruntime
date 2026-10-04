@@ -7,8 +7,8 @@
 //! shared runtime — are written for that flavour alone.
 
 use std::{
-    cell::RefCell,
-    future::{Future, pending, poll_fn},
+    cell::{Cell, RefCell},
+    future::{Future, Pending, pending, poll_fn},
     io::{self, Write},
     mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -31,6 +31,7 @@ use socket2::{SockRef, Socket};
 use crate::Event;
 use crate::{
     Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime, Sleep, Task,
+    TimedOut, Timeout,
 };
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local`
@@ -390,6 +391,112 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    fn a_timeout_hands_back_what_the_future_produced<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        let output = runtime.block_on(runtime.timeout(Duration::from_secs(10), async { 7 }));
+
+        assert_eq!(output, Ok(7));
+    }
+}
+
+in_both_modes! {
+    fn a_timeout_on_a_future_that_never_completes_times_out<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        let output = runtime.block_on(runtime.timeout(Duration::from_millis(50), pending::<()>()));
+
+        assert_eq!(output, Err(TimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A deadline that has passed by the first poll times a waiting future out on that poll,
+    /// with no wait for the reactor to fire it.
+    fn a_timeout_at_a_passed_deadline_times_out_on_its_first_poll<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let timeout = runtime.timeout_at(Instant::now(), pending::<()>());
+
+        let polled = runtime.block_on(poll_once(timeout));
+
+        assert_eq!(polled, Some(Err(TimedOut)));
+    }
+}
+
+in_both_modes! {
+    /// The future has its turn before the deadline is looked at, so one that is ready hands back
+    /// its output even where the deadline has passed already.
+    fn a_timeout_polls_the_future_before_the_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let timeout = runtime.timeout_at(Instant::now(), async { 7 });
+
+        let polled = runtime.block_on(poll_once(timeout));
+
+        assert_eq!(polled, Some(Ok(7)));
+    }
+}
+
+in_both_modes! {
+    /// A future that cannot be moved once polled, an async block that holds a borrow of its own
+    /// across a wait, is run in place.
+    fn a_timeout_runs_a_future_that_is_not_unpin<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        let output = runtime.block_on(runtime.timeout(Duration::from_secs(10), async {
+            let values = [3, 5, 7];
+            let last = &values[2];
+            runtime.sleep(Duration::from_millis(10)).await;
+
+            *last
+        }));
+
+        assert_eq!(output, Ok(7));
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A future that ran out of time is not dropped with it: the timeout hands it back, to be
+    /// driven to completion with no deadline at all.
+    fn a_timeout_hands_back_its_future_after_timing_out<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        // Shut until the time-out, so that the future cannot win the race against the deadline
+        // however slowly this runs.
+        let open = Cell::new(false);
+        let gate = Box::pin(poll_fn(|_| {
+            if open.get() {
+                Poll::Ready(7)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let mut timeout = runtime.timeout(Duration::from_millis(10), gate);
+
+        assert_eq!(runtime.block_on(&mut timeout), Err(TimedOut));
+        open.set(true);
+        let output = runtime.block_on(timeout.into_inner());
+
+        assert_eq!(output, 7);
+    }
+}
+
+/// A time-out is an I/O error of the kind made for it, which carries the time-out itself, so
+/// that code returning an `io::Result` can hand one on with `?`.
+#[test]
+#[timeout(15000)]
+fn timed_out_converts_into_an_io_error_of_its_kind() {
+    let error = io::Error::from(TimedOut);
+
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.get_ref().is_some_and(|inner| inner.is::<TimedOut>()));
+}
+
+in_both_modes! {
     fn a_registration_reports_readiness<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (source, mut peer) = pair();
@@ -655,7 +762,8 @@ fn a_second_concurrent_block_on_panics() {
 }
 
 /// What a shared runtime's handles are shared as: a task handle and a registration live in state
-/// that several threads reach, and a runtime handle is cloned into the tasks it spawns.
+/// that several threads reach, a runtime handle is cloned into the tasks it spawns, and a timer
+/// or a timeout goes wherever the task awaiting it is polled.
 #[test]
 fn shared_handles_cross_threads() {
     fn sent_and_shared<T>()
@@ -668,6 +776,7 @@ fn shared_handles_cross_threads() {
     sent_and_shared::<Task<(), Shared>>();
     sent_and_shared::<Registration<Shared>>();
     sent_and_shared::<Sleep<Shared>>();
+    sent_and_shared::<Timeout<Pending<()>, Shared>>();
 }
 
 /// Spawning and registering, through whichever of the two flavours' own methods `Self` names.

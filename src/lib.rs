@@ -52,7 +52,7 @@ use std::os::windows::io::AsSocket as AsSource;
 use std::{
     borrow::Cow,
     fmt,
-    future::Future,
+    future::{Future, IntoFuture},
     io,
     pin::Pin,
     rc::Rc,
@@ -72,7 +72,7 @@ use runtime::Core;
 #[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
 #[cfg(feature = "runtime")]
-pub use time::Sleep;
+pub use time::{Sleep, TimedOut, Timeout};
 #[cfg(feature = "unblock")]
 pub use unblock::{BlockingWork, Unblock, unblock};
 
@@ -244,6 +244,87 @@ where
     /// ```
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<M> {
         Sleep(reactor::sleep::<M>(&self.core, Some(deadline)))
+    }
+
+    /// A future that runs `future` until it completes or `duration` has passed, whichever comes
+    /// first: it resolves to what `future` produced, or to [`TimedOut`] where the time ran out.
+    /// Dropping it drops `future` and cancels the timer.
+    ///
+    /// The clock starts here, at the call, rather than at the first poll: a timeout made well
+    /// before it is awaited has had that much of its time already. A duration further ahead than
+    /// the clock can name, as `Duration::MAX` is, gives a timeout that never fires. Each poll
+    /// gives `future` its turn before it looks at the clock, so a future that completes on the
+    /// very poll its time runs out on still hands back its output. A future that runs out of time
+    /// is not dropped there: it lives on inside the timeout, which [`Timeout::into_inner`] hands
+    /// it back from, to be retried or driven on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{future, io, time::Duration};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    ///
+    /// runtime.block_on(async {
+    ///     let in_time = runtime.timeout(Duration::from_secs(60), async { 7 }).await;
+    ///     assert_eq!(in_time, Ok(7));
+    ///
+    ///     let late = runtime.timeout(Duration::from_millis(2), future::pending::<()>());
+    ///     assert!(late.await.is_err());
+    /// });
+    ///
+    /// // A time-out is an I/O error of its own kind, for code that returns `io::Result`.
+    /// fn wait(runtime: &LocalRuntime) -> io::Result<()> {
+    ///     runtime.block_on(runtime.timeout(Duration::from_millis(2), future::pending::<()>()))?;
+    ///
+    ///     Ok(())
+    /// }
+    /// assert_eq!(wait(&runtime).unwrap_err().kind(), io::ErrorKind::TimedOut);
+    /// ```
+    pub fn timeout<F>(&self, duration: Duration, future: F) -> Timeout<F::IntoFuture, M>
+    where
+        F: IntoFuture,
+    {
+        Timeout::new(future.into_future(), self.sleep(duration))
+    }
+
+    /// A future that runs `future` until it completes or `deadline` has passed, whichever comes
+    /// first, as [`timeout`](Self::timeout) does: where `deadline` has passed already, a future
+    /// that is not ready on its first poll times out on that poll. Dropping it drops `future` and
+    /// cancels the timer.
+    ///
+    /// This is what a piece of work made of several steps reaches for, to keep all of them to
+    /// one deadline rather than give each a length of time of its own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let deadline = Instant::now() + Duration::from_millis(5);
+    ///
+    /// runtime.block_on(async {
+    ///     // Steps of 2 ms each, for as long as each finishes before the deadline.
+    ///     while runtime
+    ///         .timeout_at(deadline, runtime.sleep(Duration::from_millis(2)))
+    ///         .await
+    ///         .is_ok()
+    ///     {}
+    /// });
+    ///
+    /// // However many steps fit, the loop ended once the deadline had passed.
+    /// assert!(Instant::now() >= deadline);
+    /// ```
+    pub fn timeout_at<F>(&self, deadline: Instant, future: F) -> Timeout<F::IntoFuture, M>
+    where
+        F: IntoFuture,
+    {
+        Timeout::new(future.into_future(), self.sleep_until(deadline))
     }
 }
 

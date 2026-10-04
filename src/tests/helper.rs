@@ -5,7 +5,7 @@
 
 use std::{
     cell::RefCell,
-    future::{Future, pending, poll_fn},
+    future::{Future, Pending, pending, poll_fn},
     io::Write,
     mem::MaybeUninit,
     pin::{Pin, pin},
@@ -26,12 +26,13 @@ use super::core::pair;
 #[cfg(feature = "event")]
 use crate::{Event, EventListener};
 use crate::{
-    Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, driver,
+    Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, Timeout, driver,
     runtime::{Core, lock},
 };
 
 /// What a handle is shared as: a task handle and a registration live in state that several threads
-/// reach, and a runtime handle is cloned into the tasks it spawns.
+/// reach, a runtime handle is cloned into the tasks it spawns, and a timer or a timeout goes
+/// wherever the task awaiting it is polled.
 #[test]
 #[timeout(15000)]
 fn handles_cross_threads() {
@@ -50,6 +51,7 @@ fn handles_cross_threads() {
     shared::<Task<(), Shared>>();
     shared::<Registration<Shared>>();
     sent::<Sleep<Shared>>();
+    sent::<Timeout<Pending<()>, Shared>>();
 }
 
 #[test]
@@ -402,6 +404,37 @@ fn a_sleep_reset_beyond_the_clock_lets_the_helper_exit() {
     sleep.reset_after(Duration::MAX);
 
     assert!(helper_gone(&runtime));
+    assert!(!runtime.inner().is_busy());
+}
+
+/// A timeout whose future is left waiting asks for the helper, as a timer does on its first poll,
+/// and lets it go once dropped.
+#[test]
+#[timeout(15000)]
+fn a_timeout_starts_the_helper_and_dropping_it_lets_it_exit() {
+    let runtime = runtime();
+    {
+        let mut timeout = pin!(runtime.timeout(Duration::from_secs(10), pending::<()>()));
+        // Made but not yet polled, the timeout has handed the reactor nothing to wait on.
+        assert!(!runtime.helper_running());
+        assert!(block_on(poll_once(timeout.as_mut())).is_none());
+        assert!(runtime.helper_running());
+    }
+
+    assert!(helper_gone(&runtime));
+}
+
+/// A timeout whose future completes on its first poll never polls its timer, so no deadline
+/// reaches the reactor and no helper is asked for.
+#[test]
+#[timeout(15000)]
+fn a_timeout_whose_future_completes_at_once_starts_no_helper() {
+    let runtime = runtime();
+
+    let output = block_on(runtime.timeout(Duration::from_secs(10), async { 7 }));
+
+    assert_eq!(output.ok(), Some(7));
+    assert!(!runtime.helper_running());
     assert!(!runtime.inner().is_busy());
 }
 

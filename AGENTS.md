@@ -155,8 +155,8 @@ threads. A target holds benchmarks of one kind only, and a new one goes in the l
 ```
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Interest,
-│                 # Task, Sleep (runtime feature), Event, EventListener (event feature), and
-│                 # the free block_on (helper feature)
+│                 # Task, Sleep, Timeout, TimedOut (runtime feature), Event, EventListener
+│                 # (event feature), and the free block_on (helper feature)
 ├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
 │                 # any executor, with no use of the runtime
 ├── event-only.md # The crate's documentation in a build with `event` but not `runtime`, whose
@@ -176,7 +176,7 @@ src/
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
-├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep
+├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, and Timeout
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
