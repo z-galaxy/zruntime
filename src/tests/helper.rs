@@ -26,13 +26,14 @@ use super::core::pair;
 #[cfg(feature = "event")]
 use crate::{Event, EventListener};
 use crate::{
-    Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, Timeout, driver,
+    Interest, Interval, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, Timeout,
+    driver,
     runtime::{Core, lock},
 };
 
 /// What a handle is shared as: a task handle and a registration live in state that several threads
-/// reach, a runtime handle is cloned into the tasks it spawns, and a timer or a timeout goes
-/// wherever the task awaiting it is polled.
+/// reach, a runtime handle is cloned into the tasks it spawns, and a timer, a timeout or an
+/// interval goes wherever the task awaiting it is polled.
 #[test]
 #[timeout(15000)]
 fn handles_cross_threads() {
@@ -52,6 +53,7 @@ fn handles_cross_threads() {
     shared::<Registration<Shared>>();
     sent::<Sleep<Shared>>();
     sent::<Timeout<Pending<()>, Shared>>();
+    sent::<Interval<Shared>>();
 }
 
 #[test]
@@ -438,6 +440,55 @@ fn a_timeout_whose_future_completes_at_once_starts_no_helper() {
     assert!(!runtime.inner().is_busy());
 }
 
+/// An interval asks for the helper on its first poll, as a timer does, and lets it go once
+/// dropped.
+#[test]
+#[timeout(15000)]
+fn an_interval_starts_the_helper_and_dropping_it_lets_it_exit() {
+    let runtime = runtime();
+    {
+        let mut interval = runtime.interval(Duration::from_secs(10));
+        // Made but not yet polled, the interval has handed the reactor nothing to wait on.
+        assert!(!runtime.helper_running());
+        assert!(block_on(poll_once(interval.tick())).is_none());
+        assert!(runtime.helper_running());
+    }
+
+    assert!(helper_gone(&runtime));
+}
+
+/// An interval nobody drives through `block_on` keeps ticking on the helper alone: each tick's
+/// wake comes from the helper, and the poll after it, which moves the interval on to its next
+/// tick, asks for the helper again where it has retired in between.
+#[test]
+#[timeout(15000)]
+fn the_helper_keeps_an_interval_ticking() {
+    let runtime = runtime();
+    let period = Duration::from_millis(20);
+    let woken = Arc::new(Woken::default());
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut interval = runtime.interval(period);
+    let mut ticks = Vec::new();
+
+    while ticks.len() < 3 {
+        let seen = woken.count();
+        match interval.poll_tick(&mut cx) {
+            Poll::Ready(tick) => ticks.push(tick),
+            Poll::Pending => {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while woken.count() == seen && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(woken.count() > seen);
+            }
+        }
+    }
+
+    assert_eq!(ticks[1] - ticks[0], period);
+    assert_eq!(ticks[2] - ticks[1], period);
+}
+
 #[test]
 #[timeout(15000)]
 fn a_sleep_beyond_the_clock_starts_no_helper() {
@@ -448,6 +499,20 @@ fn a_sleep_beyond_the_clock_starts_no_helper() {
 
     // A timer nothing can ever fire has no deadline for a thread to wait on, so none is asked
     // for: a helper started here would retire in the very round it started.
+    assert!(!runtime.helper_running());
+    assert!(!runtime.inner().is_busy());
+}
+
+#[test]
+#[timeout(15000)]
+fn an_interval_beyond_the_clock_starts_no_helper() {
+    let runtime = runtime();
+    let mut interval = runtime.interval(Duration::MAX);
+
+    assert!(block_on(poll_once(interval.tick())).is_none());
+
+    // An interval whose first tick the clock cannot name has no deadline for a thread to wait
+    // on, as a timer that is never to fire has none, so no helper is asked for.
     assert!(!runtime.helper_running());
     assert!(!runtime.inner().is_busy());
 }

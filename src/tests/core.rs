@@ -23,15 +23,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_lite::future::{poll_once, yield_now};
+use futures_lite::{
+    Stream, StreamExt,
+    future::{poll_once, yield_now},
+};
 use ntest::timeout;
 use socket2::{SockRef, Socket};
 
 #[cfg(feature = "event")]
 use crate::Event;
 use crate::{
-    Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime, Sleep, Task,
-    TimedOut, Timeout,
+    Interest, Interval, Local, LocalRuntime, MissedTickBehavior, Mode, Registration, Runtime,
+    Shared, SharedRuntime, Sleep, Task, TimedOut, Timeout,
 };
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local`
@@ -497,6 +500,181 @@ fn timed_out_converts_into_an_io_error_of_its_kind() {
 }
 
 in_both_modes! {
+    /// Each tick is the moment it was scheduled for, a period after the one before, the first one
+    /// period after the interval was made.
+    fn an_interval_ticks_once_a_period<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+        let started = Instant::now();
+
+        let ticks = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            [interval.tick().await, interval.tick().await, interval.tick().await]
+        });
+
+        assert!(ticks[0] >= started + period);
+        assert!(ticks[0] < started + Duration::from_secs(1));
+        assert_eq!(ticks[1] - ticks[0], period);
+        assert_eq!(ticks[2] - ticks[1], period);
+        assert!(started.elapsed() >= 3 * period);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// An interval started at a moment that has passed already ticks on its first poll, with that
+    /// moment, and keeps to the schedule from it.
+    fn an_interval_at_a_passed_start_ticks_at_once<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+        let start = Instant::now();
+        let mut interval = runtime.interval_at(start, period);
+
+        let first = runtime.block_on(poll_once(interval.tick()));
+        let second = runtime.block_on(interval.tick());
+
+        assert_eq!(first, Some(start));
+        assert_eq!(second, start + period);
+        assert!(Instant::now() >= start + period);
+    }
+}
+
+in_both_modes! {
+    fn an_interval_is_a_stream_of_its_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(5);
+        let start = Instant::now() + period;
+        let interval = runtime.interval_at(start, period);
+
+        let ticks: Vec<Instant> = runtime.block_on(interval.take(3).collect());
+
+        assert_eq!(ticks, [start, start + period, start + 2 * period]);
+    }
+}
+
+in_both_modes! {
+    /// Ticks missed while the thread was blocked are handed out one after the other, each with
+    /// the moment it was scheduled for, so the schedule is kept.
+    fn an_interval_bursts_through_missed_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+
+        let (first, after) = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Burst);
+            let first = interval.tick().await;
+            // Blocked rather than waiting, so that the runtime cannot hand out a tick meanwhile.
+            thread::sleep(period * 7 / 2);
+
+            (first, [interval.tick().await, interval.tick().await, interval.tick().await])
+        });
+
+        assert_eq!(after, [first + period, first + 2 * period, first + 3 * period]);
+    }
+}
+
+in_both_modes! {
+    /// After a tick missed, the next one comes a full period after the late one was handed out.
+    fn an_interval_delays_after_missed_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+
+        let (stalled_until, late, next) = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            interval.tick().await;
+            thread::sleep(period * 7 / 2);
+            let stalled_until = Instant::now();
+
+            (stalled_until, interval.tick().await, interval.tick().await)
+        });
+
+        assert!(late < stalled_until);
+        assert!(next >= stalled_until + period);
+        assert!(Instant::now() >= next);
+    }
+}
+
+in_both_modes! {
+    /// After ticks missed, the next one is the first of the original schedule still to come.
+    fn an_interval_skips_missed_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+
+        let (first, stalled_until, late, next) = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let first = interval.tick().await;
+            thread::sleep(period * 7 / 2);
+            let stalled_until = Instant::now();
+
+            (first, stalled_until, interval.tick().await, interval.tick().await)
+        });
+
+        // The tick that was due as the stall began is handed out late, and those missed after it
+        // are not: the one after it is the first still to come once the stall was over.
+        assert!(late < stalled_until);
+        assert!(next > stalled_until);
+        assert_eq!((late - first).as_nanos() % period.as_nanos(), 0);
+        assert_eq!((next - first).as_nanos() % period.as_nanos(), 0);
+    }
+}
+
+in_both_modes! {
+    /// A reset starts the schedule over, one period from the reset, however close the tick it
+    /// replaces was.
+    fn an_interval_reset_ticks_a_period_after_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+        let mut interval = runtime.interval_at(Instant::now(), period);
+
+        let reset = Instant::now();
+        interval.reset();
+        let tick = runtime.block_on(interval.tick());
+
+        assert!(tick >= reset + period);
+        assert!(Instant::now() >= tick);
+        assert!(reset.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    fn an_interval_with_a_zero_period_panics<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        let interval = catch_unwind(AssertUnwindSafe(|| runtime.interval(Duration::ZERO)));
+        let interval_at = catch_unwind(AssertUnwindSafe(|| {
+            runtime.interval_at(Instant::now(), Duration::ZERO)
+        }));
+
+        assert!(interval.is_err());
+        assert!(interval_at.is_err());
+    }
+}
+
+in_both_modes! {
+    /// An interval whose ticks the clock cannot name never ticks: one asked for a period further
+    /// ahead than the clock can name has no first tick, and one started now hands out its first
+    /// tick and then no other.
+    ///
+    /// As a stream, neither ends, and neither promises any tick to come either: the size hint of
+    /// an interval is no more than any stream's.
+    fn an_interval_beyond_the_clock_never_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut never = runtime.interval(Duration::MAX);
+        let start = Instant::now();
+        let mut once = runtime.interval_at(start, Duration::MAX);
+
+        assert!(runtime.block_on(poll_once(never.tick())).is_none());
+        assert_eq!(Stream::size_hint(&never), (0, None));
+        assert_eq!(runtime.block_on(poll_once(once.tick())), Some(start));
+        // The tick after it is a whole period after `start`, beyond the clock.
+        assert!(runtime.block_on(poll_once(once.tick())).is_none());
+        assert_eq!(Stream::size_hint(&once), (0, None));
+    }
+}
+
+in_both_modes! {
     fn a_registration_reports_readiness<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (source, mut peer) = pair();
@@ -762,8 +940,8 @@ fn a_second_concurrent_block_on_panics() {
 }
 
 /// What a shared runtime's handles are shared as: a task handle and a registration live in state
-/// that several threads reach, a runtime handle is cloned into the tasks it spawns, and a timer
-/// or a timeout goes wherever the task awaiting it is polled.
+/// that several threads reach, a runtime handle is cloned into the tasks it spawns, and a timer,
+/// a timeout or an interval goes wherever the task awaiting it is polled.
 #[test]
 fn shared_handles_cross_threads() {
     fn sent_and_shared<T>()
@@ -777,6 +955,7 @@ fn shared_handles_cross_threads() {
     sent_and_shared::<Registration<Shared>>();
     sent_and_shared::<Sleep<Shared>>();
     sent_and_shared::<Timeout<Pending<()>, Shared>>();
+    sent_and_shared::<Interval<Shared>>();
 }
 
 /// Spawning and registering, through whichever of the two flavours' own methods `Self` names.

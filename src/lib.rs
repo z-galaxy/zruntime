@@ -72,7 +72,7 @@ use runtime::Core;
 #[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
 #[cfg(feature = "runtime")]
-pub use time::{Sleep, TimedOut, Timeout};
+pub use time::{Interval, MissedTickBehavior, Sleep, TimedOut, Timeout};
 #[cfg(feature = "unblock")]
 pub use unblock::{BlockingWork, Unblock, unblock};
 
@@ -325,6 +325,54 @@ where
         F: IntoFuture,
     {
         Timeout::new(future.into_future(), self.sleep_until(deadline))
+    }
+
+    /// A timer that ticks once every `period`, the first time one period from now. An interval
+    /// asked for further ahead than the clock can name never ticks.
+    ///
+    /// Each tick hands out the moment it was scheduled for, and the ticks keep to the schedule
+    /// however long the work done at each of them takes. A tick missed because the task was busy,
+    /// or its thread blocked, for a period or more is made up for as the interval's
+    /// [`MissedTickBehavior`] says: by default, at once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `period` is zero: such an interval would tick on every poll, without end.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let period = Duration::from_millis(2);
+    /// let started = Instant::now();
+    ///
+    /// let ticks = runtime.block_on(async {
+    ///     let mut interval = runtime.interval(period);
+    ///     [interval.tick().await, interval.tick().await, interval.tick().await]
+    /// });
+    ///
+    /// // Each tick is the moment it was scheduled for, a period after the one before.
+    /// assert!(ticks[0] >= started + period);
+    /// assert_eq!(ticks[1] - ticks[0], period);
+    /// assert_eq!(ticks[2] - ticks[1], period);
+    /// ```
+    pub fn interval(&self, period: Duration) -> Interval<M> {
+        Interval::new(self.sleep(period), period)
+    }
+
+    /// A timer that ticks once every `period`, as [`interval`](Self::interval) does, the first
+    /// time at `start`: at once, on its first poll, where `start` has passed already, as it has
+    /// for `interval_at(Instant::now(), period)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `period` is zero: such an interval would tick on every poll, without end.
+    pub fn interval_at(&self, start: Instant, period: Duration) -> Interval<M> {
+        Interval::new(self.sleep_until(start), period)
     }
 }
 

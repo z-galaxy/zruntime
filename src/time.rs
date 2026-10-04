@@ -6,16 +6,19 @@
 //! is reset, and lets it go when the timer is dropped. What a timer adds to that is the part the
 //! reactor cannot do for itself: a poll that leaves it waiting also sees to it that some thread
 //! will be there to fire it, which a runtime from `SharedRuntime::current` does by starting a
-//! helper thread where nobody is inside `block_on` on it.
+//! helper thread where nobody is inside `block_on` on it. An interval is one timer, reset to the
+//! deadline of its next tick each time it ticks.
 
 use std::{
     error, fmt,
-    future::Future,
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+
+use futures_core::Stream;
 
 use crate::{Local, Mode, reactor};
 
@@ -150,6 +153,175 @@ impl From<TimedOut> for io::Error {
     }
 }
 
+/// A timer on a [`Runtime`](crate::Runtime) that ticks once every period, rather than once: what a
+/// heartbeat, a poll of some outside state or any other piece of work done on a schedule reaches
+/// for.
+///
+/// Each tick hands out the moment it was scheduled for, rather than the moment it was seen, so a
+/// loop that does its work at each tick keeps to the schedule however long a round of that work
+/// takes, and however late the task gets round to the next tick. A tick that comes due while
+/// nobody waits for it is not lost: the next wait for a tick finds it at once. Where a whole period
+/// or more goes by in that way, ticks are missed, and what the interval does about them is its
+/// [`MissedTickBehavior`].
+///
+/// An interval is a [`Stream`] of the instants it ticks at, which never ends, so the extension
+/// traits of [`futures-lite`] or [`futures-util`] drive it as well as [`tick`](Self::tick) does.
+/// Like a [`Sleep`], it costs nothing until it is first polled, and holds its runtime, so a task
+/// holding one keeps that runtime alive.
+///
+/// [`Stream`]: futures_core::Stream
+/// [`futures-lite`]: https://docs.rs/futures-lite
+/// [`futures-util`]: https://docs.rs/futures-util
+pub struct Interval<M = Local>
+where
+    M: Mode,
+{
+    /// The timer of the next tick, whose deadline is that tick's.
+    sleep: Sleep<M>,
+    period: Duration,
+    missed_tick_behavior: MissedTickBehavior,
+}
+
+impl<M> Interval<M>
+where
+    M: Mode,
+{
+    /// Waits for the next tick, and completes with the moment it was scheduled for.
+    ///
+    /// Dropping the future this hands back before it completes loses no tick: the next wait finds
+    /// it all the same.
+    pub async fn tick(&mut self) -> Instant {
+        poll_fn(|cx| self.poll_tick(cx)).await
+    }
+
+    /// Polls for the next tick, which completes with the moment that tick was scheduled for.
+    ///
+    /// Where the tick has not come due yet, the waker of `cx` is woken once it has; only the waker
+    /// of the last poll is, so one task at a time waits on an interval. An interval asked for
+    /// further ahead than the clock can name never ticks, and stays pending for good.
+    pub fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
+        // A timer with no deadline never completes, and its poll would do nothing at all.
+        let Some(deadline) = self.sleep.deadline() else {
+            return Poll::Pending;
+        };
+        // Through `Sleep`'s own poll, which asks for a thread to fire the deadline, as a bare
+        // timer's does.
+        if Pin::new(&mut self.sleep).poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        let next = next_deadline(
+            deadline,
+            Instant::now(),
+            self.period,
+            self.missed_tick_behavior,
+        );
+        // Straight to the reactor's timer, which takes no deadline at all for a tick the clock
+        // cannot name, and so never fires again.
+        self.sleep.0.reset(next);
+
+        Poll::Ready(deadline)
+    }
+
+    /// Starts the schedule over, with the next tick one period from now, or none at all where the
+    /// clock cannot name that moment.
+    ///
+    /// A tick that had come due, and that nobody had waited for yet, is dropped. This is what an
+    /// idle timer reaches for, which only has to tick once a period has gone by with nothing else
+    /// happening.
+    pub fn reset(&mut self) {
+        self.sleep.reset_after(self.period);
+    }
+
+    /// How long this interval waits from one tick to the next.
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
+    /// What this interval does about ticks it missed.
+    pub fn missed_tick_behavior(&self) -> MissedTickBehavior {
+        self.missed_tick_behavior
+    }
+
+    /// Changes what this interval does about ticks it missed, from the next tick it hands out on.
+    pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
+        self.missed_tick_behavior = behavior;
+    }
+
+    /// An interval whose first tick is the deadline of `sleep`, and each tick after it `period`
+    /// after the one before.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `period` is zero.
+    pub(crate) fn new(sleep: Sleep<M>, period: Duration) -> Self {
+        // A zero period would tick on every poll without end, and `next_deadline` divides by it.
+        assert!(!period.is_zero(), "an interval's period must not be zero");
+
+        Self {
+            sleep,
+            period,
+            missed_tick_behavior: MissedTickBehavior::default(),
+        }
+    }
+}
+
+impl<M> fmt::Debug for Interval<M>
+where
+    M: Mode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Interval")
+            .field("next_tick", &self.sleep.deadline())
+            .field("period", &self.period)
+            .field("missed_tick_behavior", &self.missed_tick_behavior)
+            .finish()
+    }
+}
+
+impl<M> Stream for Interval<M>
+where
+    M: Mode,
+{
+    type Item = Instant;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Instant>> {
+        self.get_mut().poll_tick(cx).map(Some)
+    }
+}
+
+/// What an [`Interval`] does about ticks it missed because nobody waited for them in time: the
+/// task polling it was busy with something else, or the thread it runs on was blocked.
+///
+/// A tick is missed where, by the time the tick before it is handed out, its own moment has passed
+/// already. Each variant below is shown on the same timeline: a period of 10 ms, ticks scheduled at
+/// 10, 20, 30 ms and so on, the tick at 10 handed out on time, and the task then held up until 35,
+/// when it hands out the tick at 20 and finds the one at 30 missed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MissedTickBehavior {
+    /// The missed ticks are handed out one after the other, at once, until the interval has caught
+    /// up, and the schedule is kept: the ticks at 20 and 30 are both handed out at 35, and the next
+    /// one at 40, then 50.
+    ///
+    /// This is what a piece of work that has to happen once for each period that went by, however
+    /// late, reaches for.
+    #[default]
+    Burst,
+    /// The next tick comes one full period after the late one was handed out, and the schedule
+    /// moves with it: the tick at 20 is handed out at 35, and the next one at 45, then 55.
+    ///
+    /// This is what a piece of work that needs a full period of rest between two rounds of it
+    /// reaches for.
+    Delay,
+    /// The missed ticks are dropped, and the next tick is the first one of the schedule still to
+    /// come: the tick at 20 is handed out at 35, the one at 30 never is, and the next one comes at
+    /// 40, then 50.
+    ///
+    /// This is what a piece of work that only has to keep to the schedule, and gains nothing from
+    /// making up for a round it missed, reaches for.
+    Skip,
+}
+
 /// A timer on a [`Runtime`](crate::Runtime), which keeps a thread on it for as long as it has a
 /// deadline.
 ///
@@ -270,5 +442,239 @@ where
         M::ensure_progress(this.0.core());
 
         Poll::Pending
+    }
+}
+
+/// When the tick after one scheduled for `deadline` and handed out at `now` is due, with ticks
+/// `period` apart and `behavior` for any that were missed, or nothing where the clock cannot name
+/// that moment, which leaves the interval never to tick again.
+///
+/// `period` is never zero: an interval is never made with one.
+fn next_deadline(
+    deadline: Instant,
+    now: Instant,
+    period: Duration,
+    behavior: MissedTickBehavior,
+) -> Option<Instant> {
+    let next = deadline.checked_add(period)?;
+    // Nothing missed, whatever the behaviour.
+    if next > now {
+        return Some(next);
+    }
+
+    match behavior {
+        MissedTickBehavior::Burst => Some(next),
+        MissedTickBehavior::Delay => now.checked_add(period),
+        MissedTickBehavior::Skip => {
+            // The first tick of the schedule after `now`, worked out in nanoseconds rather than
+            // by stepping through every missed one. `now` is no earlier than `next`, and so later
+            // than `deadline`, and the remainder is less than the period, which no `Duration`'s
+            // count of whole seconds overflows a `u64` for.
+            let period = period.as_nanos();
+            let rem = (now - deadline).as_nanos() % period;
+            let gap = period - rem;
+            let gap = Duration::new((gap / NANOS_PER_SEC) as u64, (gap % NANOS_PER_SEC) as u32);
+
+            now.checked_add(gap)
+        }
+    }
+}
+
+/// How many nanoseconds there are in a second.
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use ntest::timeout;
+
+    use super::{MissedTickBehavior, next_deadline};
+
+    const PERIOD: Duration = Duration::from_millis(10);
+
+    /// A tick handed out before the next one's moment has come misses nothing, and the next one
+    /// keeps to the schedule, whatever the behaviour.
+    #[test]
+    #[timeout(15000)]
+    fn nothing_missed_keeps_the_schedule() {
+        let base = Instant::now();
+        let deadline = base + ms(10);
+        let now = base + ms(15);
+
+        for behavior in BEHAVIORS {
+            assert_eq!(
+                next_deadline(deadline, now, PERIOD, behavior),
+                Some(base + ms(20)),
+                "{behavior:?}",
+            );
+        }
+    }
+
+    /// A tick handed out exactly at the next one's moment has missed that one.
+    #[test]
+    #[timeout(15000)]
+    fn a_tick_handed_out_at_the_next_ones_moment_has_missed_it() {
+        let base = Instant::now();
+        let deadline = base + ms(10);
+        let now = base + ms(20);
+
+        assert_eq!(
+            next_deadline(deadline, now, PERIOD, MissedTickBehavior::Delay),
+            Some(base + ms(30)),
+        );
+        assert_eq!(
+            next_deadline(deadline, now, PERIOD, MissedTickBehavior::Skip),
+            Some(base + ms(30)),
+        );
+    }
+
+    #[test]
+    #[timeout(15000)]
+    fn burst_hands_out_each_missed_tick() {
+        let base = Instant::now();
+
+        // Missed by one period, and by several.
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(35),
+                PERIOD,
+                MissedTickBehavior::Burst
+            ),
+            Some(base + ms(30)),
+        );
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(75),
+                PERIOD,
+                MissedTickBehavior::Burst
+            ),
+            Some(base + ms(30)),
+        );
+    }
+
+    #[test]
+    #[timeout(15000)]
+    fn delay_moves_the_schedule_to_a_period_after_now() {
+        let base = Instant::now();
+
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(35),
+                PERIOD,
+                MissedTickBehavior::Delay
+            ),
+            Some(base + ms(45)),
+        );
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(75),
+                PERIOD,
+                MissedTickBehavior::Delay
+            ),
+            Some(base + ms(85)),
+        );
+    }
+
+    #[test]
+    #[timeout(15000)]
+    fn skip_moves_on_to_the_first_tick_still_to_come() {
+        let base = Instant::now();
+
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(35),
+                PERIOD,
+                MissedTickBehavior::Skip
+            ),
+            Some(base + ms(40)),
+        );
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(75),
+                PERIOD,
+                MissedTickBehavior::Skip
+            ),
+            Some(base + ms(80)),
+        );
+        // Not by whole milliseconds either.
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(75) + Duration::from_nanos(1),
+                PERIOD,
+                MissedTickBehavior::Skip,
+            ),
+            Some(base + ms(80)),
+        );
+    }
+
+    /// Handed out exactly on a tick of the schedule, that tick is itself one missed, and the next
+    /// one to come is a full period on.
+    #[test]
+    #[timeout(15000)]
+    fn skip_on_a_tick_of_the_schedule_moves_a_full_period_on() {
+        let base = Instant::now();
+
+        assert_eq!(
+            next_deadline(
+                base + ms(20),
+                base + ms(50),
+                PERIOD,
+                MissedTickBehavior::Skip
+            ),
+            Some(base + ms(60)),
+        );
+    }
+
+    /// A period of seconds and nanoseconds both, which the gap to the next tick is rebuilt from
+    /// without losing either.
+    #[test]
+    #[timeout(15000)]
+    fn skip_keeps_the_seconds_of_a_long_period() {
+        let base = Instant::now();
+        let period = Duration::new(3, 500_000_000);
+        let deadline = base + period;
+        // Two periods and a half later, a second and three quarters short of the next tick.
+        let now = deadline + period * 2 + Duration::from_millis(1_750);
+
+        assert_eq!(
+            next_deadline(deadline, now, period, MissedTickBehavior::Skip),
+            Some(deadline + period * 3),
+        );
+    }
+
+    /// Where the clock has no moment a period after the tick, there is no next tick, whatever the
+    /// behaviour.
+    #[test]
+    #[timeout(15000)]
+    fn no_next_tick_beyond_the_clock() {
+        let base = Instant::now();
+
+        for behavior in BEHAVIORS {
+            assert_eq!(
+                next_deadline(base, base, Duration::MAX, behavior),
+                None,
+                "{behavior:?}",
+            );
+        }
+    }
+
+    /// Every behaviour there is.
+    const BEHAVIORS: [MissedTickBehavior; 3] = [
+        MissedTickBehavior::Burst,
+        MissedTickBehavior::Delay,
+        MissedTickBehavior::Skip,
+    ];
+
+    /// `millis` milliseconds.
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
     }
 }

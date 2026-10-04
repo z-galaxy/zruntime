@@ -74,9 +74,33 @@ or [`SharedRuntime`] instead of naming [`Runtime`] directly.
 A future built from several tasks, timers and registered sockets runs the same way: `block_on`
 drives all of it on the calling thread.
 
+## Timers
+
+[`Runtime::sleep`] waits for a length of time and [`Runtime::sleep_until`] for a moment on the
+clock, which keeps a loop to a schedule without drift, and a [`Sleep`] can be pushed back in place
+with [`Sleep::reset`], as a keep-alive or an idle timeout is on every message. [`Runtime::timeout`]
+gives any future a time limit, and [`Runtime::interval`] ticks once every period, as a stream:
+
+```rust
+use std::{future, time::Duration};
+
+use zruntime::LocalRuntime;
+
+let runtime = LocalRuntime::new().expect("a runtime for this thread");
+runtime.block_on(async {
+    let mut interval = runtime.interval(Duration::from_millis(1));
+    for _ in 0..3 {
+        interval.tick().await;
+    }
+
+    let never = runtime.timeout(Duration::from_millis(2), future::pending::<()>());
+    assert!(never.await.is_err());
+});
+```
+
 ## The `helper` feature
 
-The two examples above each drive their runtime with one `block_on` call. A library whose
+The examples above each drive their runtime with one `block_on` call. A library whose
 futures may be polled from another executor, or that calls `block_on` once per operation rather
 than once for the whole program — [zbus], say — needs a runtime that keeps running in between
 those calls instead of standing still until the next one.
@@ -114,7 +138,7 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 ## Features
 
 * `runtime` (default): [`Runtime`], [`LocalRuntime`] and [`SharedRuntime`], with the tasks,
-  timers and I/O registrations built on them.
+  timers and I/O registrations built on them; it brings the `futures-core` crate.
 * `event` (default): [`Event`] and [`EventListener`], which need no runtime.
 * `tracing` (default): the runtime logs through [`tracing`]; a build without it emits no log
   events.
@@ -161,6 +185,14 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`SharedRuntime::current`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.current
 [`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
+[`Runtime::sleep`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.sleep
+[`Runtime::sleep_until`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.sleep_until
+[`Sleep`]: https://docs.rs/zruntime/latest/zruntime/struct.Sleep.html
+[`Sleep::reset`]: https://docs.rs/zruntime/latest/zruntime/struct.Sleep.html#method.reset
+[`Runtime::timeout`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.timeout
+[`Runtime::interval`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.interval
 [`Event`]: https://docs.rs/zruntime/latest/zruntime/struct.Event.html
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html

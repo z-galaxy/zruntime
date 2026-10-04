@@ -21,8 +21,9 @@ targets = [
 
 [features]
 default = ["runtime", "event", "tracing"]
-# The runtime: `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations.
-runtime = ["dep:rustix", "dep:windows-sys"]
+# The runtime: `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations;
+# `futures-core` gives an interval timer its `Stream` impl.
+runtime = ["dep:rustix", "dep:windows-sys", "dep:futures-core"]
 # `Event` and `EventListener`, which need no runtime.
 event = []
 # Logs through `tracing`; a build without it emits no log events.
