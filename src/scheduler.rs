@@ -372,12 +372,22 @@ where
             join_waker: None,
         }),
     });
-    let guard = CompleteOnDrop::<M, F::Output>(join.clone());
+    let unpolled = Unpolled {
+        future: Some(future),
+        guard: CompleteOnDrop::<M, F::Output>(join.clone()),
+    };
     let wrapper = async move {
-        // Moved in first, so that it is dropped last: a task cancelled while it waits drops its
-        // future before the guard hears of it, as a task that ends does.
-        let guard = guard;
-        let mut future = pin!(Some(future));
+        // The guard is dropped after the future whether the wrapper goes before its first poll or
+        // after it, so that a task cancelled, or dropped with its runtime, drops its future before
+        // the guard hears of it, as a task that ends does. Before the first poll, the wrapper holds
+        // the two in the one value it captured, whose fields go in the order they are declared in.
+        // After it, they are the wrapper's locals, which go in the reverse of the order they are
+        // declared in, so the future is pinned in a local declared after the guard's. The value is
+        // taken whole before it is taken apart, so that the wrapper captures it rather than each
+        // of its fields on its own, in an order nothing promises.
+        let unpolled = unpolled;
+        let guard = unpolled.guard;
+        let mut future = pin!(unpolled.future);
         let polled = catch_unwind_polls(guard.0.task_waker(), future.as_mut()).await;
         // Done with, and dropped here, before the handle hears of the outcome: whoever joins the
         // task finds whatever the future held already gone. The value is moved out of `polled`
@@ -403,6 +413,14 @@ where
     };
 
     (join, wrapper)
+}
+
+/// A task's future and the guard that hands its outcome over, as the task's wrapper holds them
+/// until its first poll: in one value, whose fields are dropped in the order they are declared
+/// in, the future before the guard.
+struct Unpolled<F, G> {
+    future: Option<F>,
+    guard: G,
 }
 
 /// Joins a spawned task, and cancels it when dropped unless [`JoinHandle::detach`] was called.
@@ -1285,6 +1303,37 @@ mod tests {
         assert!(block_on(handle).is_err());
     }
 
+    /// A task dropped with its runtime drops its future before its handle hears of it, whether
+    /// it was polled before the runtime went or never was: whoever joins it finds whatever the
+    /// future held already gone, as they do where the task ran to its end.
+    #[test]
+    #[timeout(15000)]
+    fn a_task_dropped_with_its_runtime_drops_its_future_before_failing_its_handle() {
+        for polled in [false, true] {
+            let runtime = runtime();
+            let handle = Rc::new(RefCell::new(None));
+            let outcome_seen = Rc::new(Cell::new(None));
+            let probe = ProbeOnDrop {
+                handle: handle.clone(),
+                outcome_seen: outcome_seen.clone(),
+            };
+            let task = runtime.spawn("a task that never finishes", async move {
+                let _probe = probe;
+                std::future::pending::<()>().await;
+            });
+            *handle.borrow_mut() = Some(task);
+            if polled {
+                drive(&runtime);
+            }
+
+            drop(runtime);
+
+            assert_eq!(outcome_seen.get(), Some(false), "polled: {polled}");
+            let task = handle.borrow_mut().take().unwrap();
+            assert!(block_on(task).is_err());
+        }
+    }
+
     /// Polls ready tasks until none is left, the way the thread driving the runtime does.
     fn drive(runtime: &LocalRuntime) {
         while runtime.core.scheduler.run_one() {}
@@ -1308,6 +1357,24 @@ mod tests {
     impl Drop for SetOnDrop {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Polls the task in `handle` once as it is dropped, and notes in `outcome_seen` whether
+    /// that task had an outcome for its handle yet.
+    struct ProbeOnDrop {
+        handle: Rc<RefCell<Option<Task<()>>>>,
+        outcome_seen: Rc<Cell<Option<bool>>>,
+    }
+
+    impl Drop for ProbeOnDrop {
+        fn drop(&mut self) {
+            let mut handle = self.handle.borrow_mut();
+            let Some(task) = handle.as_mut() else {
+                return;
+            };
+            let polled = Pin::new(task).poll(&mut Context::from_waker(Waker::noop()));
+            self.outcome_seen.set(Some(polled.is_ready()));
         }
     }
 }
