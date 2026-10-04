@@ -362,6 +362,56 @@ where
     pub(crate) fn never_fires(&self) -> bool {
         self.deadline.is_none()
     }
+
+    /// Moves this timer to `deadline`, or makes it one that never comes due where there is none.
+    ///
+    /// The waker stored for the old deadline moves with it, so a task already waiting on this
+    /// timer is woken at the new deadline without being polled again. A reset only ever moves an
+    /// entry a poll put in the map, and never stores one of its own, which is why it never needs
+    /// to ask for a thread to fire it: the poll that stored the entry did, and the entry has kept
+    /// the reactor busy ever since.
+    pub(crate) fn reset(&mut self, deadline: Option<Instant>) {
+        let old = self.deadline.zip(self.id);
+        self.deadline = deadline;
+        // Nothing in the map for a timer nobody ever polled, nor for one that never came due: the
+        // next poll stores the new deadline as a first poll does, notification and all.
+        let Some((old_deadline, id)) = old else {
+            return;
+        };
+        let old_key = (old_deadline, id);
+
+        let (notify, dropped) = {
+            let mut timers = self.core.reactor.timers.lock();
+            // The earliest deadline before the reset, which is what the wait under way, if any,
+            // is bounded by.
+            let bound = timers.pending.keys().next().copied();
+            match (timers.pending.remove(&old_key), deadline) {
+                (Some(waker), Some(new)) => {
+                    let new_key = (new, id);
+                    // The id is this timer's own, so the key cannot be anybody else's.
+                    let replaced = timers.pending.insert(new_key, waker);
+                    // A deadline no earlier than the one the wait under way ends at gets no
+                    // wake-up: that wait ends at the old deadline, finds nothing due and waits
+                    // again, which costs less than a write on every reset a keep-alive makes.
+                    let earlier = bound.is_none_or(|bound| new_key < bound);
+
+                    (earlier, replaced)
+                }
+                // A timer that is never to come due leaves the map, and a thread whose wait was
+                // bounded by nothing but its deadline can stop waiting at once.
+                (Some(waker), None) => (bound == Some(old_key), Some(waker)),
+                // The timer has fired, and the reactor took it out, or a failed wait cleared the
+                // map: its task was woken, or is being, and its next poll stores the new deadline.
+                (None, _) => (false, None),
+            }
+        };
+        // Clear of the lock: dropping a waker can drop a task whose future holds a timer of this
+        // reactor, whose own drop takes this very lock.
+        drop(dropped);
+        if notify {
+            self.core.remote.notify();
+        }
+    }
 }
 
 impl<M> Future for Sleep<M>
@@ -785,6 +835,175 @@ mod tests {
         while second.count() == 0 {
             reactor.wait(None).unwrap();
         }
+        assert!(reactor.is_idle());
+    }
+
+    /// A reset moves a deadline the reactor holds, waker and all: the task waiting on the timer
+    /// is woken at the new deadline without polling the timer again.
+    #[test]
+    #[timeout(15000)]
+    fn a_reset_moves_the_deadline_and_keeps_the_waker() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (counter, waker) = counting_waker();
+        let mut sleep = pin!(runtime.sleep(Duration::from_secs(60)));
+        let polled = sleep.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        let started = Instant::now();
+
+        sleep.reset_after(Duration::from_millis(5));
+        // A wait may end on the wake-up the poll or the reset wrote, find nothing due and wait
+        // again: what ends the loop is the deadline the reset moved the waker to.
+        while counter.count() == 0 {
+            reactor.wait(None).unwrap();
+        }
+
+        assert!(started.elapsed() >= Duration::from_millis(5));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(counter.count(), 1);
+        assert!(reactor.is_idle());
+    }
+
+    /// A reset to a deadline earlier than any the reactor holds breaks the wait under way, which
+    /// was bounded by the old one.
+    #[test]
+    #[timeout(15000)]
+    fn a_reset_to_an_earlier_deadline_breaks_the_wait() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (counter, waker) = counting_waker();
+        let mut sleep = pin!(runtime.sleep(Duration::from_secs(60)));
+        let polled = sleep.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // The wake-up that poll wrote, taken out of the channel so that the wait below can only
+        // end on one written after it.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+
+        let waiting = {
+            let runtime = runtime.clone();
+            thread::spawn(move || {
+                let reactor = &runtime.core.reactor;
+                let started = Instant::now();
+                reactor.wait(None).unwrap();
+
+                started.elapsed()
+            })
+        };
+        // Long enough for the thread above to reach its wait, bounded by nothing but the
+        // deadline a minute ahead.
+        thread::sleep(Duration::from_millis(50));
+
+        sleep.reset_after(Duration::from_millis(5));
+
+        assert!(waiting.join().unwrap() < Duration::from_secs(1));
+        while counter.count() == 0 {
+            reactor.wait(None).unwrap();
+        }
+        assert!(reactor.is_idle());
+    }
+
+    /// A reset to a later deadline writes no wake-up: the wait under way ends at the old
+    /// deadline, finds nothing due and waits again, which costs less than a write on every reset
+    /// a keep-alive makes.
+    #[test]
+    #[timeout(15000)]
+    fn a_reset_to_a_later_deadline_writes_no_wake_up() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (_counter, waker) = counting_waker();
+        let mut sleep = runtime.sleep(Duration::from_millis(500));
+        let polled = Pin::new(&mut sleep).poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        // The wake-up that poll wrote, taken out of the channel, and the flag down with it.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+
+        // From this thread, which drives nothing: the driving thread is spared every write
+        // anyway, so it could not tell a reset that writes from one that does not.
+        sleep.reset_after(Duration::from_secs(60));
+
+        assert!(!runtime.core.remote.wake_pending());
+        // The deadline did move, and it is the new one that the timer's drop takes out.
+        let earliest = Lock::lock(&reactor.timers)
+            .pending
+            .keys()
+            .next()
+            .map(|(deadline, _)| *deadline);
+        assert_eq!(earliest, sleep.deadline());
+        drop(sleep);
+        assert!(reactor.is_idle());
+    }
+
+    /// A reset of a timer nobody polled stores nothing and writes no wake-up: the reactor has no
+    /// deadline of it to move, and the timer's first poll takes the new one.
+    #[test]
+    #[timeout(15000)]
+    fn a_reset_of_an_unpolled_sleep_stores_nothing() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let mut sleep = runtime.sleep(Duration::from_secs(60));
+
+        sleep.reset_after(Duration::from_secs(30));
+
+        assert!(reactor.is_idle());
+        assert!(!runtime.core.remote.wake_pending());
+    }
+
+    /// A reset to a deadline further ahead than the clock can name takes the timer out of the
+    /// reactor and lets its waker go: nothing is ever going to fire it. It breaks the wait that the
+    /// old deadline bounded, as dropping the timer does.
+    #[test]
+    #[timeout(15000)]
+    fn a_reset_beyond_the_clock_drops_the_waker() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (counter, waker) = counting_waker();
+        let mut sleep = pin!(runtime.sleep(Duration::from_secs(60)));
+        let polled = sleep.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        drop(waker);
+        // The test's own handle on the counter, and the waker the reactor keeps.
+        assert_eq!(Arc::strong_count(&counter), 2);
+        // The wake-up that poll wrote, taken out of the channel, and the flag down with it.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+
+        sleep.reset_after(Duration::MAX);
+        // The timer bounded the wait under way, so the reset breaks it.
+        assert!(runtime.core.remote.wake_pending());
+
+        assert!(sleep.deadline().is_none());
+        assert!(reactor.is_idle());
+        assert_eq!(Arc::strong_count(&counter), 1);
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// A timer that fired can be reset and fires again, at its new deadline.
+    ///
+    /// The reactor let the timer go when it fired it, so the reset has nothing to move and the
+    /// poll after it stores the new deadline, as a first poll does.
+    #[test]
+    #[timeout(15000)]
+    fn a_sleep_that_fired_fires_again_once_reset() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut sleep = pin!(runtime.sleep(Duration::from_millis(5)));
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+        while counter.count() == 0 {
+            reactor.wait(None).unwrap();
+        }
+        assert!(sleep.as_mut().poll(&mut cx).is_ready());
+
+        // Far enough ahead that the deadline is still to come at the poll just below.
+        sleep.reset_after(Duration::from_millis(100));
+        assert!(reactor.is_idle());
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+        while counter.count() == 1 {
+            reactor.wait(None).unwrap();
+        }
+
+        assert_eq!(counter.count(), 2);
+        assert!(sleep.as_mut().poll(&mut cx).is_ready());
         assert!(reactor.is_idle());
     }
 

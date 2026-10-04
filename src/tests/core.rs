@@ -12,12 +12,13 @@ use std::{
     io::{self, Write},
     mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Poll, Waker},
+    task::{Context, Poll, Wake, Waker},
     thread,
     time::{Duration, Instant},
 };
@@ -285,6 +286,106 @@ in_both_modes! {
 
         assert_eq!(runtime.sleep_until(deadline).deadline(), Some(deadline));
         assert!(runtime.sleep(Duration::MAX).deadline().is_none());
+    }
+}
+
+in_both_modes! {
+    /// A reset to a later deadline holds a timer back until that deadline, though the timer was
+    /// already waiting on the earlier one.
+    fn a_sleep_reset_to_a_later_deadline_resolves_at_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        runtime.block_on(async {
+            let mut sleep = runtime.sleep(Duration::from_millis(10));
+            // Polled first, so that the reset moves a deadline the runtime already waits on.
+            assert!(poll_once(&mut sleep).await.is_none());
+            sleep.reset_after(Duration::from_millis(50));
+            sleep.await;
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A reset to an earlier deadline brings a waiting timer forward, rather than leaving it to
+    /// the deadline it was polled with.
+    fn a_sleep_reset_to_an_earlier_deadline_resolves_at_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        runtime.block_on(async {
+            let mut sleep = runtime.sleep(Duration::from_secs(10));
+            assert!(poll_once(&mut sleep).await.is_none());
+            sleep.reset_after(Duration::from_millis(20));
+            sleep.await;
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A timer that has completed completes again once reset, at its new deadline.
+    fn a_completed_sleep_reset_completes_again<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let gap = Duration::from_millis(20);
+
+        let since_the_reset = runtime.block_on(async {
+            let mut sleep = runtime.sleep(Duration::from_millis(5));
+            (&mut sleep).await;
+            let reset = Instant::now();
+            sleep.reset_after(gap);
+            sleep.await;
+
+            reset.elapsed()
+        });
+
+        assert!(since_the_reset >= gap);
+        assert!(since_the_reset < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A task waiting on a timer is woken at the deadline the timer is reset to, though nothing
+    /// polls the timer after the reset: the waker it was polled with moves with the deadline.
+    ///
+    /// That waker is one the test counts the wakes of, rather than the `block_on` call's own,
+    /// which would show nothing: the call polls its future again after every wait, whatever
+    /// ended it.
+    fn a_reset_wakes_the_waiting_task_at_the_new_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut sleep = runtime.sleep(Duration::from_secs(10));
+        let (counter, waker) = counting_waker();
+        let mut polled = false;
+        let started = Instant::now();
+
+        runtime.block_on(poll_fn(|_| {
+            if !polled {
+                polled = true;
+                let first = Pin::new(&mut sleep).poll(&mut Context::from_waker(&waker));
+                assert!(first.is_pending());
+                sleep.reset_after(Duration::from_millis(20));
+
+                return Poll::Pending;
+            }
+            // The timer is never polled again, so what ends the call is the counted waker, woken
+            // at the new deadline by the wake that moved with it. Had the reset let that waker
+            // go instead, nothing would ever count, and once the new deadline had passed, no
+            // deadline would be left to bound the wait: the call would never end.
+            if counter.count() > 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(counter.count(), 1);
     }
 }
 
@@ -668,6 +769,35 @@ impl Future for ReadyThenPanicOnDrop {
 impl Drop for ReadyThenPanicOnDrop {
     fn drop(&mut self) {
         panic!("dropped with a panic on purpose");
+    }
+}
+
+/// A counter and the waker that counts into it.
+fn counting_waker() -> (Arc<Counter>, Waker) {
+    let counter = Arc::new(Counter::default());
+    let waker = Waker::from(counter.clone());
+
+    (counter, waker)
+}
+
+/// A waker that counts how often it has been woken.
+#[derive(Default)]
+struct Counter(AtomicUsize);
+
+impl Counter {
+    /// How often this waker has been woken.
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for Counter {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
     }
 }
 

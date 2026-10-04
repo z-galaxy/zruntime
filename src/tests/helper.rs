@@ -11,7 +11,7 @@ use std::{
     pin::{Pin, pin},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -358,6 +358,51 @@ fn a_sleep_until_starts_the_helper_and_dropping_it_lets_it_exit() {
     }
 
     assert!(helper_gone(&runtime));
+}
+
+/// A timer the helper waits on is fired at the deadline it is reset to, earlier than the one it
+/// was polled with, though nothing polls it again.
+#[test]
+#[timeout(15000)]
+fn the_helper_fires_a_sleep_reset_to_an_earlier_deadline() {
+    let runtime = runtime();
+    let woken = Arc::new(Woken::default());
+    let waker = Waker::from(woken.clone());
+    let mut sleep = runtime.sleep(Duration::from_secs(10));
+    // Polled outside any `block_on`, so that the thread waiting on the deadline is the helper.
+    let polled = Pin::new(&mut sleep).poll(&mut Context::from_waker(&waker));
+    assert!(polled.is_pending());
+    assert!(runtime.helper_running());
+    // Long enough for the helper to reach its wait, bounded by the deadline ten seconds ahead,
+    // which the reset then has to break.
+    thread::sleep(Duration::from_millis(50));
+
+    sleep.reset_after(Duration::from_millis(20));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while woken.count() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(woken.count(), 1);
+}
+
+/// A timer reset to never come due gives up the deadline that kept the helper waiting, and the
+/// helper, with nothing left to wait on, exits while the timer itself lives on.
+#[test]
+#[timeout(15000)]
+fn a_sleep_reset_beyond_the_clock_lets_the_helper_exit() {
+    let runtime = runtime();
+    let mut sleep = pin!(runtime.sleep(Duration::from_secs(10)));
+    assert!(block_on(poll_once(sleep.as_mut())).is_none());
+    assert!(runtime.helper_running());
+    // Long enough for the helper to reach its wait, bounded by the deadline ten seconds ahead,
+    // which the reset then has to break.
+    thread::sleep(Duration::from_millis(50));
+
+    sleep.reset_after(Duration::MAX);
+
+    assert!(helper_gone(&runtime));
+    assert!(!runtime.inner().is_busy());
 }
 
 #[test]
@@ -1433,5 +1478,22 @@ fn within_a_second(condition: impl Fn() -> bool) -> bool {
             return false;
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A waker that counts how often it has been woken.
+#[derive(Default)]
+struct Woken(AtomicUsize);
+
+impl Woken {
+    /// How often this waker has been woken.
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
     }
 }
