@@ -7,29 +7,34 @@
 //! shared runtime — are written for that flavour alone.
 
 use std::{
-    cell::RefCell,
-    future::{Future, pending, poll_fn},
+    cell::{Cell, RefCell},
+    future::{Future, Pending, pending, poll_fn},
     io::{self, Write},
     mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Poll, Waker},
+    task::{Context, Poll, Wake, Waker},
     thread,
     time::{Duration, Instant},
 };
 
-use futures_lite::future::yield_now;
+use futures_lite::{
+    Stream, StreamExt,
+    future::{poll_once, yield_now},
+};
 use ntest::timeout;
 use socket2::{SockRef, Socket};
 
 #[cfg(feature = "event")]
 use crate::Event;
 use crate::{
-    Interest, Local, LocalRuntime, Mode, Registration, Runtime, Shared, SharedRuntime, Sleep, Task,
+    Interest, Interval, Local, LocalRuntime, MissedTickBehavior, Mode, Registration, Runtime,
+    Shared, SharedRuntime, Sleep, Task, TimedOut, Timeout,
 };
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local`
@@ -246,6 +251,426 @@ in_both_modes! {
 
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    fn sleep_until_resolves_once_the_deadline_has_passed<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
+
+        runtime.block_on(runtime.sleep_until(deadline));
+
+        assert!(Instant::now() >= deadline);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A deadline that has passed by the first poll is no reason to wait: the timer completes
+    /// on that poll, with nothing left behind for the reactor to fire.
+    fn sleep_until_a_passed_deadline_is_ready_on_its_first_poll<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        // The clock has moved on by the time of the poll, however little.
+        let deadline = Instant::now();
+
+        let polled = runtime.block_on(poll_once(runtime.sleep_until(deadline)));
+
+        assert!(polled.is_some());
+    }
+}
+
+in_both_modes! {
+    /// A timer says when it comes due, whichever way it was asked for, and has no such moment
+    /// where the clock cannot name one.
+    fn a_sleep_reports_its_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        assert_eq!(runtime.sleep_until(deadline).deadline(), Some(deadline));
+        assert!(runtime.sleep(Duration::MAX).deadline().is_none());
+    }
+}
+
+in_both_modes! {
+    /// A reset to a later deadline holds a timer back until that deadline, though the timer was
+    /// already waiting on the earlier one.
+    fn a_sleep_reset_to_a_later_deadline_resolves_at_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        runtime.block_on(async {
+            let mut sleep = runtime.sleep(Duration::from_millis(10));
+            // Polled first, so that the reset moves a deadline the runtime already waits on.
+            assert!(poll_once(&mut sleep).await.is_none());
+            sleep.reset_after(Duration::from_millis(50));
+            sleep.await;
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A reset to an earlier deadline brings a waiting timer forward, rather than leaving it to
+    /// the deadline it was polled with.
+    fn a_sleep_reset_to_an_earlier_deadline_resolves_at_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        runtime.block_on(async {
+            let mut sleep = runtime.sleep(Duration::from_secs(10));
+            assert!(poll_once(&mut sleep).await.is_none());
+            sleep.reset_after(Duration::from_millis(20));
+            sleep.await;
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A timer that has completed completes again once reset, at its new deadline.
+    fn a_completed_sleep_reset_completes_again<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let gap = Duration::from_millis(20);
+
+        let since_the_reset = runtime.block_on(async {
+            let mut sleep = runtime.sleep(Duration::from_millis(5));
+            (&mut sleep).await;
+            let reset = Instant::now();
+            sleep.reset_after(gap);
+            sleep.await;
+
+            reset.elapsed()
+        });
+
+        assert!(since_the_reset >= gap);
+        assert!(since_the_reset < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A task waiting on a timer is woken at the deadline the timer is reset to, though nothing
+    /// polls the timer after the reset: the waker it was polled with moves with the deadline.
+    ///
+    /// That waker is one the test counts the wakes of, rather than the `block_on` call's own,
+    /// which would show nothing: the call polls its future again after every wait, whatever
+    /// ended it.
+    fn a_reset_wakes_the_waiting_task_at_the_new_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut sleep = runtime.sleep(Duration::from_secs(10));
+        let (counter, waker) = counting_waker();
+        let mut polled = false;
+        let started = Instant::now();
+
+        runtime.block_on(poll_fn(|_| {
+            if !polled {
+                polled = true;
+                let first = Pin::new(&mut sleep).poll(&mut Context::from_waker(&waker));
+                assert!(first.is_pending());
+                sleep.reset_after(Duration::from_millis(20));
+
+                return Poll::Pending;
+            }
+            // The timer is never polled again, so what ends the call is the counted waker, woken
+            // at the new deadline by the wake that moved with it. Had the reset let that waker
+            // go instead, nothing would ever count, and once the new deadline had passed, no
+            // deadline would be left to bound the wait: the call would never end.
+            if counter.count() > 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(counter.count(), 1);
+    }
+}
+
+in_both_modes! {
+    fn a_timeout_hands_back_what_the_future_produced<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        let output = runtime.block_on(runtime.timeout(Duration::from_secs(10), async { 7 }));
+
+        assert_eq!(output, Ok(7));
+    }
+}
+
+in_both_modes! {
+    fn a_timeout_on_a_future_that_never_completes_times_out<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        let output = runtime.block_on(runtime.timeout(Duration::from_millis(50), pending::<()>()));
+
+        assert_eq!(output, Err(TimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A deadline that has passed by the first poll times a waiting future out on that poll,
+    /// with no wait for the reactor to fire it.
+    fn a_timeout_at_a_passed_deadline_times_out_on_its_first_poll<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let timeout = runtime.timeout_at(Instant::now(), pending::<()>());
+
+        let polled = runtime.block_on(poll_once(timeout));
+
+        assert_eq!(polled, Some(Err(TimedOut)));
+    }
+}
+
+in_both_modes! {
+    /// The future has its turn before the deadline is looked at, so one that is ready hands back
+    /// its output even where the deadline has passed already.
+    fn a_timeout_polls_the_future_before_the_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let timeout = runtime.timeout_at(Instant::now(), async { 7 });
+
+        let polled = runtime.block_on(poll_once(timeout));
+
+        assert_eq!(polled, Some(Ok(7)));
+    }
+}
+
+in_both_modes! {
+    /// A future that cannot be moved once polled, an async block that holds a borrow of its own
+    /// across a wait, is run in place.
+    fn a_timeout_runs_a_future_that_is_not_unpin<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        let output = runtime.block_on(runtime.timeout(Duration::from_secs(10), async {
+            let values = [3, 5, 7];
+            let last = &values[2];
+            runtime.sleep(Duration::from_millis(10)).await;
+
+            *last
+        }));
+
+        assert_eq!(output, Ok(7));
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A future that ran out of time is not dropped with it: the timeout hands it back, to be
+    /// driven to completion with no deadline at all.
+    fn a_timeout_hands_back_its_future_after_timing_out<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        // Shut until the time-out, so that the future cannot win the race against the deadline
+        // however slowly this runs.
+        let open = Cell::new(false);
+        let gate = Box::pin(poll_fn(|_| {
+            if open.get() {
+                Poll::Ready(7)
+            } else {
+                Poll::Pending
+            }
+        }));
+        let mut timeout = runtime.timeout(Duration::from_millis(10), gate);
+
+        assert_eq!(runtime.block_on(&mut timeout), Err(TimedOut));
+        open.set(true);
+        let output = runtime.block_on(timeout.into_inner());
+
+        assert_eq!(output, 7);
+    }
+}
+
+/// A time-out is an I/O error of the kind made for it, which carries the time-out itself, so
+/// that code returning an `io::Result` can hand one on with `?`.
+#[test]
+#[timeout(15000)]
+fn timed_out_converts_into_an_io_error_of_its_kind() {
+    let error = io::Error::from(TimedOut);
+
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.get_ref().is_some_and(|inner| inner.is::<TimedOut>()));
+}
+
+in_both_modes! {
+    /// Each tick is the moment it was scheduled for, a period after the one before, the first one
+    /// period after the interval was made.
+    fn an_interval_ticks_once_a_period<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+        let started = Instant::now();
+
+        let ticks = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            [interval.tick().await, interval.tick().await, interval.tick().await]
+        });
+
+        assert!(ticks[0] >= started + period);
+        assert!(ticks[0] < started + Duration::from_secs(1));
+        assert_eq!(ticks[1] - ticks[0], period);
+        assert_eq!(ticks[2] - ticks[1], period);
+        assert!(started.elapsed() >= 3 * period);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// An interval started at a moment that has passed already ticks on its first poll, with that
+    /// moment, and keeps to the schedule from it.
+    fn an_interval_at_a_passed_start_ticks_at_once<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+        let start = Instant::now();
+        let mut interval = runtime.interval_at(start, period);
+
+        let first = runtime.block_on(poll_once(interval.tick()));
+        let second = runtime.block_on(interval.tick());
+
+        assert_eq!(first, Some(start));
+        assert_eq!(second, start + period);
+        assert!(Instant::now() >= start + period);
+    }
+}
+
+in_both_modes! {
+    fn an_interval_is_a_stream_of_its_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(5);
+        let start = Instant::now() + period;
+        let interval = runtime.interval_at(start, period);
+
+        let ticks: Vec<Instant> = runtime.block_on(interval.take(3).collect());
+
+        assert_eq!(ticks, [start, start + period, start + 2 * period]);
+    }
+}
+
+in_both_modes! {
+    /// Ticks missed while the thread was blocked are handed out one after the other, each with
+    /// the moment it was scheduled for, so the schedule is kept.
+    fn an_interval_bursts_through_missed_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+
+        let (first, after) = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Burst);
+            let first = interval.tick().await;
+            // Blocked rather than waiting, so that the runtime cannot hand out a tick meanwhile.
+            thread::sleep(period * 7 / 2);
+
+            (first, [interval.tick().await, interval.tick().await, interval.tick().await])
+        });
+
+        assert_eq!(after, [first + period, first + 2 * period, first + 3 * period]);
+    }
+}
+
+in_both_modes! {
+    /// After a tick missed, the next one comes a full period after the late one was handed out.
+    fn an_interval_delays_after_missed_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+
+        let (stalled_until, late, next) = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            interval.tick().await;
+            thread::sleep(period * 7 / 2);
+            let stalled_until = Instant::now();
+
+            (stalled_until, interval.tick().await, interval.tick().await)
+        });
+
+        assert!(late < stalled_until);
+        assert!(next >= stalled_until + period);
+        assert!(Instant::now() >= next);
+    }
+}
+
+in_both_modes! {
+    /// After ticks missed, the next one is the first of the original schedule still to come.
+    fn an_interval_skips_missed_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+
+        let (first, stalled_until, late, next) = runtime.block_on(async {
+            let mut interval = runtime.interval(period);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let first = interval.tick().await;
+            thread::sleep(period * 7 / 2);
+            let stalled_until = Instant::now();
+
+            (first, stalled_until, interval.tick().await, interval.tick().await)
+        });
+
+        // The tick that was due as the stall began is handed out late, and those missed after it
+        // are not: the one after it is the first still to come once the stall was over.
+        assert!(late < stalled_until);
+        assert!(next > stalled_until);
+        assert_eq!((late - first).as_nanos() % period.as_nanos(), 0);
+        assert_eq!((next - first).as_nanos() % period.as_nanos(), 0);
+    }
+}
+
+in_both_modes! {
+    /// A reset starts the schedule over, one period from the reset, however close the tick it
+    /// replaces was.
+    fn an_interval_reset_ticks_a_period_after_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let period = Duration::from_millis(20);
+        let mut interval = runtime.interval_at(Instant::now(), period);
+
+        let reset = Instant::now();
+        interval.reset();
+        let tick = runtime.block_on(interval.tick());
+
+        assert!(tick >= reset + period);
+        assert!(Instant::now() >= tick);
+        assert!(reset.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    fn an_interval_with_a_zero_period_panics<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        let interval = catch_unwind(AssertUnwindSafe(|| runtime.interval(Duration::ZERO)));
+        let interval_at = catch_unwind(AssertUnwindSafe(|| {
+            runtime.interval_at(Instant::now(), Duration::ZERO)
+        }));
+
+        assert!(interval.is_err());
+        assert!(interval_at.is_err());
+    }
+}
+
+in_both_modes! {
+    /// An interval whose ticks the clock cannot name never ticks: one asked for a period further
+    /// ahead than the clock can name has no first tick, and one started now hands out its first
+    /// tick and then no other.
+    ///
+    /// As a stream, neither ends, and neither promises any tick to come either: the size hint of
+    /// an interval is no more than any stream's.
+    fn an_interval_beyond_the_clock_never_ticks<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut never = runtime.interval(Duration::MAX);
+        let start = Instant::now();
+        let mut once = runtime.interval_at(start, Duration::MAX);
+
+        assert!(runtime.block_on(poll_once(never.tick())).is_none());
+        assert_eq!(Stream::size_hint(&never), (0, None));
+        assert_eq!(runtime.block_on(poll_once(once.tick())), Some(start));
+        // The tick after it is a whole period after `start`, beyond the clock.
+        assert!(runtime.block_on(poll_once(once.tick())).is_none());
+        assert_eq!(Stream::size_hint(&once), (0, None));
     }
 }
 
@@ -515,7 +940,8 @@ fn a_second_concurrent_block_on_panics() {
 }
 
 /// What a shared runtime's handles are shared as: a task handle and a registration live in state
-/// that several threads reach, and a runtime handle is cloned into the tasks it spawns.
+/// that several threads reach, a runtime handle is cloned into the tasks it spawns, and a timer,
+/// a timeout or an interval goes wherever the task awaiting it is polled.
 #[test]
 fn shared_handles_cross_threads() {
     fn sent_and_shared<T>()
@@ -528,6 +954,8 @@ fn shared_handles_cross_threads() {
     sent_and_shared::<Task<(), Shared>>();
     sent_and_shared::<Registration<Shared>>();
     sent_and_shared::<Sleep<Shared>>();
+    sent_and_shared::<Timeout<Pending<()>, Shared>>();
+    sent_and_shared::<Interval<Shared>>();
 }
 
 /// Spawning and registering, through whichever of the two flavours' own methods `Self` names.
@@ -629,6 +1057,35 @@ impl Future for ReadyThenPanicOnDrop {
 impl Drop for ReadyThenPanicOnDrop {
     fn drop(&mut self) {
         panic!("dropped with a panic on purpose");
+    }
+}
+
+/// A counter and the waker that counts into it.
+fn counting_waker() -> (Arc<Counter>, Waker) {
+    let counter = Arc::new(Counter::default());
+    let waker = Waker::from(counter.clone());
+
+    (counter, waker)
+}
+
+/// A waker that counts how often it has been woken.
+#[derive(Default)]
+struct Counter(AtomicUsize);
+
+impl Counter {
+    /// How often this waker has been woken.
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for Counter {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
     }
 }
 

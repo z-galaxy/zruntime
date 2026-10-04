@@ -39,6 +39,8 @@ mod reactor;
 mod runtime;
 #[cfg(feature = "runtime")]
 mod scheduler;
+#[cfg(feature = "runtime")]
+mod time;
 #[cfg(feature = "unblock")]
 mod unblock;
 
@@ -50,13 +52,13 @@ use std::os::windows::io::AsSocket as AsSource;
 use std::{
     borrow::Cow,
     fmt,
-    future::Future,
+    future::{Future, IntoFuture},
     io,
     pin::Pin,
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "event")]
@@ -69,6 +71,8 @@ pub use reactor::Registration;
 use runtime::Core;
 #[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
+#[cfg(feature = "runtime")]
+pub use time::{Interval, MissedTickBehavior, Sleep, TimedOut, Timeout};
 #[cfg(feature = "unblock")]
 pub use unblock::{BlockingWork, Unblock, unblock};
 
@@ -199,7 +203,176 @@ where
 
     /// A future that completes once `duration` has passed. Dropping it cancels the timer.
     pub fn sleep(&self, duration: Duration) -> Sleep<M> {
-        Sleep(reactor::sleep::<M>(&self.core, duration))
+        // This runtime's timers run on the standard clock, so a length of time is a deadline on
+        // it — where the clock has a moment that far ahead. `Duration::MAX`, which a wait of
+        // "however long it takes" comes to, has none, and asks for a timer that never fires
+        // rather than for a moment the clock cannot name.
+        let deadline = Instant::now().checked_add(duration);
+
+        Sleep(reactor::sleep::<M>(&self.core, deadline))
+    }
+
+    /// A future that completes once `deadline` has passed: at once, on its first poll, where it
+    /// already has. Dropping it cancels the timer.
+    ///
+    /// This is what a loop that has to keep to a schedule reaches for. One that sleeps for a
+    /// period in each round drifts by however long the work of that round took, and the error
+    /// adds up with every round. One that adds the period to a deadline of its own and sleeps
+    /// until that deadline starts each round when it was due, however long the rounds before it
+    /// took.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let period = Duration::from_millis(2);
+    /// let started = Instant::now();
+    ///
+    /// runtime.block_on(async {
+    ///     let mut deadline = started;
+    ///     for _ in 0..3 {
+    ///         deadline += period;
+    ///         runtime.sleep_until(deadline).await;
+    ///     }
+    /// });
+    ///
+    /// assert!(started.elapsed() >= 3 * period);
+    /// ```
+    pub fn sleep_until(&self, deadline: Instant) -> Sleep<M> {
+        Sleep(reactor::sleep::<M>(&self.core, Some(deadline)))
+    }
+
+    /// A future that runs `future` until it completes or `duration` has passed, whichever comes
+    /// first: it resolves to what `future` produced, or to [`TimedOut`] where the time ran out.
+    /// Dropping it drops `future` and cancels the timer.
+    ///
+    /// The clock starts here, at the call, rather than at the first poll: a timeout made well
+    /// before it is awaited has had that much of its time already. A duration further ahead than
+    /// the clock can name, as `Duration::MAX` is, gives a timeout that never fires. Each poll
+    /// gives `future` its turn before it looks at the clock, so a future that completes on the
+    /// very poll its time runs out on still hands back its output. A future that runs out of time
+    /// is not dropped there: it lives on inside the timeout, which [`Timeout::into_inner`] hands
+    /// it back from, to be retried or driven on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{future, io, time::Duration};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    ///
+    /// runtime.block_on(async {
+    ///     let in_time = runtime.timeout(Duration::from_secs(60), async { 7 }).await;
+    ///     assert_eq!(in_time, Ok(7));
+    ///
+    ///     let late = runtime.timeout(Duration::from_millis(2), future::pending::<()>());
+    ///     assert!(late.await.is_err());
+    /// });
+    ///
+    /// // A time-out is an I/O error of its own kind, for code that returns `io::Result`.
+    /// fn wait(runtime: &LocalRuntime) -> io::Result<()> {
+    ///     runtime.block_on(runtime.timeout(Duration::from_millis(2), future::pending::<()>()))?;
+    ///
+    ///     Ok(())
+    /// }
+    /// assert_eq!(wait(&runtime).unwrap_err().kind(), io::ErrorKind::TimedOut);
+    /// ```
+    pub fn timeout<F>(&self, duration: Duration, future: F) -> Timeout<F::IntoFuture, M>
+    where
+        F: IntoFuture,
+    {
+        Timeout::new(future.into_future(), self.sleep(duration))
+    }
+
+    /// A future that runs `future` until it completes or `deadline` has passed, whichever comes
+    /// first, as [`timeout`](Self::timeout) does: where `deadline` has passed already, a future
+    /// that is not ready on its first poll times out on that poll. Dropping it drops `future` and
+    /// cancels the timer.
+    ///
+    /// This is what a piece of work made of several steps reaches for, to keep all of them to
+    /// one deadline rather than give each a length of time of its own.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let deadline = Instant::now() + Duration::from_millis(5);
+    ///
+    /// runtime.block_on(async {
+    ///     // Steps of 2 ms each, for as long as each finishes before the deadline.
+    ///     while runtime
+    ///         .timeout_at(deadline, runtime.sleep(Duration::from_millis(2)))
+    ///         .await
+    ///         .is_ok()
+    ///     {}
+    /// });
+    ///
+    /// // However many steps fit, the loop ended once the deadline had passed.
+    /// assert!(Instant::now() >= deadline);
+    /// ```
+    pub fn timeout_at<F>(&self, deadline: Instant, future: F) -> Timeout<F::IntoFuture, M>
+    where
+        F: IntoFuture,
+    {
+        Timeout::new(future.into_future(), self.sleep_until(deadline))
+    }
+
+    /// A timer that ticks once every `period`, the first time one period from now. An interval
+    /// asked for further ahead than the clock can name never ticks.
+    ///
+    /// Each tick hands out the moment it was scheduled for, and the ticks keep to the schedule
+    /// however long the work done at each of them takes. A tick missed because the task was busy,
+    /// or its thread blocked, for a period or more is made up for as the interval's
+    /// [`MissedTickBehavior`] says: by default, at once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `period` is zero: such an interval would tick on every poll, without end.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let period = Duration::from_millis(2);
+    /// let started = Instant::now();
+    ///
+    /// let ticks = runtime.block_on(async {
+    ///     let mut interval = runtime.interval(period);
+    ///     [interval.tick().await, interval.tick().await, interval.tick().await]
+    /// });
+    ///
+    /// // Each tick is the moment it was scheduled for, a period after the one before.
+    /// assert!(ticks[0] >= started + period);
+    /// assert_eq!(ticks[1] - ticks[0], period);
+    /// assert_eq!(ticks[2] - ticks[1], period);
+    /// ```
+    pub fn interval(&self, period: Duration) -> Interval<M> {
+        Interval::new(self.sleep(period), period)
+    }
+
+    /// A timer that ticks once every `period`, as [`interval`](Self::interval) does, the first
+    /// time at `start`: at once, on its first poll, where `start` has passed already, as it has
+    /// for `interval_at(Instant::now(), period)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `period` is zero: such an interval would tick on every poll, without end.
+    pub fn interval_at(&self, start: Instant, period: Duration) -> Interval<M> {
+        Interval::new(self.sleep_until(start), period)
     }
 }
 
@@ -504,44 +677,6 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.poll_join(cx)
-    }
-}
-
-/// A timer on a [`Runtime`], which keeps a thread on it for as long as it has a deadline.
-///
-/// The reactor takes a timer's deadline on the first poll of it rather than where it is made, and
-/// the thread that is to fire it has to be there from that poll onwards, however long ago the
-/// timer was asked for. So it is the poll that asks for one — a helper thread, on a runtime from
-/// `SharedRuntime::current` that nobody is inside `block_on` on — and a timer nobody ever polls
-/// costs nothing at all. A timer holds its runtime, so a task holding one keeps that runtime
-/// alive: nothing here takes a runtime down while it has work.
-#[cfg(feature = "runtime")]
-pub struct Sleep<M = Local>(reactor::Sleep<M>)
-where
-    M: Mode;
-
-#[cfg(feature = "runtime")]
-impl<M> Future for Sleep<M>
-where
-    M: Mode,
-{
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if Pin::new(&mut this.0).poll(cx).is_ready() {
-            return Poll::Ready(());
-        }
-        // A timer that never comes due leaves no deadline behind and needs no thread: one
-        // started for it would find nothing to wait on and retire in the round it started.
-        if this.0.never_fires() {
-            return Poll::Pending;
-        }
-        // Asked for once the deadline is in the reactor's map, so that a helper starting here
-        // waits on it.
-        M::ensure_progress(this.0.core());
-
-        Poll::Pending
     }
 }
 

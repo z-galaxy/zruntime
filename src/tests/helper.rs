@@ -5,13 +5,13 @@
 
 use std::{
     cell::RefCell,
-    future::{Future, pending, poll_fn},
+    future::{Future, Pending, pending, poll_fn},
     io::Write,
     mem::MaybeUninit,
     pin::{Pin, pin},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -26,12 +26,14 @@ use super::core::pair;
 #[cfg(feature = "event")]
 use crate::{Event, EventListener};
 use crate::{
-    Interest, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, driver,
+    Interest, Interval, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, Timeout,
+    driver,
     runtime::{Core, lock},
 };
 
 /// What a handle is shared as: a task handle and a registration live in state that several threads
-/// reach, and a runtime handle is cloned into the tasks it spawns.
+/// reach, a runtime handle is cloned into the tasks it spawns, and a timer, a timeout or an
+/// interval goes wherever the task awaiting it is polled.
 #[test]
 #[timeout(15000)]
 fn handles_cross_threads() {
@@ -50,6 +52,8 @@ fn handles_cross_threads() {
     shared::<Task<(), Shared>>();
     shared::<Registration<Shared>>();
     sent::<Sleep<Shared>>();
+    sent::<Timeout<Pending<()>, Shared>>();
+    sent::<Interval<Shared>>();
 }
 
 #[test]
@@ -343,6 +347,148 @@ fn a_dropped_sleep_lets_the_helper_exit() {
     assert!(helper_gone(&runtime));
 }
 
+/// A timer made for a deadline asks for the helper on its first poll, as one made for a duration
+/// does, and lets it go once dropped.
+#[test]
+#[timeout(15000)]
+fn a_sleep_until_starts_the_helper_and_dropping_it_lets_it_exit() {
+    let runtime = runtime();
+    {
+        let mut sleep = pin!(runtime.sleep_until(Instant::now() + Duration::from_secs(10)));
+        // Made but not yet polled, the timer has handed the reactor nothing to wait on.
+        assert!(!runtime.helper_running());
+        assert!(block_on(poll_once(sleep.as_mut())).is_none());
+        assert!(runtime.helper_running());
+    }
+
+    assert!(helper_gone(&runtime));
+}
+
+/// A timer the helper waits on is fired at the deadline it is reset to, earlier than the one it
+/// was polled with, though nothing polls it again.
+#[test]
+#[timeout(15000)]
+fn the_helper_fires_a_sleep_reset_to_an_earlier_deadline() {
+    let runtime = runtime();
+    let woken = Arc::new(Woken::default());
+    let waker = Waker::from(woken.clone());
+    let mut sleep = runtime.sleep(Duration::from_secs(10));
+    // Polled outside any `block_on`, so that the thread waiting on the deadline is the helper.
+    let polled = Pin::new(&mut sleep).poll(&mut Context::from_waker(&waker));
+    assert!(polled.is_pending());
+    assert!(runtime.helper_running());
+    // Long enough for the helper to reach its wait, bounded by the deadline ten seconds ahead,
+    // which the reset then has to break.
+    thread::sleep(Duration::from_millis(50));
+
+    sleep.reset_after(Duration::from_millis(20));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while woken.count() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(woken.count(), 1);
+}
+
+/// A timer reset to never come due gives up the deadline that kept the helper waiting, and the
+/// helper, with nothing left to wait on, exits while the timer itself lives on.
+#[test]
+#[timeout(15000)]
+fn a_sleep_reset_beyond_the_clock_lets_the_helper_exit() {
+    let runtime = runtime();
+    let mut sleep = pin!(runtime.sleep(Duration::from_secs(10)));
+    assert!(block_on(poll_once(sleep.as_mut())).is_none());
+    assert!(runtime.helper_running());
+    // Long enough for the helper to reach its wait, bounded by the deadline ten seconds ahead,
+    // which the reset then has to break.
+    thread::sleep(Duration::from_millis(50));
+
+    sleep.reset_after(Duration::MAX);
+
+    assert!(helper_gone(&runtime));
+    assert!(!runtime.inner().is_busy());
+}
+
+/// A timeout whose future is left waiting asks for the helper, as a timer does on its first poll,
+/// and lets it go once dropped.
+#[test]
+#[timeout(15000)]
+fn a_timeout_starts_the_helper_and_dropping_it_lets_it_exit() {
+    let runtime = runtime();
+    {
+        let mut timeout = pin!(runtime.timeout(Duration::from_secs(10), pending::<()>()));
+        // Made but not yet polled, the timeout has handed the reactor nothing to wait on.
+        assert!(!runtime.helper_running());
+        assert!(block_on(poll_once(timeout.as_mut())).is_none());
+        assert!(runtime.helper_running());
+    }
+
+    assert!(helper_gone(&runtime));
+}
+
+/// A timeout whose future completes on its first poll never polls its timer, so no deadline
+/// reaches the reactor and no helper is asked for.
+#[test]
+#[timeout(15000)]
+fn a_timeout_whose_future_completes_at_once_starts_no_helper() {
+    let runtime = runtime();
+
+    let output = block_on(runtime.timeout(Duration::from_secs(10), async { 7 }));
+
+    assert_eq!(output.ok(), Some(7));
+    assert!(!runtime.helper_running());
+    assert!(!runtime.inner().is_busy());
+}
+
+/// An interval asks for the helper on its first poll, as a timer does, and lets it go once
+/// dropped.
+#[test]
+#[timeout(15000)]
+fn an_interval_starts_the_helper_and_dropping_it_lets_it_exit() {
+    let runtime = runtime();
+    {
+        let mut interval = runtime.interval(Duration::from_secs(10));
+        // Made but not yet polled, the interval has handed the reactor nothing to wait on.
+        assert!(!runtime.helper_running());
+        assert!(block_on(poll_once(interval.tick())).is_none());
+        assert!(runtime.helper_running());
+    }
+
+    assert!(helper_gone(&runtime));
+}
+
+/// An interval nobody drives through `block_on` keeps ticking on the helper alone: each tick's
+/// wake comes from the helper, and the poll after it, which moves the interval on to its next
+/// tick, asks for the helper again where it has retired in between.
+#[test]
+#[timeout(15000)]
+fn the_helper_keeps_an_interval_ticking() {
+    let runtime = runtime();
+    let period = Duration::from_millis(20);
+    let woken = Arc::new(Woken::default());
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut interval = runtime.interval(period);
+    let mut ticks = Vec::new();
+
+    while ticks.len() < 3 {
+        let seen = woken.count();
+        match interval.poll_tick(&mut cx) {
+            Poll::Ready(tick) => ticks.push(tick),
+            Poll::Pending => {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while woken.count() == seen && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(woken.count() > seen);
+            }
+        }
+    }
+
+    assert_eq!(ticks[1] - ticks[0], period);
+    assert_eq!(ticks[2] - ticks[1], period);
+}
+
 #[test]
 #[timeout(15000)]
 fn a_sleep_beyond_the_clock_starts_no_helper() {
@@ -353,6 +499,20 @@ fn a_sleep_beyond_the_clock_starts_no_helper() {
 
     // A timer nothing can ever fire has no deadline for a thread to wait on, so none is asked
     // for: a helper started here would retire in the very round it started.
+    assert!(!runtime.helper_running());
+    assert!(!runtime.inner().is_busy());
+}
+
+#[test]
+#[timeout(15000)]
+fn an_interval_beyond_the_clock_starts_no_helper() {
+    let runtime = runtime();
+    let mut interval = runtime.interval(Duration::MAX);
+
+    assert!(block_on(poll_once(interval.tick())).is_none());
+
+    // An interval whose first tick the clock cannot name has no deadline for a thread to wait
+    // on, as a timer that is never to fire has none, so no helper is asked for.
     assert!(!runtime.helper_running());
     assert!(!runtime.inner().is_busy());
 }
@@ -1416,5 +1576,22 @@ fn within_a_second(condition: impl Fn() -> bool) -> bool {
             return false;
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A waker that counts how often it has been woken.
+#[derive(Default)]
+struct Woken(AtomicUsize);
+
+impl Woken {
+    /// How often this waker has been woken.
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
     }
 }

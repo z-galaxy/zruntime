@@ -21,13 +21,13 @@ zbus's built-in runtime, which now depends on it.
 
 Two default cargo features, each usable without the other, split the crate. `runtime` is the
 runtime above — `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations —
-and is what needs `rustix` on unix and `windows-sys` on Windows. `event` is `Event` and
-`EventListener`, a notification that tasks wait for, which needs no runtime and works under any
-executor. A crate that only notifies builds zruntime with
-`default-features = false, features = ["event"]` and gets none of the runtime (zbus, whatever
-runtime it runs on, adds `broadcast` and `lock` to that); one that only runs tasks leaves `event`
-out. `helper` implies `runtime`, and `tracing`, also a default feature, makes the runtime log
-through the `tracing` crate.
+and is what needs `rustix` on unix and `windows-sys` on Windows, and `futures-core` everywhere, for
+the `Stream` impl of its interval timer. `event` is `Event` and `EventListener`, a notification
+that tasks wait for, which needs no runtime and works under any executor. A crate that only
+notifies builds zruntime with `default-features = false, features = ["event"]` and gets none of
+the runtime (zbus, whatever runtime it runs on, adds `broadcast` and `lock` to that); one that
+only runs tasks leaves `event` out. `helper` implies `runtime`, and `tracing`, also a default
+feature, makes the runtime log through the `tracing` crate.
 
 A non-default `broadcast` feature, which implies `event` and adds a `futures-core` dependency,
 gives `zruntime::broadcast`: an async multi-producer multi-consumer broadcast channel, moved here
@@ -155,8 +155,9 @@ threads. A target holds benchmarks of one kind only, and a new one goes in the l
 ```
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Interest,
-│                 # Task, Sleep (runtime feature), Event, EventListener (event feature), and
-│                 # the free block_on (helper feature)
+│                 # Task, Sleep, Timeout, TimedOut, Interval, MissedTickBehavior (runtime
+│                 # feature), Event, EventListener (event feature), and the free block_on
+│                 # (helper feature)
 ├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
 │                 # any executor, with no use of the runtime
 ├── event-only.md # The crate's documentation in a build with `event` but not `runtime`, whose
@@ -176,6 +177,7 @@ src/
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
+├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, Timeout and Interval
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
@@ -259,6 +261,7 @@ it. No socket is `Clone`.
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
 - `src/reactor.rs`: I/O readiness and timers
 - `src/scheduler.rs`: Task storage and polling
+- `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`

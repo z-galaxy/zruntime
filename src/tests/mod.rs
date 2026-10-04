@@ -106,6 +106,30 @@ struct LocalRuntimeStaysOnItsThread;
 /// sent::<zruntime::Sleep<zruntime::Local>>();
 /// ```
 ///
+/// ...a timeout, though the future it runs may go anywhere...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Timeout<std::future::Pending<()>, zruntime::Local>>();
+/// ```
+///
+/// ...an interval...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Interval<zruntime::Local>>();
+/// ```
+///
 /// ...and a registration...
 ///
 /// ```compile_fail
@@ -118,7 +142,7 @@ struct LocalRuntimeStaysOnItsThread;
 /// sent::<zruntime::Registration<zruntime::Local>>();
 /// ```
 ///
-/// ...while the same three built on a shared runtime may go anywhere.
+/// ...while the same five built on a shared runtime may go anywhere.
 ///
 /// ```
 /// fn sent<T>()
@@ -129,6 +153,8 @@ struct LocalRuntimeStaysOnItsThread;
 ///
 /// sent::<zruntime::Task<(), zruntime::Shared>>();
 /// sent::<zruntime::Sleep<zruntime::Shared>>();
+/// sent::<zruntime::Timeout<std::future::Pending<()>, zruntime::Shared>>();
+/// sent::<zruntime::Interval<zruntime::Shared>>();
 /// sent::<zruntime::Registration<zruntime::Shared>>();
 /// ```
 #[cfg(all(doctest, feature = "runtime"))]
