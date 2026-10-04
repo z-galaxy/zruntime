@@ -11,10 +11,13 @@
 //! then waits on the reactor, so what the runtime has to do is done on that thread. One thread at
 //! a time drives a runtime, and a thread drives one runtime at a time; a thread-local marker of
 //! which runtime a thread drives is what the two rules are checked against, and what spares a
-//! wake on that very thread the write that would break a wait it is not in.
+//! wake on that very thread the write that would break a wait it is not in. Beside the marker,
+//! each flavour keeps a record of the runtime itself, for what is spawned on the thread without a
+//! handle to spawn it on (see [`set_driving`]).
 //!
 //! A shared runtime with a seat, which the `helper` feature's registries hand out, is driven
-//! through that seat instead (see the `driver` module), and writes the same marker as it does.
+//! through that seat instead (see the `driver` module), and writes the same marker and record as
+//! it does.
 
 use std::{
     cell::Cell,
@@ -74,18 +77,21 @@ where
     /// task that runtime is running, or from inside the future of another `block_on`: such a
     /// call could only wait for the thread it is on. Panics, too, when another thread is driving
     /// this runtime right now.
-    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
+    ///
+    /// Not a method, because the thread's record of what it drives is made from the pointer the
+    /// runtime is shared through, which a method has no way to get hold of.
+    pub(crate) fn block_on<F>(this: &M::Ptr<Self>, future: F) -> F::Output
     where
         F: Future,
     {
         // The marks outlive the future, which is dropped as this returns: whatever that future
         // held — a task, a registration, a timer — is gone while this thread still drives the
         // runtime, so its drop asks nobody for a wake-up this thread would only take out again.
-        let _driving = Driving::enter(self);
+        let _driving = Driving::<M>::enter(this);
         let mut future = pin!(future);
         let signal = Arc::new(Signal {
             woken: AtomicBool::new(false),
-            remote: self.remote.clone(),
+            remote: this.remote.clone(),
         });
         let waker = Waker::from(signal.clone());
         let mut cx = Context::from_waker(&waker);
@@ -97,7 +103,7 @@ where
             if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
                 return output;
             }
-            self.round(&signal.woken, &mut failed_waits);
+            this.round(&signal.woken, &mut failed_waits);
         }
     }
 
@@ -307,7 +313,7 @@ struct Driving<'a, M>
 where
     M: Mode,
 {
-    core: &'a Core<M>,
+    core: &'a M::Ptr<Core<M>>,
 }
 
 impl<'a, M> Driving<'a, M>
@@ -320,7 +326,7 @@ where
     /// runtime is running on this thread, or from inside the future of another `block_on`, and
     /// could only ever wait for itself. Panics, too, where another thread drives `core`: one
     /// thread at a time polls a runtime's tasks and waits on its reactor.
-    fn enter(core: &'a Core<M>) -> Self {
+    fn enter(core: &'a M::Ptr<Core<M>>) -> Self {
         assert!(
             !drives_a_runtime(),
             "block_on called from a task this runtime is running: the call would wait for the \
@@ -344,7 +350,7 @@ where
             "block_on called on a runtime another thread is driving: a runtime is driven by one \
              thread at a time"
         );
-        set_driving(Some(&core.remote));
+        set_driving::<M>(Some(core));
 
         Self { core }
     }
@@ -355,7 +361,7 @@ where
     M: Mode,
 {
     fn drop(&mut self) {
-        set_driving(None);
+        set_driving::<M>(None);
         *self.core.driven.lock() = false;
     }
 }
@@ -389,14 +395,26 @@ impl Wake for Signal {
     }
 }
 
-/// Marks the calling thread as the one driving the runtime `remote` belongs to, or, with `None`,
-/// as driving none.
+/// Marks the calling thread as the one driving the runtime `core`, or, with `None`, as driving
+/// none.
 ///
 /// Written by whatever puts a thread in charge of a runtime and takes it out again: `block_on` on
 /// a runtime with no seat, and the seat of one with a seat. The one record of which runtime a
 /// thread drives, whichever of the two made it.
-pub(crate) fn set_driving(remote: Option<&Remote>) {
-    DRIVING.with(|driving| driving.set(remote.map(NonNull::from)));
+///
+/// It is made twice over. The marker below names the runtime by the address of its remote, which
+/// is all a wake needs to know whether it comes from the thread driving, and is read on the path
+/// of every notification, so it is a plain cell. The flavour's own record,
+/// [`Sealed::set_driven`](crate::mode::sealed::Sealed::set_driven), holds the runtime itself,
+/// weakly, for what is spawned on this thread without a handle to spawn it on. Neither has a
+/// destructor, so that both are written on a thread whose locals are being destroyed as on any
+/// other, and the thread is on record for exactly as long as it is marked.
+pub(crate) fn set_driving<M>(core: Option<&M::Ptr<Core<M>>>)
+where
+    M: Mode,
+{
+    DRIVING.with(|driving| driving.set(core.map(|core| NonNull::from(&*core.remote))));
+    M::set_driven(core);
 }
 
 /// Whether the calling thread drives the runtime `remote` belongs to.

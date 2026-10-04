@@ -6,19 +6,20 @@
 use std::{
     cell::RefCell,
     future::{Future, Pending, pending, poll_fn},
-    io::Write,
+    io::{self, Write},
     mem::MaybeUninit,
     pin::{Pin, pin},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, Wake, Waker},
     thread,
     time::{Duration, Instant},
 };
 
-use futures_lite::future::{block_on, poll_once};
+use futures_lite::future::{block_on, poll_once, yield_now};
 use ntest::timeout;
 use socket2::SockRef;
 
@@ -28,6 +29,7 @@ use crate::{Event, EventListener};
 use crate::{
     Interest, Interval, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, Timeout,
     driver,
+    mode::sealed::Sealed as _,
     runtime::{Core, lock},
 };
 
@@ -141,6 +143,53 @@ fn cancelling_the_last_task_from_another_thread_lets_the_helper_exit() {
 
     drop(task);
 
+    assert!(helper_gone(&runtime));
+}
+
+/// A task cancelled from another thread, through `cancel`, lets the helper exit once it was the
+/// last, as a task dropped there does.
+#[test]
+#[timeout(15000)]
+fn cancelling_the_last_task_from_another_thread_and_waiting_lets_the_helper_exit() {
+    let runtime = runtime();
+    let task = runtime.spawn("a task that never finishes", pending::<u32>());
+    assert!(runtime.helper_running());
+
+    assert_eq!(block_on(task.cancel()), None);
+
+    assert!(helper_gone(&runtime));
+}
+
+/// A task cancelled while the helper thread polls it is dropped by the helper once that poll
+/// returns, and the wait for it, on another thread, lasts until then.
+#[test]
+#[timeout(15000)]
+fn cancelling_a_task_the_helper_polls_waits_for_that_poll() {
+    let runtime = runtime();
+    // The task's future holds a clone, so that the count tells whether that future is gone.
+    let held = Arc::new(());
+    let (announce, announced) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let task = {
+        let held = held.clone();
+        runtime.spawn("a task held in its poll", async move {
+            let _held = held;
+            announce.send(()).unwrap();
+            // A sender dropped by a test that failed first lets the poll go on as well.
+            let _ = released.recv();
+            pending::<u32>().await
+        })
+    };
+    // The helper is inside the task's first poll once this is in.
+    announced.recv().unwrap();
+
+    let mut cancelling = pin!(task.cancel());
+
+    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert_eq!(Arc::strong_count(&held), 2);
+    release.send(()).unwrap();
+    assert_eq!(block_on(cancelling), None);
+    assert_eq!(Arc::strong_count(&held), 1);
     assert!(helper_gone(&runtime));
 }
 
@@ -1209,11 +1258,12 @@ fn block_on_as_a_thread_ends_does_not_abort() {
 ///
 /// Thread-local destructors run in reverse order of registration, and a `block_on` registers the
 /// locals it uses as it goes: the thread's own registry on the lookup it makes before its first
-/// poll, and the record of the seat it holds on the lookup made from inside that poll. A value
-/// the poll brings into being in between is therefore destroyed after the seat record and before
-/// the registry. A `block_on` from that value's destructor — waiting on a task stashed there,
-/// say — finds a live runtime in the registry and takes the seat, with no place left to write
-/// down that it has: a panic there is not an unwind but an abort.
+/// poll. A value the poll brings into being is therefore destroyed before the registry, and a
+/// `block_on` from that value's destructor — waiting on a task stashed there, say — finds a live
+/// runtime in the registry and takes the seat. The record of the seat it writes as it does is
+/// first reached by the lookup made from inside that poll, after the value, so that a record with
+/// a destructor of its own would be gone by then, leaving no place to write down that the thread
+/// is in the seat: a panic there is not an unwind but an abort. The record has none.
 #[test]
 #[timeout(15000)]
 fn a_block_on_taking_the_seat_as_a_thread_ends_does_not_abort() {
@@ -1233,7 +1283,7 @@ fn a_block_on_taking_the_seat_as_a_thread_ends_does_not_abort() {
 
     let thread = thread::spawn(|| {
         crate::block_on(async {
-            // Touched before the runtime is built, so that this value is destroyed after the
+            // Touched before the runtime is built, so that this value is destroyed after any
             // local the lookup inside `SharedRuntime::current` brings into being. The handle it
             // keeps is what the registry's weak reference still resolves to as the
             // thread ends.
@@ -1288,6 +1338,226 @@ fn current_inside_a_local_block_on_is_run_by_a_helper() {
         .unwrap();
 
     assert_eq!(name.as_deref(), Some("zruntime"));
+}
+
+/// A task spawned with no runtime to name, from a thread that drives none, goes on the runtime
+/// the whole process shares, as what `SharedRuntime::current` builds does, and a helper thread
+/// runs it.
+#[test]
+#[timeout(15000)]
+fn a_spawn_outside_any_block_on_goes_to_the_process_runtime() {
+    // Held across the spawn, so that the runtime the process shares is alive for the comparison
+    // and is the same one throughout.
+    let process = SharedRuntime::current().unwrap();
+
+    let task = crate::spawn(async {
+        // Built on a helper thread, which is in the seat of the runtime it runs.
+        let runtime = SharedRuntime::current().unwrap();
+
+        (
+            Arc::as_ptr(runtime.inner()) as usize,
+            thread::current().name().map(str::to_owned),
+        )
+    });
+    let (built_on, name) = block_on(task).unwrap();
+
+    assert_eq!(built_on, Arc::as_ptr(process.inner()) as usize);
+    assert_eq!(name.as_deref(), Some("zruntime"));
+}
+
+/// A task spawned with no runtime to name, from inside the free `block_on`, goes on the thread's
+/// own runtime, which the thread inside the call runs: it needs no helper.
+#[test]
+#[timeout(15000)]
+fn a_spawn_inside_block_on_goes_to_the_threads_own_runtime() {
+    let (ran_on, own) = crate::block_on(async {
+        let ran_on = crate::spawn(async { thread::current().id() })
+            .await
+            .unwrap();
+
+        (ran_on, SharedRuntime::current().unwrap())
+    });
+
+    assert_eq!(ran_on, thread::current().id());
+    assert!(!own.helper_running());
+}
+
+/// A task spawned with no runtime to name, inside the free `block_on` run from the destructor of
+/// a thread-local as its thread ends, goes on the thread's own runtime and runs to its end, as it
+/// does anywhere else, though the spawn is what brings that runtime into being.
+///
+/// The thread drives a runtime out of a registry once the value is in place, so that the list of
+/// what each of its `block_on` calls drives is first reached after that value: thread-local
+/// destructors run in reverse order of registration, and that list, which has a destructor of its
+/// own, is gone by the time the value's runs. Nothing else holds the runtime the spawn brings into
+/// being, so what the call holds it with has to outlast that list. A panic out of a destructor
+/// there is an abort, so the destructor catches what panics and hands it on.
+#[test]
+#[timeout(15000)]
+fn a_spawn_inside_block_on_as_a_thread_ends_runs_on_the_threads_own_runtime() {
+    /// Spawns inside the free `block_on` as it is dropped, and sends what came of it.
+    struct SpawnsAsItGoes(Option<mpsc::Sender<Result<io::Result<u32>, String>>>);
+
+    impl Drop for SpawnsAsItGoes {
+        fn drop(&mut self) {
+            let Some(spawned) = self.0.take() else {
+                return;
+            };
+            let outcome = std::panic::catch_unwind(|| {
+                crate::block_on(async { crate::spawn(async { 7 }).await })
+            })
+            .map_err(|panic| format!("{panic:?}"));
+            let _ = spawned.send(outcome);
+        }
+    }
+
+    thread_local! {
+        static SPAWNS_AS_IT_GOES: RefCell<SpawnsAsItGoes> =
+            const { RefCell::new(SpawnsAsItGoes(None)) };
+    }
+
+    let (sender, spawned) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        SPAWNS_AS_IT_GOES.with(|spawns| spawns.borrow_mut().0 = Some(sender));
+        SharedRuntime::current().unwrap().block_on(async {});
+    });
+
+    assert!(thread.join().is_ok());
+    let outcome = spawned.recv().unwrap().expect("no panic");
+    assert_eq!(outcome.map_err(|error| error.to_string()), Ok(7));
+}
+
+/// A thread that leaves the seat it took inside the free `block_on` is off the record of the
+/// runtime it drives once the call returns: what it spawns or builds from then on goes on the
+/// runtime the process shares, as on any thread that drives none, rather than on the one it has
+/// stopped running.
+#[test]
+#[timeout(15000)]
+fn a_thread_leaving_a_seat_is_off_the_record() {
+    // Held across the spawn, so that the runtime the process shares is alive for the comparison
+    // and is the same one throughout.
+    let process = SharedRuntime::current().unwrap();
+
+    // Held past the call, so that a record left standing would still name a live runtime.
+    let own = crate::block_on(async {
+        // Brought into being here, after the call has looked for a runtime to take the seat of
+        // and found none: the yield gives the call the turn of its loop on which it takes it.
+        let own = SharedRuntime::current().unwrap();
+        yield_now().await;
+        let driven = Shared::driven().expect("the runtime this thread is in the seat of");
+        assert!(Arc::ptr_eq(&driven, own.inner()));
+
+        own
+    });
+
+    assert!(Shared::driven().is_none());
+    assert!(Arc::ptr_eq(
+        SharedRuntime::current().unwrap().inner(),
+        process.inner()
+    ));
+    let task =
+        crate::spawn(async { Arc::as_ptr(SharedRuntime::current().unwrap().inner()) as usize });
+    assert_eq!(
+        block_on(task).unwrap(),
+        Arc::as_ptr(process.inner()) as usize
+    );
+    drop(own);
+}
+
+/// A task spawned with no runtime to name, from inside a task the helper is running, goes on the
+/// runtime the helper runs. The runtime here is in no registry, so that the process's is not it.
+#[test]
+#[timeout(15000)]
+fn a_spawn_from_a_task_the_helper_runs_goes_on_its_runtime() {
+    let runtime = runtime();
+    let expected = Arc::as_ptr(runtime.inner()) as usize;
+
+    let task = runtime.spawn("a task that spawns another", async {
+        crate::spawn(async { Arc::as_ptr(SharedRuntime::current().unwrap().inner()) as usize })
+            .await
+            .unwrap()
+    });
+
+    assert_eq!(block_on(task).unwrap(), expected);
+}
+
+/// A spawn inside the `block_on` of a runtime made by `Runtime::new` goes on that runtime, and
+/// the thread inside the call runs the task, where `SharedRuntime::current` there is the one the
+/// process shares, whose helper runs what is built on it.
+#[test]
+#[timeout(15000)]
+fn a_spawn_inside_a_block_on_on_a_runtime_made_by_new_goes_on_that_runtime() {
+    let runtime = SharedRuntime::new().unwrap();
+    // Held, so that the runtime the process shares is alive for the comparison.
+    let process = SharedRuntime::current().unwrap();
+
+    let (spawned, current, from_current) = runtime.block_on(async {
+        let spawned = crate::spawn(async { thread::current().id() })
+            .await
+            .unwrap();
+        let current = SharedRuntime::current().unwrap();
+        let from_current = current
+            .spawn("a task that names the thread it runs on", async {
+                thread::current().name().map(str::to_owned)
+            })
+            .await
+            .unwrap();
+
+        (spawned, current, from_current)
+    });
+
+    assert_eq!(spawned, thread::current().id());
+    assert!(Arc::ptr_eq(current.inner(), process.inner()));
+    assert_eq!(from_current.as_deref(), Some("zruntime"));
+}
+
+/// A spawn inside a `block_on` on a local runtime goes on the runtime the process shares, as what
+/// `SharedRuntime::current` builds does there, and a helper thread runs it.
+#[test]
+#[timeout(15000)]
+fn a_spawn_inside_a_local_block_on_goes_to_the_process_runtime() {
+    let local = LocalRuntime::new().unwrap();
+    // Held across the spawn, so that the runtime the process shares is alive for the comparison.
+    let process = SharedRuntime::current().unwrap();
+
+    let (built_on, name) = local
+        .block_on(async {
+            crate::spawn(async {
+                let runtime = SharedRuntime::current().unwrap();
+
+                (
+                    Arc::as_ptr(runtime.inner()) as usize,
+                    thread::current().name().map(str::to_owned),
+                )
+            })
+            .await
+        })
+        .unwrap();
+
+    assert_eq!(built_on, Arc::as_ptr(process.inner()) as usize);
+    assert_eq!(name.as_deref(), Some("zruntime"));
+}
+
+/// A spawn inside a `block_on` that does not hold the seat goes on the runtime that call drives,
+/// even while the helper is in the seat.
+///
+/// The call finds the helper in the seat, so its first poll is made without it: the runtime the
+/// thread is in the seat of is none, and the one it is inside `block_on` on is the one to find.
+#[cfg(feature = "event")]
+#[test]
+#[timeout(15000)]
+fn a_spawn_inside_a_block_on_that_holds_no_seat_goes_on_its_runtime() {
+    let runtime = runtime();
+    let _held = held_by_the_helper(&runtime);
+    let expected = Arc::as_ptr(runtime.inner()) as usize;
+
+    let built_on = runtime.block_on(async {
+        crate::spawn(async { Arc::as_ptr(SharedRuntime::current().unwrap().inner()) as usize })
+            .await
+            .unwrap()
+    });
+
+    assert_eq!(built_on, expected);
 }
 
 /// What is built inside a `block_on` on a runtime that is not the thread's own goes on that

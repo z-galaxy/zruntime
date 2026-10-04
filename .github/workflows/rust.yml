@@ -28,8 +28,9 @@ jobs:
           cargo --locked check --all-features --target x86_64-unknown-freebsd
           cargo --locked check --all-features --target x86_64-unknown-netbsd
           cargo --locked check --all-features --target aarch64-linux-android
-      # The features only add code, so the jobs build with all of them. That covers all of it but
-      # the no-op `error!` that `log.rs` builds in place of `tracing`'s where that feature is off,
+      # The features all but only add code, so the jobs build with all of them. That covers all of
+      # it but the no-op `error!` that `log.rs` builds in place of `tracing`'s where that feature
+      # is off, and the panic of a `spawn` that finds no runtime to go on where `helper` is off,
       # and cannot show that `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `fs`,
       # `tcp`, `udp` and `unix` each build without the others: checking each alone covers them, and
       # `unix`, which builds nothing on Windows, is checked to build nothing there with no warning.
@@ -115,6 +116,12 @@ jobs:
           key: ${{ matrix.os }}
       - name: Test with all features
         run: cargo --locked test --all-features
+      # The features all but only add code, and the tests of what they take out are left out of a
+      # build with every feature on: those of what `spawn` does without `helper`, where a thread
+      # that drives no shared runtime has none to spawn on. The runtime alone runs them, with the
+      # rest of its tests.
+      - name: Test the runtime alone
+        run: cargo --locked test --no-default-features --features runtime
 
   # Miri checks the lock module's `unsafe` code, and the concurrency of everything that needs no
   # runtime: Event, the locks, the two channels and unblock, doc tests included. The runtime

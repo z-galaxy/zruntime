@@ -54,6 +54,7 @@ use std::{
     fmt,
     future::{Future, IntoFuture},
     io,
+    panic::Location,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -64,13 +65,15 @@ use std::{
 #[cfg(feature = "event")]
 pub use event::{Event, EventListener};
 #[cfg(feature = "runtime")]
+use mode::sealed::Sealed as _;
+#[cfg(feature = "runtime")]
 pub use mode::{Local, Mode, Shared};
 #[cfg(feature = "runtime")]
 pub use reactor::Registration;
 #[cfg(feature = "runtime")]
 use runtime::Core;
 #[cfg(feature = "runtime")]
-use scheduler::JoinHandle;
+use scheduler::{JoinHandle, Name};
 #[cfg(feature = "runtime")]
 pub use time::{Interval, MissedTickBehavior, Sleep, TimedOut, Timeout};
 #[cfg(feature = "unblock")]
@@ -110,6 +113,125 @@ where
     F: Future,
 {
     driver::block_on(driver::Target::Own, &driver::own, future)
+}
+
+/// Queues `future` on the shared runtime the calling code is running on, and hands back the task
+/// that joins or cancels it.
+///
+/// This is `SharedRuntime::spawn` for code that has no runtime to name: a function that is
+/// called from a task, say, and was handed no clone of the runtime running it, nor a name to give
+/// the task. The task is named by where it was spawned instead, for the message logged if it
+/// panics and for its `Debug`. Dropping the task cancels it, and [`Task::detach`] lets it run on,
+/// as for a task spawned on a runtime by name.
+///
+/// The task goes on the first of these that exists:
+///
+/// 1. The shared runtime the calling thread drives. That is the one it is inside
+///    [`Runtime::block_on`] on, whether it was made by [`Runtime::new`] or handed out by
+///    `SharedRuntime::current`; the one whose seat it is in, where the `helper` feature gives it
+///    one; and the one whose task it is running, on a thread inside `block_on` as on the helper
+///    thread.
+/// 2. With the `helper` feature, the runtime `SharedRuntime::current` hands out: the thread's own
+///    inside the free `block_on`, and the one the whole process shares everywhere else, which a
+///    helper thread runs.
+///
+/// The first differs on purpose from `SharedRuntime::current`, which does not count a `block_on`
+/// on a runtime made by [`Runtime::new`], and hands out the one the process shares there. A task
+/// spawned here goes on the runtime that runs the code spawning it, so that the thread inside
+/// `block_on` runs it, as it runs every other task of its runtime, rather than a helper thread
+/// that is running some other runtime.
+///
+/// A future that need not be `Send` is spawned with [`spawn_local`], on a local runtime.
+///
+/// # Panics
+///
+/// Panics where the calling thread drives no shared runtime and the `helper` feature, which
+/// gives it a runtime to spawn on in that case, is not enabled. With the feature, it panics only
+/// where `SharedRuntime::current` would fail: where the reactor of the runtime cannot be made.
+///
+/// # Example
+///
+/// ```
+/// use zruntime::{Shared, SharedRuntime, Task};
+///
+/// // A function that is given no runtime to spawn on, and spawns on whichever one is running it.
+/// fn double(number: u32) -> Task<u32, Shared> {
+///     zruntime::spawn(async move { number * 2 })
+/// }
+///
+/// let runtime = SharedRuntime::new().unwrap();
+/// let doubled = runtime.block_on(async { double(21).await.unwrap() });
+///
+/// assert_eq!(doubled, 42);
+/// ```
+#[cfg(feature = "runtime")]
+#[track_caller]
+pub fn spawn<F>(future: F) -> Task<F::Output, Shared>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // Taken here rather than in a helper, which `track_caller` would have to be on all the way
+    // down for the location to be the caller's.
+    let name = Name::SpawnedAt(Location::caller());
+
+    spawn_on_shared(&shared_to_spawn_on(), name, future)
+}
+
+/// Queues `future` on the local runtime the calling code is running on, and hands back the task
+/// that joins or cancels it.
+///
+/// This is `LocalRuntime::spawn` for code that has no runtime to name, as [`spawn`] is for a
+/// shared one: the task is named by where it was spawned, and goes on the local runtime the
+/// calling thread drives. That is the one it is inside [`Runtime::block_on`] on, or the one whose
+/// task it is running. A local runtime stays on the thread that made it, so the thread running the
+/// spawning code is the only one that can be driving it, and there is no other runtime to look
+/// for in its place.
+///
+/// # Panics
+///
+/// Panics where the calling thread drives no local runtime: outside any `block_on`, and inside
+/// the `block_on` of a shared runtime, whose tasks may run on any thread and have no local runtime
+/// to go on.
+///
+/// # Example
+///
+/// ```
+/// use std::{cell::Cell, rc::Rc};
+///
+/// use zruntime::LocalRuntime;
+///
+/// let runtime = LocalRuntime::new().unwrap();
+/// let total = Rc::new(Cell::new(0));
+///
+/// runtime.block_on(async {
+///     // A future that holds an `Rc` is no problem here, and nothing names the runtime.
+///     let adding = zruntime::spawn_local({
+///         let total = total.clone();
+///         async move { total.set(total.get() + 42) }
+///     });
+///
+///     adding.await.unwrap();
+/// });
+///
+/// assert_eq!(total.get(), 42);
+/// ```
+#[cfg(feature = "runtime")]
+#[track_caller]
+pub fn spawn_local<F>(future: F) -> Task<F::Output, Local>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    let name = Name::SpawnedAt(Location::caller());
+    let Some(core) = Local::driven() else {
+        panic!(
+            "spawn_local called where no local runtime is running: call it from inside \
+             `LocalRuntime::block_on`, or from a task of that runtime"
+        );
+    };
+
+    Task(scheduler::spawn_local(&core, name, future))
 }
 
 /// A runtime that stays on the thread it was made on, and runs futures that need not be `Send`.
@@ -159,7 +281,8 @@ where
     /// A task whose future holds a timer, a registration or a clone of the runtime keeps the
     /// runtime, and the descriptors its reactor holds, alive until the task ends. No helper thread
     /// ever runs a runtime made here, so a detached task that never ends is never let go of: drive
-    /// such a task to completion, or keep its [`Task`] and cancel it by dropping that.
+    /// such a task to completion, or keep its [`Task`] and cancel it, by dropping that or through
+    /// [`Task::cancel`].
     ///
     /// What can fail is the reactor: it opens the channel a wait is broken through.
     ///
@@ -387,7 +510,8 @@ impl Runtime<Local> {
     /// [`Task::detach`] lets it run on.
     ///
     /// `name` says what the task is there for — `"socket reader"`, say. It is for diagnostics
-    /// only: it is what the message logged if the task panics names it by.
+    /// only: it is what the message logged if the task panics names it by. Code with no runtime
+    /// to call this on spawns with [`spawn_local`], which takes no name.
     pub fn spawn<T>(
         &self,
         name: impl Into<Cow<'static, str>>,
@@ -396,7 +520,11 @@ impl Runtime<Local> {
     where
         T: 'static,
     {
-        Task(scheduler::spawn_local(&self.core, name.into(), future))
+        Task(scheduler::spawn_local(
+            &self.core,
+            Name::Given(name.into()),
+            future,
+        ))
     }
 
     /// Watches `source` for readiness.
@@ -535,7 +663,8 @@ impl Runtime<Shared> {
     /// Dropping the handle cancels the task; [`Task::detach`] lets it run on.
     ///
     /// `name` says what the task is there for — `"socket reader"`, say. It is for diagnostics
-    /// only: it is what the message logged if the task panics names it by.
+    /// only: it is what the message logged if the task panics names it by. Code with no runtime
+    /// to call this on spawns with [`spawn`], which takes no name.
     pub fn spawn<T>(
         &self,
         name: impl Into<Cow<'static, str>>,
@@ -544,12 +673,7 @@ impl Runtime<Shared> {
     where
         T: Send + 'static,
     {
-        let task = Task(scheduler::spawn_shared(&self.core, name.into(), future));
-        // Asked for once the task is on the scheduler's queue, so that a helper starting here
-        // finds it there.
-        self.core.ensure_progress();
-
-        task
+        spawn_on_shared(&self.core, Name::Given(name.into()), future)
     }
 
     /// Watches `source` for readiness.
@@ -636,6 +760,8 @@ pub enum Interest {
 }
 
 /// A task spawned on a [`Runtime`], which cancels that task when dropped.
+///
+/// [`Task::cancel`] cancels it as well, and waits for it to stop.
 #[cfg(feature = "runtime")]
 pub struct Task<T, M = Local>(JoinHandle<T, M>)
 where
@@ -655,6 +781,89 @@ where
     /// lives, and where a helper runs it, keeps that helper for the life of the process.
     pub fn detach(self) {
         self.0.detach();
+    }
+
+    /// Cancels the task, and hands back a future that resolves once the task's future is gone.
+    ///
+    /// Dropping a task cancels it too, but does not wait: a task that another thread is polling
+    /// at that moment is left to finish that poll, and its future, with everything it holds, goes
+    /// only then. Cancelling it here, and awaiting what this hands back, is for a caller that has
+    /// to know when that is — to bind a socket to the address of one the task held, say, or to
+    /// take a lock it held — or that wants the output of a task that may have finished already.
+    ///
+    /// The cancellation is made here, in the call, whether or not the future handed back is ever
+    /// polled. A task that is waiting, or has not been polled yet, has its future dropped right
+    /// here, on the calling thread. One that is being polled at that moment has it dropped once
+    /// that poll returns: by another thread, or by this one where a task cancels itself. And
+    /// where the runtime is going just then, its last handle being dropped, perhaps on another
+    /// thread, the runtime drops the future as it goes, which may be after this call has
+    /// returned. It is awaiting the future handed back that tells when the task's future is
+    /// gone: that resolves once it has been dropped, however that came about, to the task's
+    /// output where the task had finished before the cancellation reached it, and to `None`
+    /// otherwise. A task that panicked, went with its runtime, or had its output taken already
+    /// by being awaited has none to hand back either. Dropping that future is the same as
+    /// dropping the task.
+    ///
+    /// A task's future whose destructor panics as it is dropped here panics out of this call, as
+    /// it would out of a drop of the task.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{future, rc::Rc, time::Duration};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let connection = Rc::new("a connection");
+    ///
+    /// runtime.block_on(async {
+    ///     let answer = runtime.spawn("an answer", async { 42 });
+    ///     let held = connection.clone();
+    ///     let reader = runtime.spawn("a reader that never finishes", async move {
+    ///         let _connection = held;
+    ///         future::pending::<u32>().await
+    ///     });
+    ///     // Each wait gives the tasks a turn, until the first one has finished.
+    ///     while !answer.is_finished() {
+    ///         runtime.sleep(Duration::from_millis(1)).await;
+    ///     }
+    ///
+    ///     // A task that finished hands its output back...
+    ///     assert_eq!(answer.cancel().await, Some(42));
+    ///     // ...and one that did not has let go of what it held by the time the wait is over.
+    ///     assert_eq!(reader.cancel().await, None);
+    ///     assert_eq!(Rc::strong_count(&connection), 1);
+    /// });
+    /// ```
+    pub fn cancel(self) -> impl Future<Output = Option<T>> {
+        self.0.cancel()
+    }
+
+    /// Whether the task has ended, told without polling it or taking its output.
+    ///
+    /// A task has ended once its future has completed or panicked, or has gone with the runtime
+    /// it was on. Either way, the future has been dropped, and everything it held with it, by the
+    /// time this says so.
+    ///
+    /// This stays `true` after the output has been taken by awaiting the task. It is how a caller
+    /// that has no use for the output yet, or ever, finds out that a task is over, where awaiting
+    /// the task would take that output.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let mut task = runtime.spawn("an answer", async { 42 });
+    /// assert!(!task.is_finished());
+    ///
+    /// assert_eq!(runtime.block_on(&mut task).unwrap(), 42);
+    /// assert!(task.is_finished());
+    /// ```
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
     }
 }
 
@@ -678,6 +887,43 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.poll_join(cx)
     }
+}
+
+/// Queues `future` on the shared runtime `core` as a task named `name`: what [`Runtime::spawn`]
+/// and the free [`spawn`] have in common, so that a task spawned either way is seen to alike.
+#[cfg(feature = "runtime")]
+fn spawn_on_shared<F>(core: &Arc<Core<Shared>>, name: Name, future: F) -> Task<F::Output, Shared>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let task = Task(scheduler::spawn_shared(core, name, future));
+    // Asked for once the task is on the scheduler's queue, so that a helper starting here finds it
+    // there.
+    core.ensure_progress();
+
+    task
+}
+
+/// The shared runtime the free [`spawn`] puts a task on: the one the calling thread drives, and
+/// where it drives none, the one `SharedRuntime::current` hands out, if the `helper` feature is
+/// there to make it.
+#[cfg(feature = "runtime")]
+#[track_caller]
+fn shared_to_spawn_on() -> Arc<Core<Shared>> {
+    if let Some(core) = Shared::driven() {
+        return core;
+    }
+    #[cfg(feature = "helper")]
+    return match driver::current_to_spawn_on() {
+        Ok(core) => core,
+        Err(error) => panic!("spawn found no runtime to spawn on, and could not make one: {error}"),
+    };
+    #[cfg(not(feature = "helper"))]
+    panic!(
+        "spawn called where no shared runtime is running: call it from inside \
+         `SharedRuntime::block_on`, or from a task of that runtime, or enable the `helper` feature"
+    );
 }
 
 #[cfg(any(test, doctest))]

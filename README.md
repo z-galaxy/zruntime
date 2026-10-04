@@ -98,6 +98,37 @@ runtime.block_on(async {
 });
 ```
 
+## Spawning
+
+[`Runtime::spawn`] puts a task on the runtime it is called on, under a name that the message logged
+if the task panics goes by. Code that has no runtime to call it on, because it was never handed
+one, spawns with the free [`spawn`] or [`spawn_local`] instead: the task goes on the runtime that is
+running the calling code, whichever it is, and is named by where it was spawned.
+
+```rust
+use zruntime::{LocalRuntime, Task};
+
+// Handed no runtime, and needing none: it spawns on whichever one is running its caller.
+fn double(number: u32) -> Task<u32> {
+    zruntime::spawn_local(async move { number * 2 })
+}
+
+let runtime = LocalRuntime::new().expect("a runtime for this thread");
+let doubled = runtime.block_on(async { double(21).await.expect("the task did not panic") });
+
+assert_eq!(doubled, 42);
+```
+
+[`spawn_local`] takes any `'static` future and needs the calling thread to be inside a
+[`LocalRuntime::block_on`], or in one of its tasks. [`spawn`] takes a `Send` future for the
+[`SharedRuntime`] the calling thread drives; where it drives none, it panics, unless the `helper`
+feature, described below, is there to give it a runtime to spawn on.
+
+The [`Task`] either hands back is what joins the task, by being awaited. Dropping it cancels the
+task, and [`Task::cancel`] cancels it and waits until it has stopped, handing back its output where
+it had finished already. [`Task::detach`] lets it run on unobserved, and [`Task::is_finished`] tells
+whether it has ended without polling it or taking its output.
+
 ## The `helper` feature
 
 The examples above each drive their runtime with one `block_on` call. A library whose
@@ -112,7 +143,8 @@ call is picked up by a helper thread, started the moment such work is found with
 the runtime, and put down once nothing is left to run, watch or time. A `block_on` call that
 arrives while the helper holds the runtime is handed it straight away, so a program calling
 `block_on` once per operation still runs each of them on its own thread rather than behind a
-thread of the runtime's own.
+thread of the runtime's own. With it, [`spawn`] has a runtime to go on from any thread: where the
+calling thread drives none, the task goes on the one [`SharedRuntime::current`] hands out.
 
 ## Sockets
 
@@ -185,6 +217,16 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`SharedRuntime::current`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.current
 [`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
+[`Runtime::spawn`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.spawn
+[`LocalRuntime::block_on`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.block_on
+[`spawn`]: https://docs.rs/zruntime/latest/zruntime/fn.spawn.html
+[`spawn_local`]: https://docs.rs/zruntime/latest/zruntime/fn.spawn_local.html
+[`Task`]: https://docs.rs/zruntime/latest/zruntime/struct.Task.html
+[`Task::cancel`]: https://docs.rs/zruntime/latest/zruntime/struct.Task.html#method.cancel
+[`Task::detach`]: https://docs.rs/zruntime/latest/zruntime/struct.Task.html#method.detach
+[`Task::is_finished`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Task.html#method.is_finished
 [`Runtime::sleep`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.sleep
 [`Runtime::sleep_until`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.sleep_until

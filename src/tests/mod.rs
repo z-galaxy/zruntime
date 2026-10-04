@@ -160,6 +160,35 @@ struct LocalRuntimeStaysOnItsThread;
 #[cfg(all(doctest, feature = "runtime"))]
 struct LocalHandlesStayOnTheirThread;
 
+/// The wait for a cancelled task stays on the thread of a local runtime, as the task did...
+///
+/// ```compile_fail
+/// fn sent<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// let runtime = zruntime::LocalRuntime::new().unwrap();
+/// sent(runtime.spawn("a task to cancel", async {}).cancel());
+/// ```
+///
+/// ...while the wait for one on a shared runtime may go anywhere, which says the check above fails
+/// for the reason it was written for and no other.
+///
+/// ```
+/// fn sent<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// let runtime = zruntime::SharedRuntime::new().unwrap();
+/// sent(runtime.spawn("a task to cancel", async {}).cancel());
+/// ```
+#[cfg(all(doctest, feature = "runtime"))]
+struct TheWaitForALocalTaskStaysOnItsThread;
+
 /// A shared runtime's tasks may be polled on any thread, so it turns a future away that could not
 /// follow it there...
 ///
@@ -173,7 +202,19 @@ struct LocalHandlesStayOnTheirThread;
 /// assert_eq!(runtime.block_on(task).unwrap(), 7);
 /// ```
 ///
-/// ...which a local runtime takes as it is.
+/// ...as does the free `spawn`, which puts its task on a shared runtime...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// let runtime = zruntime::SharedRuntime::new().unwrap();
+/// let local = Rc::new(7);
+/// let task = runtime.block_on(async { zruntime::spawn(async move { *local }).await });
+///
+/// assert_eq!(task.unwrap(), 7);
+/// ```
+///
+/// ...which a local runtime takes as it is...
 ///
 /// ```
 /// use std::rc::Rc;
@@ -183,6 +224,18 @@ struct LocalHandlesStayOnTheirThread;
 /// let task = runtime.spawn("a task holding an `Rc`", async move { *local });
 ///
 /// assert_eq!(runtime.block_on(task).unwrap(), 7);
+/// ```
+///
+/// ...and so does the free `spawn_local`.
+///
+/// ```
+/// use std::rc::Rc;
+///
+/// let runtime = zruntime::LocalRuntime::new().unwrap();
+/// let local = Rc::new(7);
+/// let task = runtime.block_on(async { zruntime::spawn_local(async move { *local }).await });
+///
+/// assert_eq!(task.unwrap(), 7);
 /// ```
 #[cfg(all(doctest, feature = "runtime"))]
 struct SharedRuntimeTakesSendFuturesOnly;

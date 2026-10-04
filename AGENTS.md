@@ -72,8 +72,13 @@ It is a single crate at the repository root — not a workspace.
 
 ### Building and Testing
 ```bash
-# Full test suite, every feature on (the features only add code, so this runs all of it)
+# Full test suite, every feature on (the features all but only add code: what they take out is
+# the no-op `error!` in `log.rs` and what `spawn` does without `helper`, which the next command
+# tests)
 cargo test --all-features
+
+# The runtime's tests without `event` and `helper`, the one of `spawn` without `helper` among them
+cargo test --no-default-features --features runtime
 
 # Run a single test
 cargo test --all-features some_test_name
@@ -155,9 +160,9 @@ threads. A target holds benchmarks of one kind only, and a new one goes in the l
 ```
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Interest,
-│                 # Task, Sleep, Timeout, TimedOut, Interval, MissedTickBehavior (runtime
-│                 # feature), Event, EventListener (event feature), and the free block_on
-│                 # (helper feature)
+│                 # Task, Sleep, Timeout, TimedOut, Interval, MissedTickBehavior, and the free
+│                 # spawn and spawn_local (runtime feature), Event, EventListener (event
+│                 # feature), and the free block_on (helper feature)
 ├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
 │                 # any executor, with no use of the runtime
 ├── event-only.md # The crate's documentation in a build with `event` but not `runtime`, whose
@@ -220,7 +225,25 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 `Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
-completion unobserved.
+completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
+`Task::cancel` cancels it and hands back a future that resolves once the task's future is gone:
+to its output, where the task had finished first. A cancelling handle stops the task as a drop
+does, but leaves the outcome for the guard in the task's wrapper to settle, which it does only
+once the future has been dropped.
+
+**Spawning without a runtime handle**: the free `spawn` and `spawn_local` find their runtime in a
+per-thread record of the runtime of their flavour that the thread drives (`set_driven` and
+`driven` of the sealed trait, a `Weak` in a thread-local of each impl), which `set_driving` in
+`runtime.rs` writes together with the `NonNull<Remote>` marker that wakes read, for `block_on` on
+a runtime with no seat and for the seat of one with a seat alike. Like the marker, the record has
+no destructor (its `Weak` is in a `ManuallyDrop`, and every writer clears it as the thread stops
+driving), so that a `block_on` run from a thread-local's destructor finds it. `spawn` falls back,
+with `helper`, on what `SharedRuntime::current` resolves to, which differs from the record for a
+`Runtime::new` runtime being driven: `driver::driven` leaves a runtime with no seat out. A runtime
+that fallback brings into being inside the free `block_on` is held by that call from then on
+(`driver::current_to_spawn_on`), as nothing else would hold it, in a thread-local of its own
+(`HELD`) that, like the records, has no destructor. Both name the task by `Location::caller()`
+through `scheduler::Name`, which never allocates.
 
 **Sockets (the `net` features)**: every socket is an `Io<T, M>`: the std socket, non-blocking, in
 the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
@@ -243,8 +266,9 @@ it. No socket is `Clone`.
   tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
   into the runtime; nor may `unblock`, which needs neither, or `fs`, which implies `unblock` and
   `lock`. `tcp`, `udp` and `unix` imply `runtime`, and `unix` builds nothing on Windows. CI builds
-  and tests everything with every feature on, and checks `runtime`, `event`, `broadcast`, `mpmc`,
-  `lock`, `unblock`, `fs`, `tcp`, `udp` and `unix` each alone.
+  and tests everything with every feature on, tests `runtime` alone (for what `spawn` does without
+  `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `fs`, `tcp`,
+  `udp` and `unix` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
