@@ -202,7 +202,19 @@ struct TheWaitForALocalTaskStaysOnItsThread;
 /// assert_eq!(runtime.block_on(task).unwrap(), 7);
 /// ```
 ///
-/// ...which a local runtime takes as it is.
+/// ...as does the free `spawn`, which puts its task on a shared runtime...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// let runtime = zruntime::SharedRuntime::new().unwrap();
+/// let local = Rc::new(7);
+/// let task = runtime.block_on(async { zruntime::spawn(async move { *local }).await });
+///
+/// assert_eq!(task.unwrap(), 7);
+/// ```
+///
+/// ...which a local runtime takes as it is...
 ///
 /// ```
 /// use std::rc::Rc;
@@ -212,6 +224,18 @@ struct TheWaitForALocalTaskStaysOnItsThread;
 /// let task = runtime.spawn("a task holding an `Rc`", async move { *local });
 ///
 /// assert_eq!(runtime.block_on(task).unwrap(), 7);
+/// ```
+///
+/// ...and so does the free `spawn_local`.
+///
+/// ```
+/// use std::rc::Rc;
+///
+/// let runtime = zruntime::LocalRuntime::new().unwrap();
+/// let local = Rc::new(7);
+/// let task = runtime.block_on(async { zruntime::spawn_local(async move { *local }).await });
+///
+/// assert_eq!(task.unwrap(), 7);
 /// ```
 #[cfg(all(doctest, feature = "runtime"))]
 struct SharedRuntimeTakesSendFuturesOnly;

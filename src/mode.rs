@@ -13,6 +13,11 @@
 //! thread is inside `block_on` on it; the sealed trait's two hooks, for `block_on` and for work
 //! just handed over, are where a shared runtime looks for that seat and a local one never does.
 //!
+//! Each flavour also keeps, for every thread, a record of the runtime of its flavour that thread
+//! drives, which is where the free `spawn` and `spawn_local` find the runtime to put a task on.
+//! The record is the sealed trait's too, so that each flavour has a thread-local of its own to
+//! hold it in: a pointer to a local runtime's state is not the type of one to a shared runtime's.
+//!
 //! Neither flavour is `Send` or `Sync` by assertion: a `Local` runtime is neither because an `Rc`
 //! is neither, and a `Shared` one is both because every piece of it is.
 
@@ -20,6 +25,7 @@ use std::{
     borrow::Borrow,
     cell::{RefCell, RefMut},
     future::Future,
+    mem::{self, ManuallyDrop},
     ops::{Deref, DerefMut},
     pin::Pin,
     rc::{self, Rc},
@@ -143,6 +149,27 @@ pub(crate) mod sealed {
         fn ensure_progress(core: &Self::Ptr<Core<Self>>)
         where
             Self: Mode;
+
+        /// Records that the calling thread drives `core`, or, with `None`, that it drives none.
+        ///
+        /// Written by whatever puts a thread in charge of a runtime and takes it out again, along
+        /// with the marker `set_driving` keeps for wakes, which is the one place it is called
+        /// from. A record kept for a runtime the thread no longer drives would send a spawn to a
+        /// runtime nobody runs.
+        ///
+        /// Written on a thread whose locals are being destroyed as on any other: the record has
+        /// no destructor, so that it is there to write to for as long as the thread runs.
+        fn set_driven(core: Option<&Self::Ptr<Core<Self>>>)
+        where
+            Self: Mode;
+
+        /// The runtime of this flavour the calling thread drives, if it drives one.
+        ///
+        /// What is spawned without a handle goes on this runtime, which is the one running the
+        /// code that spawns it, on a thread whose locals are being destroyed as on any other.
+        fn driven() -> Option<Self::Ptr<Core<Self>>>
+        where
+            Self: Mode;
     }
 
     /// A lock around a value, taken with no way to fail.
@@ -207,11 +234,22 @@ pub(crate) mod sealed {
         where
             F: Future,
         {
-            core.block_on(future)
+            Core::<Self>::block_on(core, future)
         }
 
         // A local runtime is run by the thread inside `block_on` on it and by nobody else.
         fn ensure_progress(_core: &Rc<Core<Self>>) {}
+
+        fn set_driven(core: Option<&Rc<Core<Self>>>) {
+            // Held weakly, so that the record keeps no runtime alive. The thread inside `block_on`
+            // holds the runtime itself for as long as the record stands.
+            let core = core.map_or_else(rc::Weak::new, Rc::downgrade);
+            LOCAL_DRIVEN.with(|driven| replace(driven, core));
+        }
+
+        fn driven() -> Option<Rc<Core<Self>>> {
+            LOCAL_DRIVEN.with(|driven| driven.borrow().upgrade())
+        }
     }
 
     impl Sealed for Shared {
@@ -259,12 +297,54 @@ pub(crate) mod sealed {
                 return crate::driver::block_on_seated(core, future);
             }
 
-            core.block_on(future)
+            Core::<Self>::block_on(core, future)
         }
 
         fn ensure_progress(core: &Arc<Core<Self>>) {
             core.ensure_progress();
         }
+
+        fn set_driven(core: Option<&Arc<Core<Self>>>) {
+            let core = core.map_or_else(sync::Weak::new, Arc::downgrade);
+            SHARED_DRIVEN.with(|driven| replace(driven, core));
+        }
+
+        fn driven() -> Option<Arc<Core<Self>>> {
+            SHARED_DRIVEN.with(|driven| driven.borrow().upgrade())
+        }
+    }
+
+    thread_local! {
+        /// The local runtime this thread drives, and none on a thread that drives none.
+        ///
+        /// Beside the marker `set_driving` writes rather than in its place: that one names the
+        /// runtime by an address, which is all a wake needs, while what is built here needs a
+        /// runtime to build on. Like the marker, it sits in a thread-local with no destructor, so
+        /// that it can always be reached: a thread whose locals are being destroyed can reach a
+        /// `block_on` from the destructor of one of them, and a spawn inside that call finds its
+        /// runtime here as anywhere else. A record torn down before then would leave it none, and
+        /// its panic there would be an abort. A `Weak` has a destructor, so it is kept in a
+        /// `ManuallyDrop`, and [`replace`] drops each value it takes out.
+        ///
+        /// Which leaks nothing: the record names a runtime only while the thread drives it, and
+        /// whatever puts a thread in charge of a runtime clears the record as it takes the
+        /// thread out again, whether it returns or unwinds. A thread cannot end inside
+        /// `block_on` or in a seat, so the record it ends with is a `Weak` to nothing, which
+        /// holds no allocation to free.
+        static LOCAL_DRIVEN: RefCell<ManuallyDrop<rc::Weak<Core<Local>>>> =
+            const { RefCell::new(ManuallyDrop::new(rc::Weak::new())) };
+
+        /// The shared runtime this thread drives, and none on a thread that drives none: for a
+        /// thread inside `block_on` on a runtime made by `Runtime::new`, and for one in the seat
+        /// of a runtime that came out of a registry. Kept as [`LOCAL_DRIVEN`] is.
+        static SHARED_DRIVEN: RefCell<ManuallyDrop<sync::Weak<Core<Shared>>>> =
+            const { RefCell::new(ManuallyDrop::new(sync::Weak::new())) };
+    }
+
+    /// Puts `core` on `record` in place of what was there, and drops that clear of the borrow.
+    fn replace<T>(record: &RefCell<ManuallyDrop<T>>, core: T) {
+        let replaced = mem::replace(&mut *record.borrow_mut(), ManuallyDrop::new(core));
+        drop(ManuallyDrop::into_inner(replaced));
     }
 
     /// The descriptor of `source`.

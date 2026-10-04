@@ -49,7 +49,7 @@ use std::{
     future::{Future, poll_fn},
     hash::{BuildHasherDefault, Hasher},
     io, mem,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    panic::{AssertUnwindSafe, Location, catch_unwind, resume_unwind},
     pin::{Pin, pin},
     rc::Rc,
     sync::{
@@ -251,7 +251,7 @@ where
 /// that joins or cancels it.
 pub(crate) fn spawn_local<F>(
     core: &Rc<Core<Local>>,
-    name: Cow<'static, str>,
+    name: Name,
     future: F,
 ) -> JoinHandle<F::Output, Local>
 where
@@ -271,7 +271,7 @@ where
 /// handle that joins or cancels it.
 pub(crate) fn spawn_shared<F>(
     core: &Arc<Core<Shared>>,
-    name: Cow<'static, str>,
+    name: Name,
     future: F,
 ) -> JoinHandle<F::Output, Shared>
 where
@@ -356,7 +356,7 @@ impl Drop for Requeue<'_> {
 /// The future is left unerased, so that the caller, which knows the concrete type and so whether
 /// it is `Send`, boxes it as its runtime's flavour takes it.
 fn task<M, F>(
-    name: Cow<'static, str>,
+    name: Name,
     task_waker: TaskWaker,
     future: F,
 ) -> (
@@ -401,7 +401,7 @@ where
         let output = match polled {
             Ok(value) => Ok(value),
             Err(payload) => {
-                error!("The task `{}` panicked", guard.0.name);
+                error!("The task {} panicked", guard.0.name);
                 // Nothing carries the panic any further, so its payload ends here. That
                 // payload's destructor is the task's code as much as the future is, and is
                 // contained the same way.
@@ -669,9 +669,10 @@ pub(crate) struct Join<M, T>
 where
     M: Mode,
 {
-    /// What the task is there for. It is for diagnostics alone: the message a panicking task
-    /// logs, and the handle's [`Debug`](fmt::Debug).
-    name: Cow<'static, str>,
+    /// What the task is called: the name its spawner gave it, or where it was spawned, for a
+    /// spawn that took none. It is for diagnostics alone: the message a panicking task logs, and
+    /// the handle's [`Debug`](fmt::Debug).
+    name: Name,
     /// Behind an `Arc` of its own on a local runtime, and in place on a shared one, where this is
     /// what the task's waker points at.
     waker: M::HeldWaker,
@@ -704,6 +705,40 @@ where
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.waker.wake();
+    }
+}
+
+/// What a task is called in diagnostics: the name its spawner gave it, or, where it was given none,
+/// the place it was spawned at.
+///
+/// Holds nothing it had to allocate for, so that a spawn without a name costs no more than one
+/// with a name that is a literal.
+pub(crate) enum Name {
+    /// A name the spawner chose, which says what the task is there for.
+    Given(Cow<'static, str>),
+    /// The call that spawned the task, for a spawn that took no name.
+    SpawnedAt(&'static Location<'static>),
+}
+
+/// How the log names a task: the given name between backticks, or where the task was spawned.
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Given(name) => write!(f, "`{name}`"),
+            Self::SpawnedAt(location) => write!(f, "spawned at {location}"),
+        }
+    }
+}
+
+/// A given name prints as the string it is. The place a task was spawned at prints without quotes
+/// around it, as `Location` prints itself in a panic message, so that a path with backslashes in
+/// it is not escaped out of recognition.
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Given(name) => fmt::Debug::fmt(name, f),
+            Self::SpawnedAt(_) => fmt::Display::fmt(self, f),
+        }
     }
 }
 
@@ -1435,6 +1470,30 @@ mod tests {
             let task = handle.borrow_mut().take().unwrap();
             assert!(block_on(task).is_err());
         }
+    }
+
+    /// A name a spawner gave reads as it always has, and the place a task was spawned at, for one
+    /// that was given none, reads as a place: in its `Debug`, which a handle's prints, and in the
+    /// sentence the log line of a panicking task puts it in, written out here as that `error!`
+    /// writes it. No test sees the line logged itself.
+    #[test]
+    #[timeout(15000)]
+    fn a_name_reads_naturally_in_the_log_and_in_debug() {
+        let given = Name::Given("socket reader".into());
+        let location = Location::caller();
+        let spawned_at = Name::SpawnedAt(location);
+
+        assert_eq!(
+            format!("The task {given} panicked"),
+            "The task `socket reader` panicked"
+        );
+        assert_eq!(format!("{given:?}"), r#""socket reader""#);
+        assert_eq!(
+            format!("The task {spawned_at} panicked"),
+            format!("The task spawned at {location} panicked")
+        );
+        assert_eq!(format!("{spawned_at:?}"), format!("spawned at {location}"));
+        assert!(location.file().ends_with("scheduler.rs"));
     }
 
     /// Polls ready tasks until none is left, the way the thread driving the runtime does.

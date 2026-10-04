@@ -19,14 +19,16 @@
 //! own.
 //!
 //! Which runtime a thread is in the seat of is written down in the one place every runtime keeps
-//! that record, the marker [`set_driving`] writes, so that a wake on that thread spares itself the
-//! write that would break a wait the thread is not in, and a `block_on` there is turned away.
+//! that record, the marker and the record of the runtime itself that [`set_driving`] writes, so
+//! that a wake on that thread spares itself the write that would break a wait the thread is not
+//! in, and a `block_on` there is turned away.
 
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     future::Future,
     io,
+    mem::{self, ManuallyDrop},
     pin::pin,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
@@ -38,6 +40,7 @@ use std::{
 
 use crate::{
     Shared,
+    mode::sealed::Sealed as _,
     runtime::{Core, drives, drives_a_runtime, lock, set_driving},
 };
 
@@ -70,6 +73,30 @@ pub(crate) fn current() -> io::Result<Arc<Core<Shared>>> {
     }
 }
 
+/// The runtime the free `spawn` falls back on where the calling thread drives none: [`current`],
+/// and held by the `block_on` the thread is inside, if it is the thread's own runtime.
+///
+/// A `block_on` looks its own runtime up afresh at each turn of its loop, and takes the seat of
+/// what it finds. The only hold on a runtime this call brings into being is the handle it hands
+/// back, which a `spawn` lets go of as soon as it has queued its task, and the runtime would go
+/// with it before the `block_on` had a turn to take its seat: the task would be dropped with it,
+/// and what awaited it told that its runtime is gone. A caller of `SharedRuntime::current` keeps
+/// the handle it is given, which a spawn with no handle of its own cannot. The innermost
+/// `block_on` holds the runtime from here on instead, until it returns (see [`HELD`]).
+pub(crate) fn current_to_spawn_on() -> io::Result<Arc<Core<Shared>>> {
+    let core = current()?;
+    if in_block_on() && is_own(&core) {
+        HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if held.is_none() {
+                **held = Some(core.clone());
+            }
+        });
+    }
+
+    Ok(core)
+}
+
 /// The calling thread's own runtime, if one is alive: what the free `block_on` resolves to.
 ///
 /// Nothing, too, once this thread's `OWN` local is gone: a `block_on` from the destructor of
@@ -100,14 +127,22 @@ pub(crate) enum Target {
 
 /// The runtime the calling thread is in the seat of, if it is in one.
 ///
-/// Nothing, too, once this thread's `DRIVING` local is gone, even where the thread still holds the
-/// seat: a destructor can reach [`Driving::enter`] after `DRIVING` has been torn down, and takes
-/// the seat with nowhere left here to record it.
+/// The record this reads is written for every shared runtime a thread drives, a `block_on` on a
+/// runtime with no seat among them. Such a runtime is left out here, as it always was: the thread
+/// inside it is in no seat, and what [`current`] builds there goes to the runtime the process
+/// shares.
+///
+/// The record has no destructor, so this finds the seat on a thread whose locals are being
+/// destroyed too, where a `block_on` run from the destructor of one of them has taken it. What
+/// [`current`] hands out there is the runtime of that seat, as on any other thread: one the thread
+/// holds for as long as it is in the seat, and whose work it runs on the next turn of its loop.
+/// Were it to look past the seat instead, the list of calls and the registry may be gone by then,
+/// and give it another runtime than the one the thread runs, or a fresh one. Of the callers of
+/// [`current`], `SharedRuntime::current` hands out there what it says it does for a thread in a
+/// seat, and [`current_to_spawn_on`] is reached only where the thread drives no shared runtime at
+/// all, so never from a seat.
 fn driven() -> Option<Arc<Core<Shared>>> {
-    DRIVING
-        .try_with(|driving| driving.borrow().upgrade())
-        .ok()
-        .flatten()
+    Shared::driven().filter(|core| core.seat.is_some())
 }
 
 /// Whether the calling thread is inside a `block_on` of this layer, and so has a thread of its
@@ -335,10 +370,10 @@ impl Seat {
             Holder::Helper => None,
         };
         self.holder = Holder::Nobody { parked_helper };
-        set_driving(None);
-        // Gone already on a thread whose locals are being destroyed, which [`Driving::take`]
-        // leaves nothing in for that very reason.
-        let _ = DRIVING.try_with(|driving| *driving.borrow_mut() = Weak::new());
+        // Cleared here, which every way out of the seat comes through: a record left standing
+        // would send what is spawned on this thread to a runtime it no longer runs, and, having
+        // no destructor, would never let go of that runtime's allocation as the thread ends.
+        set_driving::<Shared>(None);
         for (_, thread) in self.waiting.drain() {
             thread.unpark();
         }
@@ -572,13 +607,11 @@ impl Driving {
     /// Marks the calling thread as the one in the seat of `inner`, which the caller has made it:
     /// [`Driving::take`] under the seat lock, or the spawn of the helper thread.
     fn enter(inner: Arc<Core<Shared>>, who: Driver) -> Self {
-        set_driving(Some(&*inner.remote));
-        // Written down where there is still somewhere to write it: a thread whose locals are
-        // being destroyed reaches here from the destructor of one of them, and the order those
-        // run in is not this runtime's to choose. Nothing built on a thread on its way out looks
-        // this up anyway — [`driven`] comes back empty there, and the lookup falls through to
-        // the registry, which names this very runtime — so the seat is held all the same.
-        let _ = DRIVING.try_with(|driving| *driving.borrow_mut() = Arc::downgrade(&inner));
+        // Written down on a thread whose locals are being destroyed too, which reaches here from
+        // the destructor of one of them, in an order that is not this runtime's to choose: the
+        // record has no destructor, so it is there to write to whatever that order, and what is
+        // built in the seat goes on this runtime there as anywhere else.
+        set_driving::<Shared>(Some(&inner));
 
         Self {
             inner,
@@ -704,6 +737,8 @@ struct InBlockOn {
     /// Whether the call's target went on the thread's record, which it cannot once that record
     /// is gone, on a thread whose locals are being destroyed.
     recorded: bool,
+    /// What the call this one is nested in held in [`HELD`], put back as this one leaves.
+    outer_held: Option<Arc<Core<Shared>>>,
 }
 
 impl InBlockOn {
@@ -724,8 +759,14 @@ impl InBlockOn {
         let recorded = TARGETS
             .try_with(|targets| targets.borrow_mut().push(target))
             .is_ok();
+        // Taken out rather than left for this call to share, so that what this call holds goes
+        // as it leaves, and the outer call's hold is there again once it has.
+        let outer_held = HELD.with(|held| held.borrow_mut().take());
 
-        Self { recorded }
+        Self {
+            recorded,
+            outer_held,
+        }
     }
 }
 
@@ -774,20 +815,15 @@ impl Drop for InBlockOn {
             // Clear of the borrow: the handle it holds may be the last one on its runtime.
             drop(popped);
         }
+        let outer_held = self.outer_held.take();
+        let held = HELD.with(|held| mem::replace(&mut **held.borrow_mut(), outer_held));
+        // Clear of the borrow, for the same reason.
+        drop(held);
         IN_BLOCK_ON.with(|inside| inside.set(inside.get() - 1));
     }
 }
 
 thread_local! {
-    /// The runtime this thread is in the seat of, for whatever is built on this thread while it
-    /// is: a task run by a helper thread builds its own tasks, timers and registrations on the
-    /// runtime the helper runs.
-    ///
-    /// Beside the marker [`set_driving`] writes rather than in its place: that one names the
-    /// runtime by an address, which is all a wake needs, while what is built here needs a
-    /// runtime to build on.
-    static DRIVING: RefCell<Weak<Core<Shared>>> = const { RefCell::new(Weak::new()) };
-
     /// How many `block_on` calls this thread is inside of, in the seat or waiting for it. A
     /// count rather than a flag, so that one call returning does not unmark the call it was
     /// made from.
@@ -801,6 +837,19 @@ thread_local! {
     /// this thread goes on the runtime the innermost call drives, and work handed to that runtime
     /// needs no helper while the call lasts.
     static TARGETS: RefCell<Vec<Target>> = const { RefCell::new(Vec::new()) };
+
+    /// The thread's own runtime, where a free `spawn` inside the innermost `block_on` this thread
+    /// is inside of brought it into being, held by that call until it returns: nothing else holds
+    /// it, and the call takes its seat only on the next turn of its loop (see
+    /// [`current_to_spawn_on`]). Each call takes what the call around it holds out of here as it
+    /// enters, and puts it back as it leaves, so that what is here is the innermost call's alone.
+    ///
+    /// With no destructor, unlike [`TARGETS`], so that it is there for a `block_on` run from the
+    /// destructor of another of the thread's locals, whatever order they go in. Its value is kept
+    /// in a `ManuallyDrop` for that, which leaks nothing: a thread cannot end inside `block_on`,
+    /// and the outermost call puts back the `None` that was here before it.
+    static HELD: RefCell<ManuallyDrop<Option<Arc<Core<Shared>>>>> =
+        const { RefCell::new(ManuallyDrop::new(None)) };
 }
 
 /// The lock around `core`'s seat.

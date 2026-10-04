@@ -7,6 +7,7 @@
 //! shared runtime — are written for that flavour alone.
 
 use std::{
+    any::Any,
     cell::{Cell, RefCell},
     future::{Future, Pending, pending, poll_fn},
     io::{self, Write},
@@ -1234,6 +1235,27 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// The runtime a thread drives is on record for as long as the thread is inside `block_on` on
+    /// it, and not a moment longer, whether the call returns or unwinds.
+    fn the_runtime_a_thread_drives_is_on_record_while_it_is_inside_block_on<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        assert!(M::driven().is_none());
+
+        runtime.block_on(async {
+            let driven = M::driven().expect("the runtime this thread drives");
+            assert!(std::ptr::eq(&*driven, &*runtime.core));
+        });
+        assert!(M::driven().is_none());
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(async { panic!("a future that panics") });
+        }));
+        assert!(panicked.is_err());
+        assert!(M::driven().is_none());
+    }
+}
+
+in_both_modes! {
     /// A `block_on` whose future panics leaves the runtime to be driven again, by this thread or
     /// another.
     fn a_panic_in_the_future_leaves_the_runtime_drivable<M>() {
@@ -1367,6 +1389,218 @@ fn a_second_concurrent_block_on_panics() {
     assert_eq!(runtime.block_on(async { 7 }), 7);
 }
 
+/// A task spawned with no runtime to name goes on the local runtime the thread drives, whether it
+/// is spawned from the future of `block_on` or from inside a task of that runtime, and not on any
+/// other runtime there is. The futures hold an `Rc`, which only a local runtime takes.
+#[test]
+#[timeout(15000)]
+fn spawn_local_puts_the_task_on_the_runtime_the_thread_drives() {
+    let runtime = LocalRuntime::new().unwrap();
+    let other = LocalRuntime::new().unwrap();
+
+    let (from_block_on, from_a_task) = runtime.block_on(async {
+        let local = Rc::new(7);
+        let task = crate::spawn_local({
+            let local = local.clone();
+            async move { *local }
+        });
+        // Queued here, on this runtime and on no other, before it has had a turn.
+        assert_eq!(runtime.core.scheduler.live_tasks(), 1);
+        assert_eq!(other.core.scheduler.live_tasks(), 0);
+        let from_block_on = task.await.unwrap();
+
+        let spawning = crate::spawn_local({
+            let runtime = runtime.clone();
+            async move {
+                let spawned = crate::spawn_local(async move { *local });
+                // This task and the one it spawned, both on the runtime that is running them.
+                assert_eq!(runtime.core.scheduler.live_tasks(), 2);
+
+                spawned.await.unwrap()
+            }
+        });
+
+        (from_block_on, spawning.await.unwrap())
+    });
+
+    assert_eq!((from_block_on, from_a_task), (7, 7));
+    assert_eq!(other.core.scheduler.live_tasks(), 0);
+}
+
+/// A task spawned with no runtime to name goes on the shared runtime the thread drives, whether
+/// the runtime was made by `Runtime::new` or not, from the future of `block_on` and from inside a
+/// task of that runtime alike, and runs on the thread inside `block_on` as every task of it does.
+#[test]
+#[timeout(15000)]
+fn spawn_puts_the_task_on_the_runtime_the_thread_drives() {
+    let runtime = SharedRuntime::new().unwrap();
+    let other = SharedRuntime::new().unwrap();
+
+    let (from_block_on, from_a_task) = runtime.block_on(async {
+        let task = crate::spawn(async { thread::current().id() });
+        // Queued here, on this runtime and on no other, before it has had a turn.
+        assert_eq!(runtime.core.scheduler.live_tasks(), 1);
+        assert_eq!(other.core.scheduler.live_tasks(), 0);
+        let from_block_on = task.await.unwrap();
+
+        let spawning = crate::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let spawned = crate::spawn(async { thread::current().id() });
+                // This task and the one it spawned, both on the runtime that is running them.
+                assert_eq!(runtime.core.scheduler.live_tasks(), 2);
+
+                spawned.await.unwrap()
+            }
+        });
+
+        (from_block_on, spawning.await.unwrap())
+    });
+
+    assert_eq!(from_block_on, thread::current().id());
+    assert_eq!(from_a_task, thread::current().id());
+    assert_eq!(other.core.scheduler.live_tasks(), 0);
+}
+
+/// A local task has no runtime to go on where the thread drives no local runtime: outside any
+/// `block_on`, and inside the `block_on` of a shared runtime, whose tasks may run on any thread. A
+/// call that panics leaves the runtime it was made inside driving as before.
+#[test]
+#[timeout(15000)]
+fn spawn_local_panics_where_the_thread_drives_no_local_runtime() {
+    let outside = catch_unwind(AssertUnwindSafe(|| crate::spawn_local(async {}))).unwrap_err();
+    assert!(panic_message(&*outside).contains("no local runtime"));
+
+    let shared = SharedRuntime::new().unwrap();
+    let (message, next) = shared.block_on(async {
+        let inside = catch_unwind(AssertUnwindSafe(|| crate::spawn_local(async {}))).unwrap_err();
+        // Still driving: a task spawned after the panic runs as ever.
+        let next = crate::spawn(async { 7 });
+
+        (panic_message(&*inside).to_owned(), next.await.unwrap())
+    });
+
+    assert!(message.contains("no local runtime"), "{message}");
+    assert_eq!(next, 7);
+}
+
+/// Without the `helper` feature, which would give a thread that drives no shared runtime the
+/// process's to spawn on, there is none for a shared task to go on there: outside any `block_on`,
+/// and inside the `block_on` of a local runtime.
+#[cfg(not(feature = "helper"))]
+#[test]
+#[timeout(15000)]
+fn spawn_panics_where_the_thread_drives_no_shared_runtime() {
+    let outside = catch_unwind(AssertUnwindSafe(|| crate::spawn(async {}))).unwrap_err();
+    assert!(panic_message(&*outside).contains("no shared runtime"));
+
+    let local = LocalRuntime::new().unwrap();
+    let (message, next) = local.block_on(async {
+        let inside = catch_unwind(AssertUnwindSafe(|| crate::spawn(async {}))).unwrap_err();
+        // Still driving: a task spawned after the panic runs as ever.
+        let next = crate::spawn_local(async { 7 });
+
+        (panic_message(&*inside).to_owned(), next.await.unwrap())
+    });
+
+    assert!(message.contains("no shared runtime"), "{message}");
+    assert_eq!(next, 7);
+}
+
+/// A task spawned with no runtime to name, inside a `block_on` run from the destructor of a
+/// thread-local as its thread ends, goes on the runtime that call drives, as it does anywhere
+/// else: a local runtime, and a shared one made by `Runtime::new`, whose task the thread inside
+/// the call runs.
+///
+/// The thread drives a runtime of each flavour once the value is in place, so that the record of
+/// the runtime it drives is first reached after that value: thread-local destructors run in
+/// reverse order of registration, and a record with a destructor of its own would be gone by the
+/// time the value's runs. A panic out of a destructor there is an abort, so the destructor catches
+/// what panics and hands it on.
+#[test]
+#[timeout(15000)]
+fn a_spawn_inside_a_block_on_as_a_thread_ends_goes_on_the_runtime_it_drives() {
+    /// What a spawn inside a `block_on` of each flavour came to: the local task's output, and
+    /// whether the shared task ran on the thread inside the call, or what panicked instead.
+    type Spawned = (Result<u32, String>, Result<bool, String>);
+
+    /// Spawns inside a `block_on` of each flavour as it is dropped, and sends what came of it.
+    struct SpawnsAsItGoes(Option<mpsc::Sender<Spawned>>);
+
+    impl Drop for SpawnsAsItGoes {
+        fn drop(&mut self) {
+            let Some(spawned) = self.0.take() else {
+                return;
+            };
+            DROPPING.with(|dropping| dropping.set(true));
+            let local = catch_unwind(|| {
+                LocalRuntime::new()
+                    .unwrap()
+                    .block_on(async { crate::spawn_local(async { 7 }).await.unwrap() })
+            });
+            let shared = catch_unwind(|| {
+                SharedRuntime::new().unwrap().block_on(async {
+                    crate::spawn(async { DROPPING.with(Cell::get) })
+                        .await
+                        .unwrap()
+                })
+            });
+            let message = |panic: Box<dyn Any + Send>| panic_message(&*panic).to_owned();
+            let _ = spawned.send((local.map_err(message), shared.map_err(message)));
+        }
+    }
+
+    thread_local! {
+        static SPAWNS_AS_IT_GOES: RefCell<SpawnsAsItGoes> =
+            const { RefCell::new(SpawnsAsItGoes(None)) };
+
+        /// Whether this thread is the one dropping the value above, for a task to tell which
+        /// thread runs it. With no destructor, so that it is there to read as the thread ends.
+        static DROPPING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    let (sender, spawned) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        SPAWNS_AS_IT_GOES.with(|spawns| spawns.borrow_mut().0 = Some(sender));
+        LocalRuntime::new().unwrap().block_on(async {});
+        SharedRuntime::new().unwrap().block_on(async {});
+    });
+
+    assert!(thread.join().is_ok());
+    // The shared task run by the thread dropping the value, inside the call, rather than by a
+    // helper thread of some other runtime. Both compared at once, so that a failure shows both.
+    assert_eq!(spawned.recv().unwrap(), (Ok(7), Ok(true)));
+}
+
+/// A task spawned with no name is named by the call that spawned it, as its `Debug` shows, while a
+/// name given prints as the string it is.
+#[test]
+#[timeout(15000)]
+fn a_task_spawned_with_no_name_is_named_by_where_it_was_spawned() {
+    let local = LocalRuntime::new().unwrap();
+    let shared = SharedRuntime::new().unwrap();
+
+    let (local_task, local_line) =
+        local.block_on(async { (crate::spawn_local(async {}), line!()) });
+    let (shared_task, shared_line) = shared.block_on(async { (crate::spawn(async {}), line!()) });
+    let named = local.spawn("socket reader", async {});
+
+    // The line is the one of the call, and the column is left to the formatter.
+    assert!(
+        format!("{local_task:?}").contains(&format!("task: spawned at {}:{local_line}:", file!())),
+        "{local_task:?}"
+    );
+    assert!(
+        format!("{shared_task:?}")
+            .contains(&format!("task: spawned at {}:{shared_line}:", file!())),
+        "{shared_task:?}"
+    );
+    assert_eq!(
+        format!("{named:?}"),
+        r#"Task(JoinHandle { task: "socket reader", detached: false, .. })"#
+    );
+}
+
 /// What a shared runtime's handles are shared as: a task handle and a registration live in state
 /// that several threads reach, a runtime handle is cloned into the tasks it spawns, and a timer,
 /// a timeout or an interval goes wherever the task awaiting it is polled.
@@ -1451,6 +1685,16 @@ where
         })
     })
     .await
+}
+
+/// The message a panic carried, which is a string for a panic made from a string literal or a
+/// format string, as every one this crate makes is.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or_default()
 }
 
 /// Sets the flag it holds when it is dropped.
