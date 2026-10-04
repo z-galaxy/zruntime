@@ -343,6 +343,23 @@ fn a_dropped_sleep_lets_the_helper_exit() {
     assert!(helper_gone(&runtime));
 }
 
+/// A timer made for a deadline asks for the helper on its first poll, as one made for a duration
+/// does, and lets it go once dropped.
+#[test]
+#[timeout(15000)]
+fn a_sleep_until_starts_the_helper_and_dropping_it_lets_it_exit() {
+    let runtime = runtime();
+    {
+        let mut sleep = pin!(runtime.sleep_until(Instant::now() + Duration::from_secs(10)));
+        // Made but not yet polled, the timer has handed the reactor nothing to wait on.
+        assert!(!runtime.helper_running());
+        assert!(block_on(poll_once(sleep.as_mut())).is_none());
+        assert!(runtime.helper_running());
+    }
+
+    assert!(helper_gone(&runtime));
+}
+
 #[test]
 #[timeout(15000)]
 fn a_sleep_beyond_the_clock_starts_no_helper() {

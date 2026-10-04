@@ -212,19 +212,15 @@ where
     })
 }
 
-/// A timer of `core`'s reactor that is due once `duration` has passed, or one that never comes
-/// due where the clock cannot reach that far.
-pub(crate) fn sleep<M>(core: &M::Ptr<Core<M>>, duration: Duration) -> Sleep<M>
+/// A timer of `core`'s reactor that comes due at `deadline`, or one that never comes due where
+/// there is none.
+pub(crate) fn sleep<M>(core: &M::Ptr<Core<M>>, deadline: Option<Instant>) -> Sleep<M>
 where
     M: Mode,
 {
     Sleep {
         core: core.clone(),
-        // This reactor's timers run on the standard clock, so a length of time is a deadline on
-        // it — where the clock has a moment that far ahead. `Duration::MAX`, which a wait of
-        // "however long it takes" comes to, has none, and asks for a timer that never fires
-        // rather than for a moment the clock cannot name.
-        deadline: Instant::now().checked_add(duration),
+        deadline,
         id: None,
     }
 }
@@ -355,6 +351,11 @@ where
     /// The runtime this timer belongs to.
     pub(crate) fn core(&self) -> &M::Ptr<Core<M>> {
         &self.core
+    }
+
+    /// When this timer comes due, and nothing where the clock has no such moment.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     /// Whether this timer has no deadline the clock can name, and so never comes due.
@@ -657,19 +658,11 @@ mod tests {
         let reactor = &runtime.core.reactor;
         let (first, first_waker) = counting_waker();
         let (second, second_waker) = counting_waker();
-        // Built by hand from the one deadline: `sleep` reads the clock afresh for each
+        // Both made from the one deadline: `Runtime::sleep` reads the clock afresh for each
         // timer, and two deadlines nanoseconds apart would keep the pair apart on their own.
         let deadline = Instant::now() + Duration::from_millis(5);
-        let mut one = pin!(Sleep::<Shared> {
-            core: runtime.core.clone(),
-            deadline: Some(deadline),
-            id: None,
-        });
-        let mut other = pin!(Sleep::<Shared> {
-            core: runtime.core.clone(),
-            deadline: Some(deadline),
-            id: None,
-        });
+        let mut one = pin!(sleep::<Shared>(&runtime.core, Some(deadline)));
+        let mut other = pin!(sleep::<Shared>(&runtime.core, Some(deadline)));
         assert!(
             one.as_mut()
                 .poll(&mut Context::from_waker(&first_waker))

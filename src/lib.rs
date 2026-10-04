@@ -58,7 +58,7 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "event")]
@@ -203,7 +203,47 @@ where
 
     /// A future that completes once `duration` has passed. Dropping it cancels the timer.
     pub fn sleep(&self, duration: Duration) -> Sleep<M> {
-        Sleep(reactor::sleep::<M>(&self.core, duration))
+        // This runtime's timers run on the standard clock, so a length of time is a deadline on
+        // it — where the clock has a moment that far ahead. `Duration::MAX`, which a wait of
+        // "however long it takes" comes to, has none, and asks for a timer that never fires
+        // rather than for a moment the clock cannot name.
+        let deadline = Instant::now().checked_add(duration);
+
+        Sleep(reactor::sleep::<M>(&self.core, deadline))
+    }
+
+    /// A future that completes once `deadline` has passed: at once, on its first poll, where it
+    /// already has. Dropping it cancels the timer.
+    ///
+    /// This is what a loop that has to keep to a schedule reaches for. One that sleeps for a
+    /// period in each round drifts by however long the work of that round took, and the error
+    /// adds up with every round. One that adds the period to a deadline of its own and sleeps
+    /// until that deadline starts each round when it was due, however long the rounds before it
+    /// took.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let period = Duration::from_millis(2);
+    /// let started = Instant::now();
+    ///
+    /// runtime.block_on(async {
+    ///     let mut deadline = started;
+    ///     for _ in 0..3 {
+    ///         deadline += period;
+    ///         runtime.sleep_until(deadline).await;
+    ///     }
+    /// });
+    ///
+    /// assert!(started.elapsed() >= 3 * period);
+    /// ```
+    pub fn sleep_until(&self, deadline: Instant) -> Sleep<M> {
+        Sleep(reactor::sleep::<M>(&self.core, Some(deadline)))
     }
 }
 

@@ -12,6 +12,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use crate::{Local, Mode, reactor};
@@ -29,6 +30,17 @@ use crate::{Local, Mode, reactor};
 pub struct Sleep<M = Local>(pub(crate) reactor::Sleep<M>)
 where
     M: Mode;
+
+impl<M> Sleep<M>
+where
+    M: Mode,
+{
+    /// When this timer comes due, or `None` for one that never does: one asked for further ahead
+    /// than the clock can name, as `sleep(Duration::MAX)` is.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.0.deadline()
+    }
+}
 
 impl<M> Future for Sleep<M>
 where

@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_lite::future::yield_now;
+use futures_lite::future::{poll_once, yield_now};
 use ntest::timeout;
 use socket2::{SockRef, Socket};
 
@@ -246,6 +246,45 @@ in_both_modes! {
 
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    fn sleep_until_resolves_once_the_deadline_has_passed<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
+
+        runtime.block_on(runtime.sleep_until(deadline));
+
+        assert!(Instant::now() >= deadline);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+in_both_modes! {
+    /// A deadline that has passed by the first poll is no reason to wait: the timer completes
+    /// on that poll, with nothing left behind for the reactor to fire.
+    fn sleep_until_a_passed_deadline_is_ready_on_its_first_poll<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        // The clock has moved on by the time of the poll, however little.
+        let deadline = Instant::now();
+
+        let polled = runtime.block_on(poll_once(runtime.sleep_until(deadline)));
+
+        assert!(polled.is_some());
+    }
+}
+
+in_both_modes! {
+    /// A timer says when it comes due, whichever way it was asked for, and has no such moment
+    /// where the clock cannot name one.
+    fn a_sleep_reports_its_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        assert_eq!(runtime.sleep_until(deadline).deadline(), Some(deadline));
+        assert!(runtime.sleep(Duration::MAX).deadline().is_none());
     }
 }
 
