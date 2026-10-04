@@ -159,7 +159,8 @@ where
     /// A task whose future holds a timer, a registration or a clone of the runtime keeps the
     /// runtime, and the descriptors its reactor holds, alive until the task ends. No helper thread
     /// ever runs a runtime made here, so a detached task that never ends is never let go of: drive
-    /// such a task to completion, or keep its [`Task`] and cancel it by dropping that.
+    /// such a task to completion, or keep its [`Task`] and cancel it, by dropping that or through
+    /// [`Task::cancel`].
     ///
     /// What can fail is the reactor: it opens the channel a wait is broken through.
     ///
@@ -636,6 +637,8 @@ pub enum Interest {
 }
 
 /// A task spawned on a [`Runtime`], which cancels that task when dropped.
+///
+/// [`Task::cancel`] cancels it as well, and waits for it to stop.
 #[cfg(feature = "runtime")]
 pub struct Task<T, M = Local>(JoinHandle<T, M>)
 where
@@ -655,6 +658,63 @@ where
     /// lives, and where a helper runs it, keeps that helper for the life of the process.
     pub fn detach(self) {
         self.0.detach();
+    }
+
+    /// Cancels the task, and hands back a future that resolves once the task's future is gone.
+    ///
+    /// Dropping a task cancels it too, but does not wait: a task that another thread is polling
+    /// at that moment is left to finish that poll, and its future, with everything it holds, goes
+    /// only then. Cancelling it here, and awaiting what this hands back, is for a caller that has
+    /// to know when that is — to bind a socket to the address of one the task held, say, or to
+    /// take a lock it held — or that wants the output of a task that may have finished already.
+    ///
+    /// The cancellation is made here, in the call, whether or not the future handed back is ever
+    /// polled. A task that is waiting, or has not been polled yet, has its future dropped right
+    /// here, on the calling thread. One that is being polled at that moment has it dropped once
+    /// that poll returns: by another thread, or by this one where a task cancels itself. And
+    /// where the runtime is going just then, its last handle being dropped, perhaps on another
+    /// thread, the runtime drops the future as it goes, which may be after this call has
+    /// returned. It is awaiting the future handed back that tells when the task's future is
+    /// gone: that resolves once it has been dropped, however that came about, to the task's
+    /// output where the task had finished before the cancellation reached it, and to `None`
+    /// otherwise. A task that panicked, went with its runtime, or had its output taken already
+    /// by being awaited has none to hand back either. Dropping that future is the same as
+    /// dropping the task.
+    ///
+    /// A task's future whose destructor panics as it is dropped here panics out of this call, as
+    /// it would out of a drop of the task.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{future, rc::Rc, time::Duration};
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// let connection = Rc::new("a connection");
+    ///
+    /// runtime.block_on(async {
+    ///     let answer = runtime.spawn("an answer", async { 42 });
+    ///     let held = connection.clone();
+    ///     let reader = runtime.spawn("a reader that never finishes", async move {
+    ///         let _connection = held;
+    ///         future::pending::<u32>().await
+    ///     });
+    ///     // Each wait gives the tasks a turn, until the first one has finished.
+    ///     while !answer.is_finished() {
+    ///         runtime.sleep(Duration::from_millis(1)).await;
+    ///     }
+    ///
+    ///     // A task that finished hands its output back...
+    ///     assert_eq!(answer.cancel().await, Some(42));
+    ///     // ...and one that did not has let go of what it held by the time the wait is over.
+    ///     assert_eq!(reader.cancel().await, None);
+    ///     assert_eq!(Rc::strong_count(&connection), 1);
+    /// });
+    /// ```
+    pub fn cancel(self) -> impl Future<Output = Option<T>> {
+        self.0.cancel()
     }
 
     /// Whether the task has ended, told without polling it or taking its output.

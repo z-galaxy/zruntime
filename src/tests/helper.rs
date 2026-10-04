@@ -12,6 +12,7 @@ use std::{
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -141,6 +142,53 @@ fn cancelling_the_last_task_from_another_thread_lets_the_helper_exit() {
 
     drop(task);
 
+    assert!(helper_gone(&runtime));
+}
+
+/// A task cancelled from another thread, through `cancel`, lets the helper exit once it was the
+/// last, as a task dropped there does.
+#[test]
+#[timeout(15000)]
+fn cancelling_the_last_task_from_another_thread_and_waiting_lets_the_helper_exit() {
+    let runtime = runtime();
+    let task = runtime.spawn("a task that never finishes", pending::<u32>());
+    assert!(runtime.helper_running());
+
+    assert_eq!(block_on(task.cancel()), None);
+
+    assert!(helper_gone(&runtime));
+}
+
+/// A task cancelled while the helper thread polls it is dropped by the helper once that poll
+/// returns, and the wait for it, on another thread, lasts until then.
+#[test]
+#[timeout(15000)]
+fn cancelling_a_task_the_helper_polls_waits_for_that_poll() {
+    let runtime = runtime();
+    // The task's future holds a clone, so that the count tells whether that future is gone.
+    let held = Arc::new(());
+    let (announce, announced) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let task = {
+        let held = held.clone();
+        runtime.spawn("a task held in its poll", async move {
+            let _held = held;
+            announce.send(()).unwrap();
+            // A sender dropped by a test that failed first lets the poll go on as well.
+            let _ = released.recv();
+            pending::<u32>().await
+        })
+    };
+    // The helper is inside the task's first poll once this is in.
+    announced.recv().unwrap();
+
+    let mut cancelling = pin!(task.cancel());
+
+    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert_eq!(Arc::strong_count(&held), 2);
+    release.send(()).unwrap();
+    assert_eq!(block_on(cancelling), None);
+    assert_eq!(Arc::strong_count(&held), 1);
     assert!(helper_gone(&runtime));
 }
 

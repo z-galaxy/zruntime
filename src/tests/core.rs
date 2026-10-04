@@ -12,11 +12,12 @@ use std::{
     io::{self, Write},
     mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind},
-    pin::Pin,
+    pin::{Pin, pin},
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -25,7 +26,7 @@ use std::{
 
 use futures_lite::{
     Stream, StreamExt,
-    future::{poll_once, yield_now},
+    future::{block_on, poll_once, yield_now},
 };
 use ntest::timeout;
 use socket2::{SockRef, Socket};
@@ -288,6 +289,345 @@ fn a_shared_task_is_finished_only_once_its_future_is_dropped() {
 
         assert_eq!(noted, Some(false), "{end:?}");
     }
+}
+
+in_both_modes! {
+    /// A task cancelled before its first poll is never polled, and its future is gone by the time
+    /// `cancel` returns, which leaves the wait nothing to wait for.
+    fn cancelling_a_task_never_polled_drops_its_future_in_the_call<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task = {
+            let polled = polled.clone();
+            let marker = SetOnDrop(dropped.clone());
+            M::spawn(&runtime, "a task that is never polled", async move {
+                let _marker = marker;
+                polled.store(true, Ordering::Release);
+            })
+        };
+
+        let cancelling = task.cancel();
+
+        assert!(dropped.load(Ordering::Acquire));
+        // A round of the runtime, which comes to the id the task left in its queue and skips it.
+        runtime.block_on(yield_now());
+        assert!(!polled.load(Ordering::Acquire));
+        assert_eq!(runtime.block_on(poll_once(cancelling)), Some(None));
+    }
+}
+
+in_both_modes! {
+    /// A task cancelled while it waits has its future dropped in the call, on the thread that
+    /// cancels it, and the wait is over as soon as it is polled.
+    fn cancelling_a_waiting_task_drops_its_future_in_the_call<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task = {
+            let marker = SetOnDrop(dropped.clone());
+            M::spawn(&runtime, "a task that never finishes", async move {
+                let _marker = marker;
+                pending::<u32>().await
+            })
+        };
+        // A yield is one round of the loop, in which the task is polled and left waiting.
+        runtime.block_on(yield_now());
+        assert!(!dropped.load(Ordering::Acquire));
+
+        let cancelling = task.cancel();
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(block_on(poll_once(cancelling)), Some(None));
+    }
+}
+
+in_both_modes! {
+    /// A task that finished before it was cancelled hands its output back, which nobody had
+    /// taken yet.
+    fn cancelling_a_finished_task_hands_its_output_back<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let task = M::spawn(&runtime, "an answer", async { 42 });
+        runtime.block_on(yield_now());
+        assert!(task.is_finished());
+
+        assert_eq!(block_on(poll_once(task.cancel())), Some(Some(42)));
+    }
+}
+
+in_both_modes! {
+    /// A task that panicked has no output to hand back.
+    fn cancelling_a_panicked_task_hands_nothing_back<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let task = M::spawn(&runtime, "a task that panics", async {
+            panic!("the task panicked on purpose");
+        });
+        runtime.block_on(yield_now());
+        assert!(task.is_finished());
+
+        let resolved = block_on(poll_once(task.cancel()));
+
+        assert!(resolved.is_some_and(|output| output.is_none()));
+    }
+}
+
+in_both_modes! {
+    /// A task whose runtime went before it ended has no output to hand back, and its future is
+    /// gone already, so there is nothing to wait for.
+    fn cancelling_a_task_whose_runtime_is_gone_hands_nothing_back<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let task = M::spawn(&runtime, "a task that never finishes", pending::<u32>());
+        runtime.block_on(yield_now());
+
+        drop(runtime);
+
+        assert_eq!(block_on(poll_once(task.cancel())), Some(None));
+    }
+}
+
+in_both_modes! {
+    /// A task whose output was taken by awaiting it has nothing left to hand back, and the wait
+    /// is over at once rather than waiting for an outcome that has come and gone.
+    fn cancelling_a_task_already_awaited_hands_nothing_back<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut task = M::spawn(&runtime, "an answer", async { 42 });
+        assert_eq!(runtime.block_on(&mut task).unwrap(), 42);
+
+        assert_eq!(block_on(poll_once(task.cancel())), Some(None));
+    }
+}
+
+in_both_modes! {
+    /// A future whose destructor panics as `cancel` drops it panics out of that call, as it does
+    /// out of a drop of the task, and takes nothing else with it.
+    fn a_panicking_destructor_panics_out_of_cancel<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let task = M::spawn(&runtime, "a task that never finishes", async {
+            let _marker = PanicOnDrop;
+            pending::<()>().await;
+        });
+        // Idle when it is cancelled, so the drop of its future is this thread's to make, and the
+        // panic is the caller's to see.
+        runtime.block_on(yield_now());
+
+        assert!(catch_unwind(AssertUnwindSafe(|| task.cancel())).is_err());
+
+        let next = M::spawn(&runtime, "the task after it", async { 7 });
+        assert_eq!(runtime.block_on(next).unwrap(), 7);
+    }
+}
+
+/// A task may cancel itself from inside its own poll, and await that: the wait leaves the poll
+/// pending, and the future is dropped once that poll has returned, the wait with it, while the
+/// runtime carries on.
+#[test]
+#[timeout(15000)]
+fn a_local_task_may_cancel_itself() {
+    let runtime = LocalRuntime::new().unwrap();
+    let own = Rc::new(RefCell::new(None::<Task<()>>));
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let task = {
+        let own = own.clone();
+        let log = log.clone();
+        let marker = SetOnDrop(dropped.clone());
+        runtime.spawn("a task that cancels itself", async move {
+            let _marker = marker;
+            let task = own.borrow_mut().take().expect("the task's own handle");
+            let cancelling = task.cancel();
+            log.borrow_mut().push("cancelled");
+            cancelling.await;
+            log.borrow_mut().push("resumed");
+        })
+    };
+    *own.borrow_mut() = Some(task);
+
+    runtime.block_on(yield_now());
+
+    assert_eq!(*log.borrow(), ["cancelled"]);
+    assert!(dropped.load(Ordering::Acquire));
+    let next = runtime.spawn("the task after it", async { 7 });
+    assert_eq!(runtime.block_on(next).unwrap(), 7);
+}
+
+/// A task may cancel itself from inside its own poll, and await that: the wait leaves the poll
+/// pending, and the future is dropped once that poll has returned, the wait with it, while the
+/// runtime carries on. Nothing of the task is left behind then: the waker the wait registered is
+/// the task's own, and dropping the cancelled handle lets go of it, or the task would keep itself,
+/// and the runtime's remote with it, alive for good.
+#[test]
+#[timeout(15000)]
+fn a_shared_task_may_cancel_itself() {
+    let runtime = SharedRuntime::new().unwrap();
+    let remotes = Arc::strong_count(&runtime.core.remote);
+    let own = Arc::new(Mutex::new(None::<Task<(), Shared>>));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let task = {
+        let own = own.clone();
+        let log = log.clone();
+        let marker = SetOnDrop(dropped.clone());
+        runtime.spawn("a task that cancels itself", async move {
+            let _marker = marker;
+            let task = own.lock().unwrap().take().expect("the task's own handle");
+            let cancelling = task.cancel();
+            log.lock().unwrap().push("cancelled");
+            cancelling.await;
+            log.lock().unwrap().push("resumed");
+        })
+    };
+    *own.lock().unwrap() = Some(task);
+
+    runtime.block_on(yield_now());
+
+    assert_eq!(*log.lock().unwrap(), ["cancelled"]);
+    assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(Arc::strong_count(&runtime.core.remote), remotes);
+    let next = runtime.spawn("the task after it", async { 7 });
+    assert_eq!(runtime.block_on(next).unwrap(), 7);
+}
+
+/// A task cancelled as its runtime drops it — from the destructor of its own future, here — is
+/// waited for until its future is gone, though the runtime can no longer be reached to stop it:
+/// the runtime is dropping that future already, and the wait lasts until it has.
+#[test]
+#[timeout(15000)]
+fn a_task_cancelled_as_its_runtime_goes_is_waited_for_until_its_future_is_gone() {
+    let runtime = LocalRuntime::new().unwrap();
+    let own = Rc::new(RefCell::new(None));
+    let cancelling = Rc::new(RefCell::new(None));
+    let pending_at_once = Rc::new(Cell::new(None));
+    let task = {
+        let canceller = CancelOnDrop {
+            task: own.clone(),
+            cancelling: cancelling.clone(),
+            pending_at_once: pending_at_once.clone(),
+        };
+        runtime.spawn("a task that cancels itself as it goes", async move {
+            let _canceller = canceller;
+            pending::<()>().await;
+        })
+    };
+    *own.borrow_mut() = Some(task);
+    runtime.block_on(yield_now());
+
+    drop(runtime);
+
+    // The future was still being dropped when the wait was first polled...
+    assert_eq!(pending_at_once.get(), Some(true));
+    // ...and is gone by now.
+    let cancelling = cancelling.borrow_mut().take().unwrap();
+    assert_eq!(block_on(poll_once(cancelling)), Some(None));
+}
+
+/// A task cancelled while another thread polls it is dropped by that thread once its poll
+/// returns, and the wait for it lasts until then. Where that poll leaves the task waiting, there
+/// is no output to hand back.
+#[test]
+#[timeout(15000)]
+fn cancelling_a_task_another_thread_polls_waits_for_that_poll() {
+    let runtime = SharedRuntime::new().unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let marker = SetOnDrop(dropped.clone());
+    let (task, release, driver) = held_in_its_poll(&runtime, async move {
+        let _marker = marker;
+        pending::<u32>().await
+    });
+
+    let mut cancelling = pin!(task.cancel());
+
+    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert!(!dropped.load(Ordering::Acquire));
+    release.send(()).unwrap();
+    assert_eq!(block_on(cancelling), None);
+    assert!(dropped.load(Ordering::Acquire));
+    driver.join().unwrap();
+}
+
+/// A task cancelled while another thread polls it, whose poll then finishes it, hands its output
+/// back once that thread has dropped its future: the task finished before the cancellation
+/// reached it.
+#[test]
+#[timeout(15000)]
+fn cancelling_a_task_another_thread_polls_to_its_end_hands_its_output_back() {
+    let runtime = SharedRuntime::new().unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let marker = SetOnDrop(dropped.clone());
+    let (task, release, driver) = held_in_its_poll(&runtime, async move {
+        let _marker = marker;
+        42
+    });
+
+    let mut cancelling = pin!(task.cancel());
+
+    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert!(!dropped.load(Ordering::Acquire));
+    release.send(()).unwrap();
+    assert_eq!(block_on(cancelling), Some(42));
+    assert!(dropped.load(Ordering::Acquire));
+    driver.join().unwrap();
+}
+
+/// A task cancelled while another thread polls it, whose future's destructor panics as that
+/// thread drops it, ends the wait all the same: the panic is contained there, and the task is
+/// still told to be over.
+#[test]
+#[timeout(15000)]
+fn cancelling_a_task_whose_destructor_panics_on_another_thread_ends_the_wait() {
+    let runtime = SharedRuntime::new().unwrap();
+    let (task, release, driver) = held_in_its_poll(&runtime, async {
+        let _marker = PanicOnDrop;
+        pending::<u32>().await
+    });
+
+    let mut cancelling = pin!(task.cancel());
+
+    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    release.send(()).unwrap();
+    assert_eq!(block_on(cancelling), None);
+    driver.join().unwrap();
+}
+
+/// Dropping the wait for a cancelled task lets go of the task's outcome, as dropping the task
+/// does: a task that finishes in the poll it was cancelled during drops its output there, rather
+/// than leave it to whoever kept a clone of its waker.
+#[test]
+#[timeout(15000)]
+fn dropping_the_wait_for_a_cancelled_task_lets_its_output_go() {
+    let runtime = SharedRuntime::new().unwrap();
+    let kept = Arc::new(Mutex::new(None));
+    let output_dropped = Arc::new(AtomicBool::new(false));
+    let (task, release, driver) = {
+        let kept = kept.clone();
+        let output = SetOnDrop(output_dropped.clone());
+        held_in_its_poll(&runtime, async move {
+            let waker = poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+            *kept.lock().unwrap() = Some(waker);
+
+            output
+        })
+    };
+
+    drop(task.cancel());
+    release.send(()).unwrap();
+    driver.join().unwrap();
+
+    assert!(kept.lock().unwrap().is_some());
+    assert!(output_dropped.load(Ordering::Acquire));
+}
+
+/// The wait for a cancelled task on a shared runtime may be sent to, and awaited on, another
+/// thread, as the task itself may.
+#[test]
+#[timeout(15000)]
+fn the_wait_for_a_cancelled_shared_task_crosses_threads() {
+    let runtime = SharedRuntime::new().unwrap();
+    let cancelling = runtime
+        .spawn("a task that never finishes", pending::<u32>())
+        .cancel();
+
+    let resolved = thread::spawn(move || block_on(cancelling)).join().unwrap();
+
+    assert_eq!(resolved, None);
 }
 
 in_both_modes! {
@@ -1242,6 +1582,72 @@ where
         let finished = self.task.lock().unwrap().as_ref().map(Task::is_finished);
         *self.noted.lock().unwrap() = finished;
     }
+}
+
+/// Cancels the task in `task` as it is dropped, polls the wait for it once, and leaves that wait
+/// in `cancelling`, noting in `pending_at_once` whether that poll left it pending.
+///
+/// What it finds goes into the test's own cells rather than into assertions of its own: a
+/// destructor the runtime runs has its panics contained, and an assertion failing there would
+/// fail nothing.
+struct CancelOnDrop {
+    task: Rc<RefCell<Option<Task<()>>>>,
+    cancelling: Rc<RefCell<Option<Cancelling>>>,
+    pending_at_once: Rc<Cell<Option<bool>>>,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some(task) = self.task.borrow_mut().take() else {
+            return;
+        };
+        let mut cancelling = Box::pin(task.cancel());
+        let polled = cancelling
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        self.pending_at_once.set(Some(polled.is_pending()));
+        *self.cancelling.borrow_mut() = Some(cancelling);
+    }
+}
+
+/// The wait for a cancelled local task, boxed so that a test can keep it.
+type Cancelling = Pin<Box<dyn Future<Output = Option<()>>>>;
+
+/// Spawns `future` on `runtime` behind a first poll that holds the thread making it until the
+/// sender handed back is sent to or dropped, and has a thread of its own make that poll, inside a
+/// `block_on` on `runtime` that lasts one round of its loop.
+///
+/// Returns once that poll has begun, with the task, that sender, and that thread, which leaves
+/// `block_on` once the poll has returned and the scheduler has done with the task what the poll
+/// left it to do.
+fn held_in_its_poll<F>(
+    runtime: &SharedRuntime,
+    future: F,
+) -> (
+    Task<F::Output, Shared>,
+    mpsc::Sender<()>,
+    thread::JoinHandle<()>,
+)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (announce, announced) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let task = runtime.spawn("a task held in its poll", async move {
+        announce.send(()).unwrap();
+        // A sender dropped by a test that failed first lets the poll go on as well.
+        let _ = released.recv();
+        future.await
+    });
+    let driver = {
+        let runtime = runtime.clone();
+        // A yield is one round of the loop, in which the task is polled once.
+        thread::spawn(move || runtime.block_on(yield_now()))
+    };
+    announced.recv().unwrap();
+
+    (task, release, driver)
 }
 
 /// A counter and the waker that counts into it.

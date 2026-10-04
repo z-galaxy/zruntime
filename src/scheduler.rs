@@ -21,10 +21,14 @@
 //! [`spawn`] hands back a handle that resolves to what the task produced. The task's future is
 //! wrapped before it is stored, and the wrapper is what hands the outcome over: the future's
 //! output, or an error where it panicked, or — through a guard it holds, as it is dropped
-//! unfinished — an error where the runtime went away with it. Dropping the handle cancels the
+//! unfinished — an error where the runtime went away with it or the task was cancelled. Whichever
+//! it is, it is handed over once the future has been dropped. Dropping the handle cancels the
 //! task: the future is dropped there and then if nobody is polling it, and by the poll under way
-//! otherwise. A task whose outcome is of no further interest is detached instead, and runs until
-//! it ends.
+//! otherwise. A handle can also cancel the task and stay, to learn when the future is gone: the
+//! future is dropped just as for a drop of the handle, but the outcome is left for the wrapper to
+//! hand over, which tells the handle that the future is gone, and hands it the output where the
+//! task had finished first. A task whose outcome is of no further interest is detached instead,
+//! and runs until it ends.
 //!
 //! A task that panics takes nothing with it. The panic is caught where the task is polled, the
 //! task ends there, its handle reports the failure, and the thread that polled it carries on
@@ -321,6 +325,7 @@ where
         core: M::downgrade(core),
         join,
         detached: false,
+        cancelled: false,
     }
 }
 
@@ -423,7 +428,8 @@ struct Unpolled<F, G> {
     guard: G,
 }
 
-/// Joins a spawned task, and cancels it when dropped unless [`JoinHandle::detach`] was called.
+/// Joins a spawned task, and cancels it when dropped unless [`JoinHandle::detach`] was called;
+/// [`JoinHandle::cancel`] cancels it and waits for its future to be gone.
 pub(crate) struct JoinHandle<T, M>
 where
     M: Mode,
@@ -434,6 +440,9 @@ where
     core: M::Weak<Core<M>>,
     join: M::Ptr<Join<M, T>>,
     detached: bool,
+    /// Whether [`JoinHandle::cancel`] has cancelled the task already, which leaves the drop of
+    /// the handle nothing to do but let go of the outcome.
+    cancelled: bool,
 }
 
 impl<T, M> JoinHandle<T, M>
@@ -447,16 +456,31 @@ where
     /// waker holds that too, and a waker somebody kept would keep the output alive with it.
     pub(crate) fn detach(mut self) {
         self.detached = true;
-        let (output, join_waker) = {
-            let mut state = self.join.state.lock();
-            state.done = true;
+        self.settle();
+    }
 
-            (state.output.take(), state.join_waker.take())
+    /// Cancels the task, as a drop of the handle does, and hands back a future that resolves once
+    /// the task's future is gone: to the output, where the task finished before it was
+    /// cancelled, and to `None` otherwise.
+    ///
+    /// Unlike a drop, this leaves the outcome for the task to settle: the guard its wrapper holds
+    /// settles it once the future has been dropped, here or after the poll under way, and wakes
+    /// whoever waits on it, which by then is the future handed back.
+    pub(crate) fn cancel(mut self) -> impl Future<Output = Option<T>> {
+        // Marked first, so that a destructor panicking out of the stop below drops the handle as
+        // one whose task is cancelled already.
+        self.cancelled = true;
+        let unsettled = {
+            let mut state = self.join.state.lock();
+            // Finished, or failed as its runtime went: nothing is left to stop, and the outcome
+            // is there for the taking.
+            (!state.done).then(|| state.join_waker.take())
         };
-        // Clear of the lock: an output's destructor is the task's code, and a waker's somebody
-        // else's.
-        drop(output);
-        drop(join_waker);
+        if let Some(join_waker) = unsettled {
+            self.stop(join_waker);
+        }
+
+        poll_fn(move |cx| self.poll_cancelled(cx))
     }
 
     /// The task's outcome, once it has one; a wake of `cx`'s waker once it does, otherwise.
@@ -488,6 +512,103 @@ where
     pub(crate) fn is_finished(&self) -> bool {
         self.join.state.lock().done
     }
+
+    /// What the task cancelled by [`JoinHandle::cancel`] hands back once its future is gone: its
+    /// output, where it finished before it was cancelled, and `None` otherwise; a wake of `cx`'s
+    /// waker once the future is gone, until then.
+    ///
+    /// An outcome settled before the cancellation may have had its output taken already, by a
+    /// poll of the handle that resolved: there is nothing left to hand back then but `None`, and
+    /// nothing to wait for.
+    fn poll_cancelled(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
+        // to run with a lock of this runtime's held.
+        let waker = cx.waker().clone();
+        let replaced = {
+            let mut state = self.join.state.lock();
+            if state.done {
+                let output = state.output.take();
+                drop(state);
+                // Clear of the lock: the error a task that did not finish leaves, which is
+                // handed on to nobody, is dropped here.
+                return Poll::Ready(output.and_then(Result::ok));
+            }
+
+            state.join_waker.replace(waker)
+        };
+        // Clear of the lock, for the same reason.
+        drop(replaced);
+
+        Poll::Pending
+    }
+
+    /// Stops the task: drops its future here where nobody is polling it, and has whoever is
+    /// polling it drop it once that poll returns otherwise. Wakes `join_waker`, which an earlier
+    /// poll of the handle registered, and tells the thread driving the runtime.
+    ///
+    /// A future whose destructor panics here hands the panic on to the caller, once the task is
+    /// closed off either way.
+    fn stop(&self, join_waker: Option<Waker>) {
+        let Some(core) = M::upgrade(&self.core) else {
+            // The runtime is on its way out, and its future with it.
+            if let Some(waker) = join_waker {
+                waker.wake();
+            }
+
+            return;
+        };
+        let removed = {
+            let mut tasks = core.scheduler.tasks.lock();
+            let running = match tasks.slots.get_mut(&self.id) {
+                // Whoever is polling the task drops the future once that poll returns.
+                Some(Slot::Running { cancelled }) => {
+                    *cancelled = true;
+
+                    true
+                }
+                Some(_) => false,
+                // Gone already: it ended since its outcome was looked at, and the thread that
+                // polled it last drops the future, or has dropped it.
+                None => true,
+            };
+
+            (!running).then(|| tasks.slots.remove(&self.id)).flatten()
+        };
+        // On the thread that let the handle go or cancelled the task, with no lock held: a
+        // destructor that panics here panics where that was done, and one that spawns is served
+        // as any other caller is.
+        let dropped = removed.map(|slot| catch_unwind(AssertUnwindSafe(move || drop(slot))));
+        if let Some(waker) = join_waker {
+            // Outside the lock: whoever registered it, polling this very handle earlier and
+            // getting `Pending`, may be polled to completion right here.
+            waker.wake();
+        }
+        // Even where nothing was queued: a thread waiting with this as its last task learns
+        // from it that it has nothing left to wait for, and a helper thread that it can retire.
+        core.remote.notify();
+        // Carried on from here, so that the panic is still the caller's to see while the task it
+        // belonged to is closed off either way: the notification above is what lets an idle
+        // helper retire, and somebody's destructor panicking is no reason to leave one up.
+        if let Some(Err(payload)) = dropped {
+            resume_unwind(payload);
+        }
+    }
+
+    /// Settles the outcome where the task has not settled it yet, and lets go of what it handed
+    /// over: the task then finds nobody to tell, and drops its output as it hands it over rather
+    /// than leave it with what the task and its handle share.
+    fn settle(&self) {
+        let (output, join_waker) = {
+            let mut state = self.join.state.lock();
+            state.done = true;
+
+            (state.output.take(), state.join_waker.take())
+        };
+        // Clear of the lock: an output's destructor is the task's code, and a waker's somebody
+        // else's.
+        drop(output);
+        drop(join_waker);
+    }
 }
 
 impl<T, M> Drop for JoinHandle<T, M>
@@ -496,6 +617,13 @@ where
 {
     fn drop(&mut self) {
         if self.detached {
+            return;
+        }
+        if self.cancelled {
+            // Cancelled already, by `cancel`, and nobody waits on the outcome any more: it is
+            // settled here, should the task not have settled it yet, as `detach` settles it.
+            self.settle();
+
             return;
         }
         // Marked done first, so that the guard in the wrapper finds nobody left to tell when the
@@ -519,48 +647,7 @@ where
 
             state.join_waker.take()
         };
-        let Some(core) = M::upgrade(&self.core) else {
-            // The runtime is on its way out, and its future with it.
-            if let Some(waker) = join_waker {
-                waker.wake();
-            }
-
-            return;
-        };
-        let removed = {
-            let mut tasks = core.scheduler.tasks.lock();
-            let running = match tasks.slots.get_mut(&self.id) {
-                // Whoever is polling the task drops the future once that poll returns.
-                Some(Slot::Running { cancelled }) => {
-                    *cancelled = true;
-
-                    true
-                }
-                Some(_) => false,
-                // Gone already: it finished while the handle was marked done above.
-                None => true,
-            };
-
-            (!running).then(|| tasks.slots.remove(&self.id)).flatten()
-        };
-        // On the thread that let the handle go, with no lock held: a destructor that panics
-        // here panics where the handle was dropped, and one that spawns is served as any other
-        // caller is.
-        let dropped = removed.map(|slot| catch_unwind(AssertUnwindSafe(move || drop(slot))));
-        if let Some(waker) = join_waker {
-            // Outside the lock: whoever registered it, polling this very handle earlier and
-            // getting `Pending`, may be polled to completion right here.
-            waker.wake();
-        }
-        // Even where nothing was queued: a thread waiting with this as its last task learns
-        // from it that it has nothing left to wait for, and a helper thread that it can retire.
-        core.remote.notify();
-        // Carried on from here, so that the panic is still the caller's to see while the task it
-        // belonged to is closed off either way: the notification above is what lets an idle
-        // helper retire, and somebody's destructor panicking is no reason to leave one up.
-        if let Some(Err(payload)) = dropped {
-            resume_unwind(payload);
-        }
+        self.stop(join_waker);
     }
 }
 
@@ -625,7 +712,9 @@ struct JoinState<T> {
     /// The task's output, until the handle that joins it takes it.
     output: Option<io::Result<T>>,
     /// Whether the task's outcome is settled: an output handed over, or the handle gone and so
-    /// nobody left to hand one to.
+    /// nobody left to hand one to. A handle that cancels the task and stays leaves it for the task
+    /// to settle, which the task does once its future is gone, so that the handle learns when
+    /// that is.
     done: bool,
     /// Registered by a poll of the [`JoinHandle`] that found no output waiting yet.
     join_waker: Option<Waker>,
@@ -634,8 +723,11 @@ struct JoinState<T> {
 /// Hands the outcome of a task over to its handle: the one it is given, or, where it is dropped
 /// with none given, the error of a task whose runtime went away with it.
 ///
-/// Dropped unfinished, a task's wrapper is either cancelled, and its handle gone and marked done
-/// already, or dropped with the runtime it was on, which is what the error says.
+/// Dropped unfinished, a task's wrapper is cancelled, or dropped with the runtime it was on. A
+/// handle that went as it cancelled the task marked the outcome settled already, and there is
+/// nobody to tell. One that cancelled the task and stayed is waiting to hear that the future is
+/// gone, which the error tells it, though it hands that error on to nobody. Otherwise the runtime
+/// went, which is what the error says.
 struct CompleteOnDrop<M, T>(M::Ptr<Join<M, T>>)
 where
     M: Mode;
@@ -779,8 +871,8 @@ where
     Idle { future: M::BoxFuture, waker: Waker },
     /// Out of its slot, being polled.
     Running {
-        /// Whether the handle was dropped while the task was being polled, so the future is to
-        /// be dropped once that poll returns.
+        /// Whether the handle was dropped, or cancelled the task, while the task was being
+        /// polled, so the future is to be dropped once that poll returns.
         cancelled: bool,
     },
 }

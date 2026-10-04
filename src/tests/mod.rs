@@ -160,6 +160,35 @@ struct LocalRuntimeStaysOnItsThread;
 #[cfg(all(doctest, feature = "runtime"))]
 struct LocalHandlesStayOnTheirThread;
 
+/// The wait for a cancelled task stays on the thread of a local runtime, as the task did...
+///
+/// ```compile_fail
+/// fn sent<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// let runtime = zruntime::LocalRuntime::new().unwrap();
+/// sent(runtime.spawn("a task to cancel", async {}).cancel());
+/// ```
+///
+/// ...while the wait for one on a shared runtime may go anywhere, which says the check above fails
+/// for the reason it was written for and no other.
+///
+/// ```
+/// fn sent<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// let runtime = zruntime::SharedRuntime::new().unwrap();
+/// sent(runtime.spawn("a task to cancel", async {}).cancel());
+/// ```
+#[cfg(all(doctest, feature = "runtime"))]
+struct TheWaitForALocalTaskStaysOnItsThread;
+
 /// A shared runtime's tasks may be polled on any thread, so it turns a future away that could not
 /// follow it there...
 ///

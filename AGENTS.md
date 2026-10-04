@@ -221,6 +221,10 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
+`Task::cancel` cancels it and hands back a future that resolves once the task's future is gone:
+to its output, where the task had finished first. A cancelling handle stops the task as a drop
+does, but leaves the outcome for the guard in the task's wrapper to settle, which it does only
+once the future has been dropped.
 
 **Sockets (the `net` features)**: every socket is an `Io<T, M>`: the std socket, non-blocking, in
 the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
