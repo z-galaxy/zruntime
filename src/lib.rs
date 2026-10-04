@@ -39,6 +39,8 @@ mod reactor;
 mod runtime;
 #[cfg(feature = "runtime")]
 mod scheduler;
+#[cfg(feature = "runtime")]
+mod time;
 #[cfg(feature = "unblock")]
 mod unblock;
 
@@ -69,6 +71,8 @@ pub use reactor::Registration;
 use runtime::Core;
 #[cfg(feature = "runtime")]
 use scheduler::JoinHandle;
+#[cfg(feature = "runtime")]
+pub use time::Sleep;
 #[cfg(feature = "unblock")]
 pub use unblock::{BlockingWork, Unblock, unblock};
 
@@ -504,44 +508,6 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.poll_join(cx)
-    }
-}
-
-/// A timer on a [`Runtime`], which keeps a thread on it for as long as it has a deadline.
-///
-/// The reactor takes a timer's deadline on the first poll of it rather than where it is made, and
-/// the thread that is to fire it has to be there from that poll onwards, however long ago the
-/// timer was asked for. So it is the poll that asks for one — a helper thread, on a runtime from
-/// `SharedRuntime::current` that nobody is inside `block_on` on — and a timer nobody ever polls
-/// costs nothing at all. A timer holds its runtime, so a task holding one keeps that runtime
-/// alive: nothing here takes a runtime down while it has work.
-#[cfg(feature = "runtime")]
-pub struct Sleep<M = Local>(reactor::Sleep<M>)
-where
-    M: Mode;
-
-#[cfg(feature = "runtime")]
-impl<M> Future for Sleep<M>
-where
-    M: Mode,
-{
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if Pin::new(&mut this.0).poll(cx).is_ready() {
-            return Poll::Ready(());
-        }
-        // A timer that never comes due leaves no deadline behind and needs no thread: one
-        // started for it would find nothing to wait on and retire in the round it started.
-        if this.0.never_fires() {
-            return Poll::Pending;
-        }
-        // Asked for once the deadline is in the reactor's map, so that a helper starting here
-        // waits on it.
-        M::ensure_progress(this.0.core());
-
-        Poll::Pending
     }
 }
 

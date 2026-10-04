@@ -176,6 +176,7 @@ src/
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
+├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep
 ├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
@@ -259,6 +260,7 @@ it. No socket is `Clone`.
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
 - `src/reactor.rs`: I/O readiness and timers
 - `src/scheduler.rs`: Task storage and polling
+- `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
