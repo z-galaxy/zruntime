@@ -225,6 +225,13 @@ I/O still make progress. The helper parks as soon as a `block_on` arrives to tak
 and puts itself down once it finds nothing left to run, watch or time. A `Runtime::new()` runtime
 never has a seat or a helper: it runs only while some thread is inside `block_on` on it.
 
+**Parallelism through several runtimes**: a runtime's scheduler and reactor are only ever run by
+one thread at a time, so all of its tasks share one core, and that stays so: several threads
+taking tasks from one runtime's scheduler, as smol's `Executor::run` does, was decided against.
+Work that needs more cores runs on several runtimes, one per thread, spread over them through an
+`mpmc` channel whose receiver each thread holds a clone of. The README's "Running on several
+threads" section and the `mpmc` module's "Spreading work over threads" example document this.
+
 **I/O integration**: `Runtime::register` erases the source into the mode's `SourcePtr` (`Rc<dyn
 AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and returns a
 `Registration` whose `poll_io` drives an arbitrary operation against
