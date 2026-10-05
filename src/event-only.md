@@ -13,8 +13,9 @@ it last, and an event may be notified from any thread.
 
 * `event`, on in this build: [`Event`] and [`EventListener`].
 * `runtime`, off in this build: the runtime itself, `Runtime`, `LocalRuntime` and `SharedRuntime`,
-  with the tasks, timers and I/O registrations built on them, the `rustix` and `windows-sys`
-  crates it polls with, and the `futures-core` crate.
+  with the tasks, timers and I/O registrations built on them, and `Async`, the async handle of any
+  source they can watch, the `rustix` and `windows-sys` crates it polls with, and the
+  `futures-core` and `futures-io` crates.
 * `tracing`: the runtime logs through the `tracing` crate. Without the runtime, it has nothing to
   log.
 * `helper`: per-thread shared runtimes, and the helper thread that keeps their work moving in

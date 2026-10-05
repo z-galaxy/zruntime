@@ -20,14 +20,16 @@ is a standalone crate with no dependency on any particular application; it was e
 zbus's built-in runtime, which now depends on it.
 
 Two default cargo features, each usable without the other, split the crate. `runtime` is the
-runtime above — `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations —
-and is what needs `rustix` on unix and `windows-sys` on Windows, and `futures-core` everywhere, for
-the `Stream` impl of its interval timer. `event` is `Event` and `EventListener`, a notification
-that tasks wait for, which needs no runtime and works under any executor. A crate that only
-notifies builds zruntime with `default-features = false, features = ["event"]` and gets none of
-the runtime (zbus, whatever runtime it runs on, adds `broadcast` and `lock` to that); one that
-only runs tasks leaves `event` out. `helper` implies `runtime`, and `tracing`, also a default
-feature, makes the runtime log through the `tracing` crate.
+runtime above — `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers, I/O registrations
+and `Async`, the async handle of any source the reactor can watch — and is what needs `rustix`
+on unix and `windows-sys` on Windows, and `futures-core` and `futures-io` everywhere, for the
+`Stream` impl of its interval timer and the `AsyncRead` and `AsyncWrite` impls of `Async`.
+`event` is `Event` and `EventListener`, a notification that tasks wait for, which needs
+no runtime and works under any executor. A crate that only notifies builds zruntime with
+`default-features = false, features = ["event"]` and gets none of the runtime (zbus, whatever
+runtime it runs on, adds `broadcast` and `lock` to that); one that only runs tasks leaves `event`
+out. `helper` implies `runtime`, and `tracing`, also a default feature, makes the runtime log
+through the `tracing` crate.
 
 A non-default `broadcast` feature, which implies `event` and adds a `futures-core` dependency,
 gives `zruntime::broadcast`: an async multi-producer multi-consumer broadcast channel, moved here
@@ -164,10 +166,12 @@ threads. A target holds benchmarks of one kind only, and a new one goes in the l
 
 ```
 src/
-├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Interest,
-│                 # Task, Sleep, Timeout, TimedOut, Interval, MissedTickBehavior, and the free
-│                 # spawn and spawn_local (runtime feature), Event, EventListener (event
-│                 # feature), and the free block_on (helper feature)
+├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Readiness,
+│                 # Interest, Async, Source, Task, Sleep, Timeout, TimedOut, Interval,
+│                 # MissedTickBehavior, and the free spawn and spawn_local (runtime feature),
+│                 # Event, EventListener (event feature), and the free block_on (helper feature)
+├── async_io.rs   # [runtime feature] Async<T, M>: the async handle of any source the reactor
+│                 # can watch
 ├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
 │                 # any executor, with no use of the runtime
 ├── event-only.md # The crate's documentation in a build with `event` but not `runtime`, whose
@@ -236,10 +240,29 @@ threads" section and the `mpmc` module's "Spreading work over threads" example d
 AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and returns a
 `Registration` whose `poll_io` drives an arbitrary operation against
 `Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`, and whose `ready` hands out a
-`Readiness` future that waits for readiness alone. Each direction of a source keeps one waker for
+`Readiness` future that waits for readiness alone. The source's descriptor is read once, at
+registration, and kept beside it in the map: a wait watches that and calls no `as_fd` or
+`as_socket`, so it runs no code of a source's while it holds the clones of the sources. Each direction of a source keeps one waker for
 `poll_io`, which the next operation to wait takes the place of, and a map of `Readiness` waits
 under ids of their own, any number of which may wait at once: readiness wakes them all and takes
 them out of the map, which is how a `Readiness` tells readiness from a poll anything else caused.
+
+**`Async`, the handle of a source**: `Async<T, M>` is a `Registration` and the mode's `Ptr<T>`
+(`Rc`/`Arc`) of the source, of which the reactor holds a clone through the sealed
+`IntoSource::source_ptr`; its I/O runs on the `Ptr<T>`. The constructors are written once, generic
+over `M`, with `T: Source<M>`: a sealed public bound, whose per-flavour blanket impls go through
+the private supertrait `IntoSource<M>` (`AsFd`/`AsSocket` and `'static`, and `Send + Sync` for
+`Shared`). A `new` in an `impl` of each flavour instead would make `Async::new` ambiguous (E0034),
+as the compiler looks the item up before it has chosen the flavour. No `&mut T` is handed out, the
+reactor sharing the pointer, so the I/O traits are there only where `&T` implements
+`Read`/`Write`, for `Async` and `&Async` both. `readable`, `writable`, `read_with` and `write_with`
+wait through `Readiness`, any number of tasks at once; `poll_read_with`, `poll_write_with` and the
+traits keep one waiting task per direction, through `poll_io`. `into_inner` ends the watch and
+takes the source out of the pointer: on `Local` nothing else holds it by then, and on `Shared` it
+yields until a wait under way on another thread lets go of its clone. A wait lets go of its clones
+of registered sources under the map's lock, before the others, whose drop may be the last and run
+a destructor (`Reactor::release`): a destructor that takes another source back on the driving
+thread would otherwise yield for good on a clone that thread holds.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
@@ -301,6 +324,8 @@ it. No socket is `Clone`.
 - `src/runtime.rs`: `Core<M>`, the scheduler + reactor + driving state `Runtime<M>` owns
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
 - `src/reactor.rs`: I/O readiness and timers
+- `src/async_io.rs`: `Async<T, M>`, the async handle of any source the reactor can watch, built on
+  a `Registration` and the `Ptr<T>` of the source it shares with the reactor
 - `src/scheduler.rs`: Task storage and polling
 - `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an

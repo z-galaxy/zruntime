@@ -3,24 +3,28 @@
 //! filesystem access built on it, and of the sockets a runtime watches.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
-//! the `core` module, in both flavours wherever the test means the same in each. An event and its
-//! listeners, which need no runtime, are tested in the `event` module. What the type system is to
-//! rule out — a local runtime's handles leaving their thread, a shared runtime taking a future
-//! that could not follow it to another, a lock or a channel handing its value or its messages to a
-//! thread that could not own them, the future of blocking work doing the same with the value it
-//! resolves to, and an adapter of a blocking handle with its handle — can only be shown by code
-//! that does not compile, so it is shown here, by the doc tests of the items below. The broadcast
-//! channel, the MPMC channel and the locks, built on the event, are tested in the `broadcast`,
-//! `mpmc` and `lock` modules. Blocking work, which needs neither the runtime nor the event, is
-//! tested in the `unblock` module, and the filesystem access of the `fs` module, built on it, in
-//! the `fs` module. The sockets of the `net` module are tested in the `net` module, one family of
-//! them to a module there, in both flavours wherever the test means the same in each.
+//! the `core` module, in both flavours wherever the test means the same in each. `Async`, the
+//! async handle of any source a runtime watches, is tested in the `async_io` module, in both
+//! flavours wherever the test means the same in each. An event and its listeners, which need no
+//! runtime, are tested in the `event` module. What the type system is to rule out — a local
+//! runtime's handles leaving their thread, a shared runtime taking a future or a source that could
+//! not follow it to another, a lock or a channel handing its value or its messages to a thread
+//! that could not own them, the future of blocking work doing the same with the value it resolves
+//! to, and an adapter of a blocking handle with its handle — can only be shown by code that does
+//! not compile, so it is shown here, by the doc tests of the items below. The broadcast channel,
+//! the MPMC channel and the locks, built on the event, are tested in the `broadcast`, `mpmc` and
+//! `lock` modules. Blocking work, which needs neither the runtime nor the event, is tested in the
+//! `unblock` module, and the filesystem access of the `fs` module, built on it, in the `fs`
+//! module. The sockets of the `net` module are tested in the `net` module, one family of them to a
+//! module there, in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
 //! where both are. The broadcast channel, the MPMC channel and the locks are features of their own
 //! as well, each built on the event and with no use of the runtime.
 
+#[cfg(all(test, feature = "runtime"))]
+mod async_io;
 #[cfg(all(test, feature = "broadcast"))]
 mod broadcast;
 #[cfg(all(test, feature = "runtime"))]
@@ -160,6 +164,67 @@ struct LocalRuntimeStaysOnItsThread;
 #[cfg(all(doctest, feature = "runtime"))]
 struct LocalHandlesStayOnTheirThread;
 
+/// An async handle on a source stays on the thread of a local runtime as well, and so does the
+/// wait for readiness it hands out: neither is `Send`...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Async<std::net::TcpStream, zruntime::Local>>();
+/// ```
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::Readiness<'static, zruntime::Local>>();
+/// ```
+///
+/// ...and neither is `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::Async<std::net::TcpStream, zruntime::Local>>();
+/// ```
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::Readiness<'static, zruntime::Local>>();
+/// ```
+///
+/// ...while the same two built on a shared runtime are both, which is what says the four checks
+/// above fail for the reason they were written for and no other.
+///
+/// ```
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// sent_and_shared::<zruntime::Async<std::net::TcpStream, zruntime::Shared>>();
+/// sent_and_shared::<zruntime::Readiness<'static, zruntime::Shared>>();
+/// ```
+#[cfg(all(doctest, feature = "runtime"))]
+struct AnAsyncHandleOnALocalRuntimeStaysOnItsThread;
+
 /// The wait for a cancelled task stays on the thread of a local runtime, as the task did...
 ///
 /// ```compile_fail
@@ -239,6 +304,80 @@ struct TheWaitForALocalTaskStaysOnItsThread;
 /// ```
 #[cfg(all(doctest, feature = "runtime"))]
 struct SharedRuntimeTakesSendFuturesOnly;
+
+/// A shared runtime's reactor is waited on by whichever thread drives the runtime, which then
+/// reaches every source it watches, so it watches only a source that may be reached from any
+/// thread. `Async::new` turns away one that is `Send` but not `Sync`, such as a socket beside a
+/// `Cell`...
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// use zruntime::{Async, Shared, SharedRuntime};
+///
+/// # #[cfg(unix)]
+/// # type Socket = std::os::fd::OwnedFd;
+/// # #[cfg(windows)]
+/// # type Socket = std::os::windows::io::OwnedSocket;
+/// struct NotSync {
+///     socket: Socket,
+///     cell: Cell<u8>,
+/// }
+///
+/// # #[cfg(unix)]
+/// impl std::os::fd::AsFd for NotSync {
+///     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+///         std::os::fd::AsFd::as_fd(&self.socket)
+///     }
+/// }
+/// # #[cfg(windows)]
+/// impl std::os::windows::io::AsSocket for NotSync {
+///     fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+///         std::os::windows::io::AsSocket::as_socket(&self.socket)
+///     }
+/// }
+///
+/// fn watch(runtime: &SharedRuntime, source: NotSync) -> std::io::Result<Async<NotSync, Shared>> {
+///     Async::new(runtime, source)
+/// }
+/// ```
+///
+/// ...which a local runtime takes as it is, and which says the check above fails for the reason it
+/// was written for and no other.
+///
+/// ```
+/// use std::cell::Cell;
+///
+/// use zruntime::{Async, Local, LocalRuntime};
+///
+/// # #[cfg(unix)]
+/// # type Socket = std::os::fd::OwnedFd;
+/// # #[cfg(windows)]
+/// # type Socket = std::os::windows::io::OwnedSocket;
+/// struct NotSync {
+///     socket: Socket,
+///     cell: Cell<u8>,
+/// }
+///
+/// # #[cfg(unix)]
+/// impl std::os::fd::AsFd for NotSync {
+///     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+///         std::os::fd::AsFd::as_fd(&self.socket)
+///     }
+/// }
+/// # #[cfg(windows)]
+/// impl std::os::windows::io::AsSocket for NotSync {
+///     fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+///         std::os::windows::io::AsSocket::as_socket(&self.socket)
+///     }
+/// }
+///
+/// fn watch(runtime: &LocalRuntime, source: NotSync) -> std::io::Result<Async<NotSync, Local>> {
+///     Async::new(runtime, source)
+/// }
+/// ```
+#[cfg(all(doctest, feature = "runtime"))]
+struct ASharedRuntimeWatchesOnlySourcesThatMayBeSharedBetweenThreads;
 
 /// A lock hands its value to whichever thread holds a guard, so a lock may go to another thread, or
 /// be shared with one, only where its value may: a mutex of an `Rc`, which cannot be sent, is not

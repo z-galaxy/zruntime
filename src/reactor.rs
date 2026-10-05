@@ -15,9 +15,10 @@
 //! Two locks guard the sources and the timers, and neither is taken while the other is held. A
 //! source's wakers live in its entry in the map, under the map's lock. Neither lock is held
 //! across the wait, which may last until a deadline, nor across a wake or the drop of a waker or
-//! a source, each of which runs somebody else's code and may come straight back here to register
-//! a source, to ask for a timer or to let either go. The flag that spares a `notify` its write
-//! while a wake-up is on its way needs no lock: it is an atomic of the runtime's remote.
+//! of the last clone of a source, each of which runs somebody else's code and may come straight
+//! back here to register a source, to ask for a timer or to let either go. The flag that spares a
+//! `notify` its write while a wake-up is on its way needs no lock: it is an atomic of the runtime's
+//! remote.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -33,7 +34,7 @@ use std::{
 use crate::{
     Interest, Local, Mode,
     mode::sealed::Lock,
-    poll::Want,
+    poll::{RawSource, Want},
     runtime::{Core, Remote},
 };
 
@@ -79,6 +80,7 @@ where
             .filter_map(|(&key, state)| {
                 let want = Want {
                     key,
+                    descriptor: state.descriptor,
                     readable: state.wakers.readable.any(),
                     writable: state.wakers.writable.any(),
                 };
@@ -99,7 +101,14 @@ where
             (bound, None) | (None, bound) => bound,
         };
 
-        let ready = self.remote.poller.wait(&wants, M::as_source, timeout)?;
+        let ready = match self.remote.poller.wait(&wants, timeout) {
+            Ok(ready) => ready,
+            Err(e) => {
+                self.release(wants);
+
+                return Err(e);
+            }
+        };
         // The wait takes whatever wake-up it finds out of the channel, so the flag comes down
         // here and the next caller writes again. One that came between the two is turned away
         // without a write, and loses nothing by it: what it had to say — a task queued, a source
@@ -107,12 +116,10 @@ where
         // ones the driving thread makes look at all three afresh. The other way about, a wake-up
         // left in the channel by a wait that ended some other way only ends the next one at once.
         self.remote.wake_pending.store(false, Ordering::Release);
-        // Clear of every lock: the last clone of a source let go of during the wait closes it,
-        // which runs the destructor of whatever was registered.
-        drop(wants);
 
-        let woken = {
+        let (woken, unregistered) = {
             let mut sources = self.sources.lock();
+            let unregistered = unregistered(&sources, wants);
             let mut woken = Vec::new();
             for event in &ready {
                 // A source let go of while the wait ran has nobody left to wake.
@@ -127,8 +134,10 @@ where
                 }
             }
 
-            woken
+            (woken, unregistered)
         };
+        // Clear of every lock, and of every clone of a source still registered: see `release`.
+        drop(unregistered);
         for waker in woken {
             waker.wake();
         }
@@ -146,6 +155,24 @@ where
         }
 
         Ok(())
+    }
+
+    /// Lets go of the clones of the sources a wait was made with.
+    ///
+    /// A clone of a source that is still registered is not the last of its source: the map holds
+    /// another, which only goes under the map's lock, so those clones go under it, where letting
+    /// go of one runs no code but the count's. The rest may each be the last, of a source whose
+    /// registration went while the wait ran, and the drop of the last clone closes the source,
+    /// which runs the destructor of whatever was registered: those go clear of every lock, and
+    /// once no clone of a registered source is left here. A destructor that takes a source of
+    /// this runtime back, through `Async::into_inner`, waits until nothing else holds that source,
+    /// which would be for good if this thread still held a clone of it.
+    ///
+    /// A wait that succeeds does the same, under the lock it takes to wake the waiters of what it
+    /// found ready.
+    fn release(&self, wants: Vec<(M::SourcePtr, Want)>) {
+        let unregistered = unregistered(&self.sources.lock(), wants);
+        drop(unregistered);
     }
 
     /// Wakes every stored waker, sources and timers alike; what a failed wait falls back on, so
@@ -180,6 +207,12 @@ pub(crate) fn register<M>(
 where
     M: Mode,
 {
+    // Read here, once, and never again: a wait watches the descriptor the source lends now, so
+    // that it runs no code of the source's. Clear of the lock, as that is somebody else's code.
+    #[cfg(unix)]
+    let descriptor = std::os::fd::AsRawFd::as_raw_fd(&M::as_source(&source));
+    #[cfg(windows)]
+    let descriptor = std::os::windows::io::AsRawSocket::as_raw_socket(&M::as_source(&source));
     let key = {
         let mut sources = core.reactor.sources.lock();
         // One `select` takes a fixed number of sockets, one place of which is spoken for by the
@@ -197,6 +230,7 @@ where
             key,
             SourceState {
                 source,
+                descriptor,
                 wakers: Wakers::default(),
             },
         );
@@ -633,6 +667,21 @@ where
     }
 }
 
+/// The clones in `wants` of the sources `sources` no longer holds, having let go of the others:
+/// what [`Reactor::release`] keeps to let go of clear of the map's lock, which the caller holds.
+fn unregistered<M>(
+    sources: &Sources<M>,
+    wants: Vec<(M::SourcePtr, Want)>,
+) -> Vec<(M::SourcePtr, Want)>
+where
+    M: Mode,
+{
+    wants
+        .into_iter()
+        .filter(|(_, want)| !sources.states.contains_key(&want.key))
+        .collect()
+}
+
 /// The sources the reactor watches, under the keys it reports them by.
 struct Sources<M>
 where
@@ -650,6 +699,8 @@ where
     M: Mode,
 {
     source: M::SourcePtr,
+    /// The descriptor the source lent when it was registered, which is what a wait watches.
+    descriptor: RawSource,
     wakers: Wakers,
 }
 
