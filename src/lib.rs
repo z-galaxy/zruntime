@@ -69,7 +69,7 @@ use mode::sealed::Sealed as _;
 #[cfg(feature = "runtime")]
 pub use mode::{Local, Mode, Shared};
 #[cfg(feature = "runtime")]
-pub use reactor::Registration;
+pub use reactor::{Readiness, Registration};
 #[cfg(feature = "runtime")]
 use runtime::Core;
 #[cfg(feature = "runtime")]

@@ -235,7 +235,11 @@ threads" section and the `mpmc` module's "Spreading work over threads" example d
 **I/O integration**: `Runtime::register` erases the source into the mode's `SourcePtr` (`Rc<dyn
 AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and returns a
 `Registration` whose `poll_io` drives an arbitrary operation against
-`Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`.
+`Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`, and whose `ready` hands out a
+`Readiness` future that waits for readiness alone. Each direction of a source keeps one waker for
+`poll_io`, which the next operation to wait takes the place of, and a map of `Readiness` waits
+under ids of their own, any number of which may wait at once: readiness wakes them all and takes
+them out of the map, which is how a `Readiness` tells readiness from a poll anything else caused.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
