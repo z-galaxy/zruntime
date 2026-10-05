@@ -189,7 +189,7 @@ src/
 │                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime
 └── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
                   # broadcast.rs: the broadcast channel, broadcast feature; mpmc.rs: the MPMC
-                  # channel, mpmc feature; lock.rs: the locks, lock feature; helper.rs: helper
+                  # channel, mpmc feature; lock/: the locks, lock feature; helper.rs: helper
                   # feature; unblock/: unblock, its pool and Unblock, unblock feature; fs.rs: fs,
                   # fs feature; net/: the sockets, each family under its own feature
 ```
