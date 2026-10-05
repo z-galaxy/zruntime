@@ -1,5 +1,8 @@
-//! Async locks whose guards a future can hold across an await: [`Mutex`], [`RwLock`] and
-//! [`Semaphore`].
+//! Async synchronization whose waits suspend the task rather than block the thread: the locks
+//! [`Mutex`], [`RwLock`] and [`Semaphore`], and a [`Barrier`].
+//!
+//! The locks hand out guards that a future can hold across an await, and the [`Barrier`] makes a
+//! number of tasks wait for each other.
 //!
 //! Tasks that share state often have to keep hold of it while they wait for something else: a task
 //! that writes a message to a shared socket holds the socket until all of the message is out,
@@ -16,12 +19,13 @@
 //! connection or have a request in flight. It keeps no value, and its guards stand for the permits
 //! it hands out.
 //!
-//! The locks are built on [`Event`](crate::Event) and need no runtime. They work under any
-//! executor, and from any thread, inside a task or outside of one: a thread with no task to run can
-//! wait for a lock with the `block_on` of any executor. A future that waits for a lock, or that
-//! holds a guard across an await, may move between threads as long as the lock may be shared
-//! between them, which takes a value that is `Send` for a [`Mutex`], and `Send` and `Sync` for an
-//! [`RwLock`]. A [`Semaphore`], which keeps no value, may always be shared.
+//! The locks and the barrier are built on [`Event`](crate::Event) and need no runtime. They work
+//! under any executor, and from any thread, inside a task or outside of one: a thread with no task
+//! to run can wait for a lock with the `block_on` of any executor. A future that waits for a lock,
+//! or that holds a guard across an await, may move between threads as long as the lock may be
+//! shared between them, which takes a value that is `Send` for a [`Mutex`], and `Send` and `Sync`
+//! for an [`RwLock`]. A [`Semaphore`], which keeps no value, may always be shared. A [`Barrier`]
+//! holds no value either, so the future that waits at one may always move between threads.
 //!
 //! Each lock hands out guards of two kinds. [`Mutex::lock`], [`RwLock::read`] and [`RwLock::write`]
 //! hand out a guard that borrows the lock, which suits a guard held within one scope or one async
@@ -65,7 +69,9 @@
 //! A panic while a guard is held does not poison the lock. The guard is dropped as the panic
 //! unwinds, or with the future that holds it, which releases the lock, and the next task to take it
 //! finds the value as the panicking code left it, which can be half-way through an update. A
-//! [`Semaphore`] keeps no value: a guard dropped as a panic unwinds just gives its permit back.
+//! [`Semaphore`] keeps no value: a guard dropped as a panic unwinds just gives its permit back. A
+//! [`Barrier`] has no guard, and a task that panics instead of arriving at one leaves the others
+//! waiting for it, as it does with [`std::sync::Barrier`].
 //!
 //! # Fairness
 //!
@@ -118,7 +124,14 @@
 //! given up, the lock is not taken, and no other task waiting for it is left stranded. The same
 //! goes for the futures of [`Mutex::lock_arc`], [`RwLock::read_arc`] and [`RwLock::write_arc`], and
 //! for those of [`Semaphore::acquire`] and [`Semaphore::acquire_arc`], which take no permit.
+//!
+//! Dropping the future that [`Barrier::wait`] returned, after its first poll and before it
+//! completes, takes the task's arrival back, unless the round it arrived in has been completed by
+//! then: the barrier again needs the arrival to release the tasks that wait at it, and nobody is
+//! released early. A round that was completed before the drop does not count the dropped task
+//! towards the next one.
 
+mod barrier;
 mod mutex;
 mod rwlock;
 mod semaphore;
@@ -126,6 +139,7 @@ mod semaphore;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::time::{Duration, Instant};
 
+pub use barrier::{Barrier, BarrierWaitResult};
 pub use mutex::{Mutex, MutexGuard, MutexGuardArc};
 pub use rwlock::{
     RwLock, RwLockReadGuard, RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc,

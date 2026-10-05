@@ -44,7 +44,7 @@ are built on `Event`, need no runtime and work under any executor. Each hands ou
 borrow it and, through `lock_arc`, `read_arc` and `write_arc` on an `Arc` of it, guards that hold a
 clone of that `Arc` instead, to be kept in a struct or moved into a spawned task. The module also
 gives a `Semaphore`, a lock that up to a set number of tasks may hold at once, built the same way,
-with `acquire` and `acquire_arc`.
+with `acquire` and `acquire_arc`, and a `Barrier` that tasks wait at for each other.
 
 A non-default `unblock` feature, which adds `futures-io` and `futures-core` dependencies, gives
 `zruntime::unblock`: a piece of blocking work run on a pool of threads kept for it, out of the way
@@ -177,8 +177,8 @@ src/
 │                 # message to one receiver, built on Event, with no use of the runtime
 ├── fs/           # [fs feature] Async filesystem access, built on unblock and Unblock, with no
 │                 # use of the runtime
-├── lock/         # [lock feature] Mutex, RwLock and Semaphore, built on Event, with no use of
-│                 # the runtime
+├── lock/         # [lock feature] Mutex, RwLock, Semaphore and Barrier, built on Event, with no
+│                 # use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
 ├── net/          # [tcp, udp, unix features] Async sockets: io.rs, `Io<T, M>`, a socket and its
@@ -294,7 +294,8 @@ it. No socket is `Clone`.
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
 - `src/lock/`: [lock feature] `Mutex`, `RwLock` and `Semaphore`, the async locks built on `Event`,
-  with guards that borrow the lock and guards that hold an `Arc` of it
+  with guards that borrow the lock and guards that hold an `Arc` of it, and `Barrier`, built on
+  `Event` too
 - `src/unblock/`: [unblock feature] `unblock`, blocking work on a pool of threads (`pool.rs`), and
   `Unblock`, the async adapter of a blocking I/O handle built on it (`io.rs`)
 - `src/fs/`: [fs feature] Async filesystem access: the free functions (`mod.rs`), `File` on

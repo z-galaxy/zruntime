@@ -498,14 +498,17 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// fail for the reason they were written for and no other. A value that is `Sync` without being
 /// `Send`, as a `std::sync::MutexGuard` is, tells a guard that is `Sync` where `T` is `Sync` apart
 /// from one that would ask for `T` to be `Send` as well. A semaphore keeps no value, so it and its
-/// guards are `Send` and `Sync`, and so are the futures that wait for a permit.
+/// guards are `Send` and `Sync`, and so are the futures that wait for a permit. A barrier holds no
+/// value either, so there is nothing for it to ask of one: it and the result of waiting at it are
+/// `Send` and `Sync`, and so is the future that waits at it.
 ///
 /// ```
 /// use std::{cell::Cell, sync::Arc};
 ///
 /// use zruntime::lock::{
-///     Mutex, MutexGuard, MutexGuardArc, RwLock, RwLockReadGuard, RwLockReadGuardArc,
-///     RwLockWriteGuard, RwLockWriteGuardArc, Semaphore, SemaphoreGuard, SemaphoreGuardArc,
+///     Barrier, BarrierWaitResult, Mutex, MutexGuard, MutexGuardArc, RwLock, RwLockReadGuard,
+///     RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc, Semaphore, SemaphoreGuard,
+///     SemaphoreGuardArc,
 /// };
 ///
 /// fn sent<T>()
@@ -555,6 +558,8 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// sent_and_shared::<Semaphore>();
 /// sent_and_shared::<SemaphoreGuard<'static>>();
 /// sent_and_shared::<SemaphoreGuardArc>();
+/// sent_and_shared::<Barrier>();
+/// sent_and_shared::<BarrierWaitResult>();
 ///
 /// let mutex = Arc::new(Mutex::new(Cell::new(0u8)));
 /// let rwlock = Arc::new(RwLock::new(0u8));
@@ -568,6 +573,9 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// let semaphore = Arc::new(Semaphore::new(1));
 /// sent_future(semaphore.acquire());
 /// sent_future(semaphore.acquire_arc());
+///
+/// let barrier = Barrier::new(2);
+/// sent_future(barrier.wait());
 /// ```
 #[cfg(all(doctest, feature = "lock"))]
 struct LocksAreAsSendAndSyncAsTheirValues;

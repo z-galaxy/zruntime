@@ -76,11 +76,11 @@
 //! memory access before it to be done, where a `SeqCst` write and look are a plain `stlr` and
 //! `ldar`.
 //!
-//! * The broadcast channel, the MPMC channel and the readers-writer lock check and change what
-//!   their waiters wait for under a lock of their own, which orders the two by itself. If the
-//!   notifier's turn with that lock comes first, the check sees the change. If the waiter's turn
-//!   does, its `listen` came before that turn, which came before the notifier's, which came before
-//!   the look, so the look finds the word `listen` wrote or a later one.
+//! * The broadcast channel, the MPMC channel, the readers-writer lock and the barrier check and
+//!   change what their waiters wait for under a lock of their own, which orders the two by itself.
+//!   If the notifier's turn with that lock comes first, the check sees the change. If the waiter's
+//!   turn does, its `listen` came before that turn, which came before the notifier's, which came
+//!   before the look, so the look finds the word `listen` wrote or a later one.
 //! * `lock::Mutex` checks and changes its flag with `SeqCst` operations: a compare-exchange whose
 //!   failure is `SeqCst`, or a `SeqCst` `fetch_or`, to take it, and a `SeqCst` `fetch_sub` to
 //!   release it, or to stop counting a waiter that held newcomers back from it. All `SeqCst`
