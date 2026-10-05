@@ -1,5 +1,5 @@
-//! Runs zruntime's locks on `wasm32-unknown-unknown`, where the standard library has no clock
-//! and `Instant::now` panics, which traps the module.
+//! Runs zruntime's locks, its semaphore among them, on `wasm32-unknown-unknown`, where the
+//! standard library has no clock and `Instant::now` panics, which traps the module.
 //!
 //! Each exported function drives the futures of a lock by hand, with a waker that goes nowhere,
 //! through the paths that start a wait, and returns 0 where every step went as expected, or the
@@ -11,7 +11,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use zruntime::lock::{Mutex, RwLock};
+use zruntime::lock::{Mutex, RwLock, Semaphore};
 
 /// A `lock` that has to wait for a mutex waits, and gets it once the holder lets go.
 #[unsafe(no_mangle)]
@@ -58,6 +58,23 @@ pub extern "C" fn contended_write() -> u32 {
     }
     drop(reader);
     if !poll(writer.as_mut()).is_ready() {
+        return 2;
+    }
+
+    0
+}
+
+/// An `acquire` that has to wait for a permit waits, and gets one once a holder lets go.
+#[unsafe(no_mangle)]
+pub extern "C" fn contended_acquire() -> u32 {
+    let semaphore = Semaphore::new(1);
+    let holder = semaphore.try_acquire().expect("a new semaphore has its permit free");
+    let mut waiter = pin!(semaphore.acquire());
+    if !poll(waiter.as_mut()).is_pending() {
+        return 1;
+    }
+    drop(holder);
+    if !poll(waiter.as_mut()).is_ready() {
         return 2;
     }
 
@@ -122,6 +139,38 @@ pub extern "C" fn starved_write() -> u32 {
     };
     drop(guard);
     if lock.try_write().is_none() {
+        return 6;
+    }
+
+    0
+}
+
+/// An `acquire` that waited and then found no permit free holds newcomers back, `try_acquire`
+/// among them, as a `lock` does.
+#[unsafe(no_mangle)]
+pub extern "C" fn starved_acquire() -> u32 {
+    let semaphore = Semaphore::new(1);
+    let holder = semaphore.try_acquire().expect("a new semaphore has its permit free");
+    let mut waiter = pin!(semaphore.acquire());
+    if !poll(waiter.as_mut()).is_pending() {
+        return 1;
+    }
+    drop(holder);
+    let Some(barging) = semaphore.try_acquire() else {
+        return 2;
+    };
+    if !poll(waiter.as_mut()).is_pending() {
+        return 3;
+    }
+    drop(barging);
+    if semaphore.try_acquire().is_some() {
+        return 4;
+    }
+    let Poll::Ready(guard) = poll(waiter.as_mut()) else {
+        return 5;
+    };
+    drop(guard);
+    if semaphore.try_acquire().is_none() {
         return 6;
     }
 

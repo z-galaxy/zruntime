@@ -36,7 +36,7 @@ broadcast = ["event", "dep:futures-core"]
 # The `mpmc` module: an async multi-producer multi-consumer channel, each of whose messages one
 # receiver gets.
 mpmc = ["event", "dep:futures-core"]
-# The `lock` module: an async mutex and readers-writer lock, which need no runtime.
+# The `lock` module: an async mutex, readers-writer lock and semaphore, which need no runtime.
 lock = ["event"]
 # `unblock`: blocking work run on a pool of threads, out of the way of the async tasks, and
 # `Unblock`, which gives a blocking I/O handle the async I/O traits through it; needs no runtime.

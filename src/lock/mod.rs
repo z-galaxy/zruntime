@@ -1,4 +1,5 @@
-//! Async locks whose guards a future can hold across an await: [`Mutex`] and [`RwLock`].
+//! Async locks whose guards a future can hold across an await: [`Mutex`], [`RwLock`] and
+//! [`Semaphore`].
 //!
 //! Tasks that share state often have to keep hold of it while they wait for something else: a task
 //! that writes a message to a shared socket holds the socket until all of the message is out,
@@ -10,12 +11,17 @@
 //! only ever held for a few instructions, with no await in between, needs none of this, and the
 //! locks of [`std::sync`] serve for it.
 //!
+//! A [`Semaphore`] is a lock that up to a set number of tasks may hold at once, rather than one:
+//! it keeps a count of permits, and caps how many tasks do something at once, such as hold a
+//! connection or have a request in flight. It keeps no value, and its guards stand for the permits
+//! it hands out.
+//!
 //! The locks are built on [`Event`](crate::Event) and need no runtime. They work under any
 //! executor, and from any thread, inside a task or outside of one: a thread with no task to run can
 //! wait for a lock with the `block_on` of any executor. A future that waits for a lock, or that
 //! holds a guard across an await, may move between threads as long as the lock may be shared
 //! between them, which takes a value that is `Send` for a [`Mutex`], and `Send` and `Sync` for an
-//! [`RwLock`].
+//! [`RwLock`]. A [`Semaphore`], which keeps no value, may always be shared.
 //!
 //! Each lock hands out guards of two kinds. [`Mutex::lock`], [`RwLock::read`] and [`RwLock::write`]
 //! hand out a guard that borrows the lock, which suits a guard held within one scope or one async
@@ -23,6 +29,8 @@
 //! of the lock, hand out one that holds a clone of that `Arc` instead, and so is not tied to a
 //! borrow: it can be kept in a struct, or moved into a spawned task, with nothing to borrow the
 //! lock from. The two wait, and treat the other tasks waiting for the lock, in just the same way.
+//! A [`Semaphore`] hands out its permits in the same two ways, through [`Semaphore::acquire`] and
+//! [`Semaphore::acquire_arc`].
 //!
 //! # Example
 //!
@@ -56,7 +64,8 @@
 //!
 //! A panic while a guard is held does not poison the lock. The guard is dropped as the panic
 //! unwinds, or with the future that holds it, which releases the lock, and the next task to take it
-//! finds the value as the panicking code left it, which can be half-way through an update.
+//! finds the value as the panicking code left it, which can be half-way through an update. A
+//! [`Semaphore`] keeps no value: a guard dropped as a panic unwinds just gives its permit back.
 //!
 //! # Fairness
 //!
@@ -69,6 +78,8 @@
 //! lock as it is released, rather than leave it free until a waiting task has been woken and has
 //! run, which keeps a contended lock busy. The calls that hand out a guard holding an `Arc` of the
 //! lock, such as [`Mutex::lock_arc`], are served in just the same way as those that borrow it.
+//! [`Semaphore::acquire`] likewise first tries to take a permit, and takes a free one ahead of the
+//! tasks waiting for one.
 //!
 //! How long newcomers can keep a task waiting this way is bounded. A task that has waited for a
 //! lock for a while, and is woken only to find it taken again, starts holding newcomers back, for
@@ -84,6 +95,11 @@
 //!   [`RwLock`] or waiting for it, is let in the next time no writer holds the lock, ahead of the
 //!   writers that wait for it, and no writer takes the lock until the reader is in. Other readers
 //!   are held back by a waiting writer as before: see [write preference](#write-preference).
+//! * A [`Semaphore`] that such a task waits for hands no permit to an `acquire` that has not waited
+//!   yet, nor to [`try_acquire`](Semaphore::try_acquire), even while permits are free: those wait
+//!   behind the task. A task that was waiting already can still take a free permit ahead of it, as
+//!   with a [`Mutex`]. Only a newcomer that checks at the very moment the task starts to hold
+//!   newcomers back may still slip past it.
 //!
 //! Where the standard library has no clock, as on `wasm32-unknown-unknown`, a task cannot tell how
 //! long it has waited, and holds newcomers back the first time it is woken only to find the lock
@@ -100,10 +116,12 @@
 //! Dropping the future that [`Mutex::lock`], [`RwLock::read`] or [`RwLock::write`] returned, before
 //! it completes, is fine: a timeout may do it, or a `select` that goes another way. The wait is
 //! given up, the lock is not taken, and no other task waiting for it is left stranded. The same
-//! goes for the futures of [`Mutex::lock_arc`], [`RwLock::read_arc`] and [`RwLock::write_arc`].
+//! goes for the futures of [`Mutex::lock_arc`], [`RwLock::read_arc`] and [`RwLock::write_arc`], and
+//! for those of [`Semaphore::acquire`] and [`Semaphore::acquire_arc`], which take no permit.
 
 mod mutex;
 mod rwlock;
+mod semaphore;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::time::{Duration, Instant};
@@ -112,9 +130,10 @@ pub use mutex::{Mutex, MutexGuard, MutexGuardArc};
 pub use rwlock::{
     RwLock, RwLockReadGuard, RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc,
 };
+pub use semaphore::{Semaphore, SemaphoreGuard, SemaphoreGuardArc};
 
-/// When a `lock`, `read` or `write` call began to wait, so that it can tell once it has waited for
-/// long enough to hold newcomers back.
+/// When a `lock`, `read`, `write` or `acquire` call began to wait, so that it can tell once it has
+/// waited for long enough to hold newcomers back.
 ///
 /// Where the standard library has no clock, as on `wasm32-unknown-unknown`, it keeps no time, and
 /// a call has waited for long enough as soon as it has waited at all: it then holds newcomers back

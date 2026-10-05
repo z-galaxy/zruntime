@@ -497,14 +497,15 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// the value allows, and the futures that wait for a lock are `Send`: which says the checks above
 /// fail for the reason they were written for and no other. A value that is `Sync` without being
 /// `Send`, as a `std::sync::MutexGuard` is, tells a guard that is `Sync` where `T` is `Sync` apart
-/// from one that would ask for `T` to be `Send` as well.
+/// from one that would ask for `T` to be `Send` as well. A semaphore keeps no value, so it and its
+/// guards are `Send` and `Sync`, and so are the futures that wait for a permit.
 ///
 /// ```
 /// use std::{cell::Cell, sync::Arc};
 ///
 /// use zruntime::lock::{
 ///     Mutex, MutexGuard, MutexGuardArc, RwLock, RwLockReadGuard, RwLockReadGuardArc,
-///     RwLockWriteGuard, RwLockWriteGuardArc,
+///     RwLockWriteGuard, RwLockWriteGuardArc, Semaphore, SemaphoreGuard, SemaphoreGuardArc,
 /// };
 ///
 /// fn sent<T>()
@@ -551,6 +552,10 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// sent_and_shared::<RwLockReadGuardArc<u8>>();
 /// sent_and_shared::<RwLockWriteGuardArc<u8>>();
 ///
+/// sent_and_shared::<Semaphore>();
+/// sent_and_shared::<SemaphoreGuard<'static>>();
+/// sent_and_shared::<SemaphoreGuardArc>();
+///
 /// let mutex = Arc::new(Mutex::new(Cell::new(0u8)));
 /// let rwlock = Arc::new(RwLock::new(0u8));
 /// sent_future(mutex.lock());
@@ -559,6 +564,10 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// sent_future(mutex.lock_arc());
 /// sent_future(rwlock.read_arc());
 /// sent_future(rwlock.write_arc());
+///
+/// let semaphore = Arc::new(Semaphore::new(1));
+/// sent_future(semaphore.acquire());
+/// sent_future(semaphore.acquire_arc());
 /// ```
 #[cfg(all(doctest, feature = "lock"))]
 struct LocksAreAsSendAndSyncAsTheirValues;

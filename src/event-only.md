@@ -23,8 +23,8 @@ it last, and an event may be notified from any thread.
   built on [`Event`]; it implies `event`.
 * `mpmc`: the `mpmc` module, an async multi-producer multi-consumer channel, each of whose
   messages one receiver gets, built on [`Event`]; it implies `event`.
-* `lock`: the `lock` module, an async `Mutex` and `RwLock`, whose guards a task may hold across an
-  await, built on [`Event`]; it implies `event`.
+* `lock`: the `lock` module, an async `Mutex`, `RwLock` and `Semaphore`, whose guards a task may
+  hold across an await, built on [`Event`]; it implies `event`.
 * `unblock`: `unblock`, which runs a piece of blocking work on a pool of threads kept for it and
   hands back a future of its outcome, and `Unblock`, an adapter that gives a blocking I/O handle
   the async I/O traits of `futures-io` that way; it needs no runtime, and brings the `futures-io`

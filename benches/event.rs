@@ -1,9 +1,10 @@
 //! What `Event`'s listen and notify paths cost: taking a listener, alone and dropped at once,
 //! sending a notification to nobody, waking one listener and a hundred taken beforehand, and
-//! `lock::Mutex`, built on an event, taken by one thread alone. `Event` needs no runtime, so no id
-//! here goes through `zruntime::block_on`: they poll listeners by hand or take the mutex with
-//! `try_lock`, all on one thread. `mutex/4-threads`, the mutex taken by four contending threads,
-//! is in `contention.rs`, as only the clock can measure it.
+//! `lock::Mutex` and `lock::Semaphore`, built on an event, taken by one thread alone. `Event` needs
+//! no runtime, so no id here goes through `zruntime::block_on`: they poll listeners by hand or take
+//! the mutex with `try_lock` and a permit with `try_acquire`, all on one thread.
+//! `mutex/4-threads`, the mutex taken by four contending threads, is in `contention.rs`, as only
+//! the clock can measure it.
 //!
 //! `listen` times taking a listener, alone, on an event whose shared state is already allocated:
 //! what every wait starts with. The listeners are taken a batch at a time and dropped once the
@@ -20,6 +21,10 @@
 //! `mutex/uncontended` times taking and releasing zruntime's own `lock::Mutex` on one thread, with
 //! nobody else after it: the commonest use of a lock, whose release notifies the mutex's event with
 //! nobody listening.
+//!
+//! `semaphore/uncontended` times taking a permit of zruntime's own `lock::Semaphore` and giving it
+//! back on one thread, with nobody else after one: what a semaphore that caps work which seldom
+//! reaches the cap costs, whose release notifies its event with nobody listening.
 //!
 //! `wake-one` times notifying one listener and polling it once to `Ready`: the end of a wait,
 //! from being told it is over to finding so, without its start, which `listen` times.
@@ -41,7 +46,10 @@ use std::{
 };
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use zruntime::{Event, EventListener, lock::Mutex};
+use zruntime::{
+    Event, EventListener,
+    lock::{Mutex, Semaphore},
+};
 
 /// Times `listen`, `notify` and the poll that resolves a listener, all on a single thread.
 fn event_benches(c: &mut Criterion) {
@@ -76,6 +84,12 @@ fn event_benches(c: &mut Criterion) {
     group.bench_function("mutex/uncontended", |b| {
         // The guard is dropped at once: the mutex is taken and released.
         b.iter(|| drop(black_box(uncontended.try_lock())));
+    });
+
+    let semaphore = Semaphore::new(1);
+    group.bench_function("semaphore/uncontended", |b| {
+        // The guard is dropped at once: the permit is taken and given back.
+        b.iter(|| drop(black_box(semaphore.try_acquire())));
     });
 
     group.bench_function("wake-one", |b| {

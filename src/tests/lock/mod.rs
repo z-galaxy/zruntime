@@ -1,4 +1,6 @@
-//! Tests of the locks of [`crate::lock`]: [`Mutex`] and [`RwLock`].
+//! Tests of the locks of [`crate::lock`]: [`Mutex`] and [`RwLock`]. Those of
+//! [`Semaphore`](crate::lock::Semaphore) are in the `semaphore` module, which shares the helpers
+//! at the end of this one.
 //!
 //! Most of these drive the futures of a lock by hand, polling each with a waker that goes nowhere,
 //! so that every test says exactly who a release lets in and who still waits. The mutex comes
@@ -46,6 +48,8 @@ use futures_lite::future::block_on;
 use ntest::timeout;
 
 use crate::lock::{Mutex, MutexGuard, PATIENCE, RwLock, RwLockWriteGuard};
+
+mod semaphore;
 
 /// A second taker waits while the first holds the mutex, and is let in once the first lets go.
 #[test]

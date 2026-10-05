@@ -88,6 +88,15 @@
 //!   read that misses a write before that write. A check that missed the change would come before
 //!   it, and a look that missed the word before that word; with the change before the look and the
 //!   word before the check, the four would go round in a circle, which no order can.
+//! * `lock::Semaphore` checks and changes its counts of free permits and of waiters that hold
+//!   newcomers back with `SeqCst` operations, as `lock::Mutex` does its flag: `SeqCst` loads, and
+//!   compare-exchanges whose failure is `SeqCst`, to check them, and a `SeqCst` `fetch_add` to give
+//!   a permit back, a `SeqCst` compare-exchange to add permits, or a `SeqCst` `fetch_sub` to stop
+//!   counting a waiter, to change them, each followed by `notify_additional_unfenced`, the last
+//!   only where a `SeqCst` look at the free permits finds some. The same circle rules out a check
+//!   and a look that both miss. Where that look finds none, every permit that was free as a
+//!   newcomer was held back has been taken since, and comes back through a release, which notifies,
+//!   or was forgotten, and leaves nothing to wake a task for.
 //!
 //! One thing the lock gave that a look without it does not: a notification that took the lock came
 //! before every later poll of a listener, so a listener it found notified already saw, on
@@ -338,7 +347,7 @@ impl Event {
     ///
     /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
     /// lock that whoever checks the condition takes too, as the module documentation says.
-    #[cfg(feature = "mpmc")]
+    #[cfg(any(feature = "lock", feature = "mpmc"))]
     pub(crate) fn notify_additional_unfenced(&self, n: usize) -> usize {
         self.send(n, Notification::Additional, Order::SeqCst)
     }
