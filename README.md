@@ -210,6 +210,16 @@ default. It was split into a separate project so non-zbus users can use it too.
 
 [MIT]
 
+## Sponsors
+
+<a href="https://codspeed.io/?utm_source=oss-sponsorship&utm_medium=z-galaxy">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://codspeed.io/codspeed-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://codspeed.io/codspeed-logo-light.svg">
+    <img alt="CodSpeed logo" src="https://codspeed.io/codspeed-logo-light.svg" width="400">
+  </picture>
+</a>
+
 [`Runtime`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html
 [`Runtime::block_on`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.block_on
 [`LocalRuntime`]: https://docs.rs/zruntime/latest/zruntime/type.LocalRuntime.html
