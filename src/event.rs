@@ -76,11 +76,11 @@
 //! memory access before it to be done, where a `SeqCst` write and look are a plain `stlr` and
 //! `ldar`.
 //!
-//! * The broadcast channel, the MPMC channel and the readers-writer lock check and change what
-//!   their waiters wait for under a lock of their own, which orders the two by itself. If the
-//!   notifier's turn with that lock comes first, the check sees the change. If the waiter's turn
-//!   does, its `listen` came before that turn, which came before the notifier's, which came before
-//!   the look, so the look finds the word `listen` wrote or a later one.
+//! * The broadcast channel, the MPMC channel, the readers-writer lock and the barrier check and
+//!   change what their waiters wait for under a lock of their own, which orders the two by itself.
+//!   If the notifier's turn with that lock comes first, the check sees the change. If the waiter's
+//!   turn does, its `listen` came before that turn, which came before the notifier's, which came
+//!   before the look, so the look finds the word `listen` wrote or a later one.
 //! * `lock::Mutex` checks and changes its flag with `SeqCst` operations: a compare-exchange whose
 //!   failure is `SeqCst`, or a `SeqCst` `fetch_or`, to take it, and a `SeqCst` `fetch_sub` to
 //!   release it, or to stop counting a waiter that held newcomers back from it. All `SeqCst`
@@ -88,6 +88,15 @@
 //!   read that misses a write before that write. A check that missed the change would come before
 //!   it, and a look that missed the word before that word; with the change before the look and the
 //!   word before the check, the four would go round in a circle, which no order can.
+//! * `lock::Semaphore` checks and changes its counts of free permits and of waiters that hold
+//!   newcomers back with `SeqCst` operations, as `lock::Mutex` does its flag: `SeqCst` loads, and
+//!   compare-exchanges whose failure is `SeqCst`, to check them, and a `SeqCst` `fetch_add` to give
+//!   a permit back, a `SeqCst` compare-exchange to add permits, or a `SeqCst` `fetch_sub` to stop
+//!   counting a waiter, to change them, each followed by `notify_additional_unfenced`, the last
+//!   only where a `SeqCst` look at the free permits finds some. The same circle rules out a check
+//!   and a look that both miss. Where that look finds none, every permit that was free as a
+//!   newcomer was held back has been taken since, and comes back through a release, which notifies,
+//!   or was forgotten, and leaves nothing to wake a task for.
 //!
 //! One thing the lock gave that a look without it does not: a notification that took the lock came
 //! before every later poll of a listener, so a listener it found notified already saw, on
@@ -338,7 +347,7 @@ impl Event {
     ///
     /// For a caller in this crate that changes the condition with a `SeqCst` operation, or under a
     /// lock that whoever checks the condition takes too, as the module documentation says.
-    #[cfg(feature = "mpmc")]
+    #[cfg(any(feature = "lock", feature = "mpmc"))]
     pub(crate) fn notify_additional_unfenced(&self, n: usize) -> usize {
         self.send(n, Notification::Additional, Order::SeqCst)
     }

@@ -1,15 +1,17 @@
 //! A readers-writer lock that a future can hold across an await point.
 //!
 //! [`RwLock`] keeps a value that any number of readers may share or one writer may use, and hands
-//! it out through an [`RwLockReadGuard`] or an [`RwLockWriteGuard`]. What the locks of this crate
-//! do and do not promise is said once, in the [module documentation](super).
+//! it out through an [`RwLockReadGuard`] or an [`RwLockWriteGuard`], or through an
+//! [`RwLockReadGuardArc`] or an [`RwLockWriteGuardArc`], which hold an `Arc` of the lock rather
+//! than a borrow of it. What the locks of this crate do and do not promise is said once, in the
+//! [module documentation](super).
 
 use std::{
     cell::UnsafeCell,
     fmt, mem,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
-    sync::{self, PoisonError},
+    sync::{self, Arc, PoisonError},
 };
 
 use super::WaitStart;
@@ -164,24 +166,7 @@ where
     /// });
     /// ```
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
-        let mut reader = WaitingReader {
-            rwlock: self,
-            since: None,
-            starved: false,
-        };
-        loop {
-            if let Some(guard) = reader.try_read() {
-                return guard;
-            }
-            reader.lost();
-            // Listen before re-checking so a release between the check and the wait is seen.
-            let listener = self.readers_may_enter.listen_unfenced();
-            if let Some(guard) = reader.try_read() {
-                return guard;
-            }
-            reader.since.get_or_insert_with(WaitStart::now);
-            listener.await;
-        }
+        self.acquire_read(|| RwLockReadGuard(self)).await
     }
 
     /// Acquires exclusive access, waiting for every reader and writer to leave.
@@ -220,20 +205,7 @@ where
     /// assert_eq!(waiter.join().expect("the other thread did not panic"), 5);
     /// ```
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let mut writer = WaitingWriter::register(self);
-        loop {
-            if let Some(guard) = writer.try_write() {
-                return guard;
-            }
-            writer.lost();
-            // Listen before re-checking so a release between the check and the wait is seen.
-            let listener = self.writer_may_enter.listen_unfenced();
-            if let Some(guard) = writer.try_write() {
-                return guard;
-            }
-            writer.since.get_or_insert_with(WaitStart::now);
-            listener.await;
-        }
+        self.acquire_write(|| RwLockWriteGuard(self)).await
     }
 
     /// Acquires shared access if no writer holds or waits for the lock, without waiting.
@@ -259,12 +231,7 @@ where
     /// assert!(lock.try_write().is_none());
     /// ```
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-        let mut state = lock(&self.state);
-        if state.writers_waiting > 0 || !state.admit_reader() {
-            return None;
-        }
-
-        Some(RwLockReadGuard(self))
+        self.try_acquire_read().then(|| RwLockReadGuard(self))
     }
 
     /// Acquires exclusive access if nobody holds the lock, without waiting.
@@ -290,12 +257,127 @@ where
     /// assert_eq!(*lock.try_read().expect("the writer is gone"), 2);
     /// ```
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        let mut state = lock(&self.state);
-        if state.writers_starved > 0 || !state.admit_writer() {
-            return None;
-        }
+        self.try_acquire_write().then(|| RwLockWriteGuard(self))
+    }
 
-        Some(RwLockWriteGuard(self))
+    /// Acquires shared access, waiting while a writer holds or waits for the lock, and hands out a
+    /// guard that holds an `Arc` of the lock rather than a borrow of it.
+    ///
+    /// This waits, and treats the other tasks waiting for the lock, exactly as
+    /// [`read`](RwLock::read) does, write preference included; only the guard differs. An
+    /// [`RwLockReadGuardArc`] keeps the lock alive for as long as it lives, so it can be kept in a
+    /// struct, or moved into a spawned task, with nothing to borrow the lock from.
+    ///
+    /// A task that holds a read guard of either kind must not call this, nor `read`, again: see
+    /// [write preference](RwLock#write-preference).
+    ///
+    /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
+    /// other task waiting for it is left stranded.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{sync::Arc, thread};
+    ///
+    /// use futures_lite::future::block_on;
+    /// use zruntime::lock::RwLock;
+    ///
+    /// let lock = Arc::new(RwLock::new(String::from("shared")));
+    /// let guard = block_on(lock.read_arc());
+    ///
+    /// let len = thread::spawn(move || guard.len())
+    ///     .join()
+    ///     .expect("the other thread did not panic");
+    ///
+    /// assert_eq!(len, 6);
+    /// ```
+    pub async fn read_arc(self: &Arc<Self>) -> RwLockReadGuardArc<T> {
+        self.acquire_read(|| RwLockReadGuardArc(self.clone())).await
+    }
+
+    /// Acquires shared access if no writer holds or waits for the lock, without waiting, and hands
+    /// out a guard that holds an `Arc` of the lock rather than a borrow of it.
+    ///
+    /// Returns `None` exactly where [`try_read`](RwLock::try_read) does; only the guard differs, as
+    /// [`read_arc`](RwLock::read_arc) says.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use zruntime::lock::RwLock;
+    ///
+    /// let lock = Arc::new(RwLock::new(1));
+    ///
+    /// let first = lock.try_read_arc().expect("nobody holds a new lock");
+    /// let second = lock.try_read_arc().expect("readers share the lock");
+    /// assert_eq!(*first + *second, 2);
+    /// assert!(lock.try_write_arc().is_none());
+    /// ```
+    pub fn try_read_arc(self: &Arc<Self>) -> Option<RwLockReadGuardArc<T>> {
+        self.try_acquire_read()
+            .then(|| RwLockReadGuardArc(self.clone()))
+    }
+
+    /// Acquires exclusive access, waiting for every reader and writer to leave, and hands out a
+    /// guard that holds an `Arc` of the lock rather than a borrow of it.
+    ///
+    /// This waits, holds new readers back while it does, and treats the other tasks waiting for
+    /// the lock, exactly as [`write`](RwLock::write) does; only the guard differs. An
+    /// [`RwLockWriteGuardArc`] keeps the lock alive for as long as it lives, so it can be kept in
+    /// a struct, or moved into a spawned task, with nothing to borrow the lock from.
+    ///
+    /// Dropping the future before it completes gives up the wait. The lock is not taken, the future
+    /// stops holding readers back, and no other task waiting for the lock is left stranded.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::{sync::Arc, thread};
+    ///
+    /// use futures_lite::future::block_on;
+    /// use zruntime::lock::RwLock;
+    ///
+    /// let lock = Arc::new(RwLock::new(0));
+    /// let mut guard = block_on(lock.write_arc());
+    ///
+    /// thread::spawn(move || *guard += 1)
+    ///     .join()
+    ///     .expect("the other thread did not panic");
+    ///
+    /// assert_eq!(*block_on(lock.read()), 1);
+    /// ```
+    pub async fn write_arc(self: &Arc<Self>) -> RwLockWriteGuardArc<T> {
+        self.acquire_write(|| RwLockWriteGuardArc(self.clone()))
+            .await
+    }
+
+    /// Acquires exclusive access if nobody holds the lock, without waiting, and hands out a guard
+    /// that holds an `Arc` of the lock rather than a borrow of it.
+    ///
+    /// Returns `None` exactly where [`try_write`](RwLock::try_write) does; only the guard differs,
+    /// as [`write_arc`](RwLock::write_arc) says.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use zruntime::lock::RwLock;
+    ///
+    /// let lock = Arc::new(RwLock::new(1));
+    ///
+    /// let guard = lock.try_write_arc().expect("nobody holds a new lock");
+    /// assert!(lock.try_write_arc().is_none());
+    /// assert!(lock.try_read_arc().is_none());
+    ///
+    /// drop(guard);
+    /// assert!(lock.try_read_arc().is_some());
+    /// ```
+    pub fn try_write_arc(self: &Arc<Self>) -> Option<RwLockWriteGuardArc<T>> {
+        self.try_acquire_write()
+            .then(|| RwLockWriteGuardArc(self.clone()))
     }
 
     /// The value, borrowed mutably.
@@ -315,6 +397,132 @@ where
     /// ```
     pub fn get_mut(&mut self) -> &mut T {
         self.value.get_mut()
+    }
+
+    /// Waits until this call holds a share of the lock, and returns the guard that `guard` makes
+    /// of it.
+    ///
+    /// The waiting of [`read`](RwLock::read) and [`read_arc`](RwLock::read_arc), which differ only
+    /// in the guard `guard` makes once this call holds the share. It makes the guard with no await
+    /// in between, so a future that is dropped never leaves a share taken with no guard to give it
+    /// up.
+    async fn acquire_read<F, G>(&self, guard: F) -> G
+    where
+        F: FnOnce() -> G,
+    {
+        let mut reader = WaitingReader {
+            rwlock: self,
+            since: None,
+            starved: false,
+        };
+        // The listener of the try that took the share, or `None` where the first try did.
+        let listener = loop {
+            if reader.try_read() {
+                break None;
+            }
+            reader.lost();
+            // Listen before re-checking so a release between the check and the wait is seen.
+            let listener = self.readers_may_enter.listen_unfenced();
+            if reader.try_read() {
+                break Some(listener);
+            }
+            reader.since.get_or_insert_with(WaitStart::now);
+            listener.await;
+        };
+        // The guard is made before the listener and the reader are dropped. A listener that was
+        // notified passes its notification on as it is dropped, and the event re-raises a panic of
+        // the waker that wakes. A panic in a drop that runs as a function returns leaks the value
+        // it returns, which would leave the share taken with no guard to give it up. Made before
+        // the drops, the guard is still a local of this function when one panics, and the
+        // unwinding drops it.
+        let guard = guard();
+        drop(listener);
+        drop(reader);
+
+        guard
+    }
+
+    /// Waits until this call holds the lock alone, and returns the guard that `guard` makes of
+    /// it.
+    ///
+    /// The waiting of [`write`](RwLock::write) and [`write_arc`](RwLock::write_arc), which differ
+    /// only in the guard `guard` makes once this call holds the lock. It makes the guard with no
+    /// await in between, so a future that is dropped never leaves the lock taken with no guard to
+    /// release it.
+    async fn acquire_write<F, G>(&self, guard: F) -> G
+    where
+        F: FnOnce() -> G,
+    {
+        let mut writer = WaitingWriter::register(self);
+        // The listener of the try that took the lock, or `None` where the first try did.
+        let listener = loop {
+            if writer.try_write() {
+                break None;
+            }
+            writer.lost();
+            // Listen before re-checking so a release between the check and the wait is seen.
+            let listener = self.writer_may_enter.listen_unfenced();
+            if writer.try_write() {
+                break Some(listener);
+            }
+            writer.since.get_or_insert_with(WaitStart::now);
+            listener.await;
+        };
+        // The guard is made before the listener and the writer are dropped, for the reason given
+        // in `acquire_read`: a panic in one of those drops would otherwise leak the guard, and
+        // leave the lock taken with no guard to release it.
+        let guard = guard();
+        drop(listener);
+        drop(writer);
+
+        guard
+    }
+
+    /// Takes a share of the lock if no writer holds or waits for it, and tells whether it did: the
+    /// try of [`try_read`](RwLock::try_read) and [`try_read_arc`](RwLock::try_read_arc).
+    fn try_acquire_read(&self) -> bool {
+        let mut state = lock(&self.state);
+
+        state.writers_waiting == 0 && state.admit_reader()
+    }
+
+    /// Takes the lock if nobody holds it and no starved task holds newcomers back, and tells
+    /// whether it did: the try of [`try_write`](RwLock::try_write) and
+    /// [`try_write_arc`](RwLock::try_write_arc).
+    fn try_acquire_write(&self) -> bool {
+        let mut state = lock(&self.state);
+
+        state.writers_starved == 0 && state.admit_writer()
+    }
+
+    /// Gives up the share of the lock that a read guard held, and wakes a writer waiting for it
+    /// once the last reader is gone: what dropping an [`RwLockReadGuard`] or an
+    /// [`RwLockReadGuardArc`] does.
+    fn read_unlock(&self) {
+        let mut state = lock(&self.state);
+        let Owner::Reading(readers) = state.owner else {
+            unreachable!("a read guard exists only while the owner is reading");
+        };
+        if let Some(readers) = NonZeroUsize::new(readers.get() - 1) {
+            state.owner = Owner::Reading(readers);
+            return;
+        }
+        state.owner = Owner::Unlocked;
+        drop(state);
+
+        self.writer_may_enter.notify_unfenced(1);
+    }
+
+    /// Releases the lock that a write guard held, and wakes the readers and the writer waiting for
+    /// it: what dropping an [`RwLockWriteGuard`] or an [`RwLockWriteGuardArc`] does.
+    fn write_unlock(&self) {
+        lock(&self.state).owner = Owner::Unlocked;
+        // Who gets in next is settled by the waiters' tries on the state they find once they wake,
+        // so waking both sides can let nobody in early. A notification whose listener is dropped
+        // before polling it is passed on to the next listener, so a `write` future abandoned after
+        // being woken strands nobody behind it.
+        self.readers_may_enter.notify_unfenced(usize::MAX);
+        self.writer_may_enter.notify_unfenced(1);
     }
 }
 
@@ -356,7 +564,8 @@ where
 ///
 /// Made by [`RwLock::read`] and [`RwLock::try_read`]. The guard dereferences to the value, and
 /// dropping it gives up its share of the lock: once the last reader is gone, a writer waiting for
-/// the lock is woken.
+/// the lock is woken. A guard that has to outlive a borrow of the lock is an
+/// [`RwLockReadGuardArc`].
 ///
 /// A guard is `Send` and `Sync` wherever `T` is `Sync`, so holding one across an await does not
 /// keep a future from moving between threads.
@@ -399,18 +608,7 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        let mut state = lock(&self.0.state);
-        let Owner::Reading(readers) = state.owner else {
-            unreachable!("a read guard exists only while the owner is reading");
-        };
-        if let Some(readers) = NonZeroUsize::new(readers.get() - 1) {
-            state.owner = Owner::Reading(readers);
-            return;
-        }
-        state.owner = Owner::Unlocked;
-        drop(state);
-
-        self.0.writer_may_enter.notify_unfenced(1);
+        self.0.read_unlock();
     }
 }
 
@@ -418,7 +616,8 @@ where
 ///
 /// Made by [`RwLock::write`] and [`RwLock::try_write`]. The guard dereferences to the value,
 /// mutably too, and dropping it releases the lock and wakes the readers and the writer waiting
-/// for it, if there are any.
+/// for it, if there are any. A guard that has to outlive a borrow of the lock is an
+/// [`RwLockWriteGuardArc`].
 ///
 /// A guard is `Send` wherever `T` is `Send`, and `Sync` wherever `T` is `Sync`, so holding one
 /// across an await does not keep a future from moving between threads.
@@ -472,13 +671,186 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        lock(&self.0.state).owner = Owner::Unlocked;
-        // Who gets in next is settled by the waiters' tries on the state they find once they wake,
-        // so waking both sides can let nobody in early. A notification whose listener is dropped
-        // before polling it is passed on to the next listener, so a `write` future abandoned after
-        // being woken strands nobody behind it.
-        self.0.readers_may_enter.notify_unfenced(usize::MAX);
-        self.0.writer_may_enter.notify_unfenced(1);
+        self.0.write_unlock();
+    }
+}
+
+/// Shared access to the value of an [`RwLock`], for as long as the guard lives, through an `Arc` of
+/// the lock rather than a borrow of it.
+///
+/// Made by [`RwLock::read_arc`] and [`RwLock::try_read_arc`]. It does what an [`RwLockReadGuard`]
+/// does: it dereferences to the value, and dropping it gives up its share of the lock, waking a
+/// writer waiting for the lock once the last reader is gone. Unlike an `RwLockReadGuard`, it is not
+/// tied to a borrow of the lock: the `Arc` it holds keeps the lock alive for as long as the guard
+/// lives, so the guard can be kept in a struct, or moved into a spawned task or onto another
+/// thread.
+///
+/// A guard is `Send` wherever `T` is `Send` and `Sync`, which is what it takes for an `Arc` of the
+/// lock to go to another thread: the guard holds one, and dropping it there can drop the last
+/// `Arc`, and the value with it. It is `Sync` wherever `T` is `Send` and `Sync` too, through the
+/// `Arc`, which is more than sharing a guard needs, for that shares a `&T` and nothing else. A
+/// guard of a value that is `Sync` but not `Send` therefore cannot be shared by reference with
+/// another thread, a scoped one say, as an `RwLockReadGuard` or a `MutexGuardArc` of it can.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use futures_lite::future::block_on;
+/// use zruntime::lock::{RwLock, RwLockReadGuardArc};
+///
+/// /// A view of the settings that keeps them from changing while it lives.
+/// struct Snapshot {
+///     settings: RwLockReadGuardArc<Vec<&'static str>>,
+/// }
+///
+/// let settings = Arc::new(RwLock::new(vec!["verbose"]));
+/// let snapshot = Snapshot {
+///     settings: block_on(settings.read_arc()),
+/// };
+/// assert!(settings.try_write().is_none());
+/// assert_eq!(*snapshot.settings, ["verbose"]);
+///
+/// drop(snapshot);
+/// assert!(settings.try_write().is_some());
+/// ```
+// `Send` and `Sync` are the auto traits' and follow the `Arc`, asking for `T: Send + Sync`. `Send`
+// needs no less, as the guard's doc says. `Sync` could ask for `T: Sync` alone, as sharing the
+// guard shares a `&T` and nothing more, but only through an unsafe impl, which the guard does
+// without. What that costs is a guard of a value that is `Sync` but not `Send`: it cannot be shared
+// by reference with another thread, such as a scoped one, as a borrowing guard or a `MutexGuardArc`
+// of that value can be.
+#[must_use = "if unused the RwLock will immediately unlock"]
+pub struct RwLockReadGuardArc<T>(Arc<RwLock<T>>)
+where
+    T: ?Sized;
+
+impl<T> Deref for RwLockReadGuardArc<T>
+where
+    T: ?Sized,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists, so the owner is `Reading`, which keeps every writer out, and
+        // its clone of the `Arc` rules out `get_mut` and `into_inner`, which no shared `Arc` can
+        // reach: only shared references to the cell's contents can be live.
+        unsafe { &*self.0.value.get() }
+    }
+}
+
+impl<T> fmt::Debug for RwLockReadGuardArc<T>
+where
+    T: ?Sized + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T> Drop for RwLockReadGuardArc<T>
+where
+    T: ?Sized,
+{
+    fn drop(&mut self) {
+        self.0.read_unlock();
+    }
+}
+
+/// Exclusive access to the value of an [`RwLock`], for as long as the guard lives, through an `Arc`
+/// of the lock rather than a borrow of it.
+///
+/// Made by [`RwLock::write_arc`] and [`RwLock::try_write_arc`]. It does what an
+/// [`RwLockWriteGuard`] does: it dereferences to the value, mutably too, and dropping it releases
+/// the lock and wakes the readers and the writer waiting for it, if there are any. Unlike an
+/// `RwLockWriteGuard`, it is not tied to a borrow of the lock: the `Arc` it holds keeps the lock
+/// alive for as long as the guard lives, so the guard can be kept in a struct, or moved into a
+/// spawned task or onto another thread.
+///
+/// A guard is `Send` wherever `T` is `Send` and `Sync`, which is what it takes for an `Arc` of the
+/// lock to go to another thread: the guard holds one, and dropping it there can drop the last
+/// `Arc`, and the value with it. It is `Sync` wherever `T` is `Send` and `Sync` too, through the
+/// `Arc`. Both are more than an `RwLockWriteGuard` asks, which is `Send` wherever `T` is `Send`
+/// and `Sync` wherever `T` is `Sync`. So a scoped thread, say, can be given a borrowing guard of a
+/// value that is `Send` but not `Sync`, or share one of a value that is `Sync` but not `Send`, and
+/// can do neither with this guard.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use futures_lite::future::block_on;
+/// use zruntime::lock::{RwLock, RwLockWriteGuardArc};
+///
+/// /// An edit of a document, which nobody may read until it is done.
+/// struct Edit {
+///     text: RwLockWriteGuardArc<String>,
+/// }
+///
+/// let document = Arc::new(RwLock::new(String::from("draft")));
+/// let mut edit = Edit {
+///     text: block_on(document.write_arc()),
+/// };
+/// edit.text.push_str(", revised");
+/// assert!(document.try_read().is_none());
+///
+/// drop(edit);
+/// assert_eq!(*block_on(document.read()), "draft, revised");
+/// ```
+// `Send` and `Sync` are the auto traits' and follow the `Arc`, asking for `T: Send + Sync`. `Send`
+// could ask for `T: Send` alone, as an `RwLockWriteGuard` does, since the guard hands out nothing
+// of the `Arc` it holds, and `Sync` for `T: Sync` alone, as sharing the guard shares a `&T` and
+// nothing more, but only through unsafe impls, which the guard does without. What that costs is,
+// with a scoped thread say, that a guard of a value that is `Send` but not `Sync` cannot be moved
+// to it, nor one of a value that is `Sync` but not `Send` be shared with it by reference, as a
+// borrowing guard of such a value can.
+#[must_use = "if unused the RwLock will immediately unlock"]
+pub struct RwLockWriteGuardArc<T>(Arc<RwLock<T>>)
+where
+    T: ?Sized;
+
+impl<T> Deref for RwLockWriteGuardArc<T>
+where
+    T: ?Sized,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists, so the owner is `Writing`, which keeps every other guard out,
+        // and its clone of the `Arc` rules out `get_mut` and `into_inner`, which no shared `Arc`
+        // can reach: nothing else can reach the cell's contents.
+        unsafe { &*self.0.value.get() }
+    }
+}
+
+impl<T> DerefMut for RwLockWriteGuardArc<T>
+where
+    T: ?Sized,
+{
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, this guard is the only path to the cell's contents, and `&mut
+        // self` rules out a second reference taken through the guard itself.
+        unsafe { &mut *self.0.value.get() }
+    }
+}
+
+impl<T> fmt::Debug for RwLockWriteGuardArc<T>
+where
+    T: ?Sized + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T> Drop for RwLockWriteGuardArc<T>
+where
+    T: ?Sized,
+{
+    fn drop(&mut self) {
+        self.0.write_unlock();
     }
 }
 
@@ -549,21 +921,22 @@ where
     starved: bool,
 }
 
-impl<'a, T> WaitingReader<'a, T>
+impl<T> WaitingReader<'_, T>
 where
     T: ?Sized,
 {
-    /// Enters if no writer holds the lock, and, unless this reader is starved, none waits for it.
-    fn try_read(&mut self) -> Option<RwLockReadGuard<'a, T>> {
+    /// Enters if no writer holds the lock, and, unless this reader is starved, none waits for it,
+    /// and tells whether it did.
+    fn try_read(&mut self) -> bool {
         let mut state = lock(&self.rwlock.state);
         if (!self.starved && state.writers_waiting > 0) || !state.admit_reader() {
-            return None;
+            return false;
         }
         if mem::take(&mut self.starved) {
             state.readers_starved -= 1;
         }
 
-        Some(RwLockReadGuard(self.rwlock))
+        true
     }
 
     /// Records that this call could not enter, after a notification woke it if it has waited.
@@ -639,11 +1012,11 @@ where
     }
 
     /// Takes the lock if nobody holds it, no starved reader waits for it and, until this call has
-    /// waited, no starved writer holds newcomers back.
-    fn try_write(&mut self) -> Option<RwLockWriteGuard<'a, T>> {
+    /// waited, no starved writer holds newcomers back, and tells whether it did.
+    fn try_write(&mut self) -> bool {
         let mut state = lock(&self.rwlock.state);
         if (self.since.is_none() && state.writers_starved > 0) || !state.admit_writer() {
-            return None;
+            return false;
         }
         self.counted = false;
         state.writers_waiting -= 1;
@@ -651,7 +1024,7 @@ where
             state.writers_starved -= 1;
         }
 
-        Some(RwLockWriteGuard(self.rwlock))
+        true
     }
 
     /// Records that this call could not take the lock, after a notification woke it if it has

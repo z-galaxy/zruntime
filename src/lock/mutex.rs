@@ -1,14 +1,18 @@
 //! A mutual-exclusion lock that a future can hold across an await point.
 //!
 //! [`Mutex`] keeps a value that one task at a time may use, and hands it out through a
-//! [`MutexGuard`]. What the locks of this crate do and do not promise is said once, in the
+//! [`MutexGuard`], or through a [`MutexGuardArc`] that holds an `Arc` of the mutex rather than a
+//! borrow of it. What the locks of this crate do and do not promise is said once, in the
 //! [module documentation](super).
 
 use std::{
     cell::UnsafeCell,
     fmt,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::WaitStart;
@@ -159,25 +163,7 @@ where
     /// assert_eq!(waiter.join().expect("the other thread did not panic"), 5);
     /// ```
     pub async fn lock(&self) -> MutexGuard<'_, T> {
-        // When this call began to wait, once it has.
-        let mut since = None;
-        // Counts this call among the starved waiters once it is one, until the call ends.
-        let mut starved = None;
-        loop {
-            if let Some(guard) = self.try_lock_as(since.is_some()) {
-                return guard;
-            }
-            if starved.is_none() && since.is_some_and(WaitStart::waited_long) {
-                starved = Some(Starved::new(self));
-            }
-            // Listen before re-checking so a release between the check and the wait is seen.
-            let listener = self.unlocked.listen_unfenced();
-            if let Some(guard) = self.try_lock_as(since.is_some()) {
-                return guard;
-            }
-            since.get_or_insert_with(WaitStart::now);
-            listener.await;
-        }
+        self.acquire(|| MutexGuard(self)).await
     }
 
     /// Acquires the lock if nobody holds it, without waiting.
@@ -200,11 +186,66 @@ where
     /// assert!(mutex.try_lock().is_some());
     /// ```
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.state
-            .compare_exchange(0, LOCKED, Ordering::Acquire, Ordering::SeqCst)
-            .ok()?;
+        self.try_acquire().then(|| MutexGuard(self))
+    }
 
-        Some(MutexGuard(self))
+    /// Acquires the lock, waiting for the current holder to release it, and hands out a guard
+    /// that holds an `Arc` of the mutex rather than a borrow of it.
+    ///
+    /// This waits, and treats the other tasks waiting for the mutex, exactly as
+    /// [`lock`](Mutex::lock) does; only the guard differs. A [`MutexGuardArc`] keeps the mutex
+    /// alive for as long as it lives, so it can be kept in a struct, or moved into a spawned task,
+    /// with nothing to borrow the mutex from.
+    ///
+    /// Dropping the future before it completes gives up the wait. The lock is not taken, and no
+    /// other task waiting for it is left stranded.
+    ///
+    /// # Example
+    ///
+    /// A guard moved onto a thread of its own, which takes only what borrows nothing:
+    ///
+    /// ```
+    /// use std::{sync::Arc, thread};
+    ///
+    /// use futures_lite::future::block_on;
+    /// use zruntime::lock::Mutex;
+    ///
+    /// let mutex = Arc::new(Mutex::new(0));
+    /// let mut guard = block_on(mutex.lock_arc());
+    ///
+    /// thread::spawn(move || *guard += 1)
+    ///     .join()
+    ///     .expect("the other thread did not panic");
+    ///
+    /// assert_eq!(*block_on(mutex.lock()), 1);
+    /// ```
+    pub async fn lock_arc(self: &Arc<Self>) -> MutexGuardArc<T> {
+        self.acquire(|| MutexGuardArc(self.clone())).await
+    }
+
+    /// Acquires the lock if nobody holds it, without waiting, and hands out a guard that holds an
+    /// `Arc` of the mutex rather than a borrow of it.
+    ///
+    /// Returns `None` exactly where [`try_lock`](Mutex::try_lock) does; only the guard differs, as
+    /// [`lock_arc`](Mutex::lock_arc) says.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use zruntime::lock::Mutex;
+    ///
+    /// let mutex = Arc::new(Mutex::new(1));
+    ///
+    /// let guard = mutex.try_lock_arc().expect("nobody holds a new mutex");
+    /// assert!(mutex.try_lock_arc().is_none());
+    ///
+    /// drop(guard);
+    /// assert!(mutex.try_lock_arc().is_some());
+    /// ```
+    pub fn try_lock_arc(self: &Arc<Self>) -> Option<MutexGuardArc<T>> {
+        self.try_acquire().then(|| MutexGuardArc(self.clone()))
     }
 
     /// The value, borrowed mutably.
@@ -226,23 +267,82 @@ where
         self.value.get_mut()
     }
 
-    /// Takes the mutex if nobody holds it: as a newcomer, held back by starved waiters, until the
-    /// `lock` call trying has `waited`, and whether or not they hold newcomers back from then on.
+    /// Waits until this call holds the lock, and returns the guard that `guard` makes of it.
+    ///
+    /// The waiting of [`lock`](Mutex::lock) and [`lock_arc`](Mutex::lock_arc), which differ only
+    /// in the guard `guard` makes once this call holds the lock. It makes the guard with no await
+    /// in between, so a future that is dropped never leaves the lock taken with no guard to
+    /// release it.
+    async fn acquire<F, G>(&self, guard: F) -> G
+    where
+        F: FnOnce() -> G,
+    {
+        // When this call began to wait, once it has.
+        let mut since = None;
+        // Counts this call among the starved waiters once it is one, until the call ends.
+        let mut starved = None;
+        // The listener of the try that took the lock, or `None` where the first try did.
+        let listener = loop {
+            if self.try_acquire_as(since.is_some()) {
+                break None;
+            }
+            if starved.is_none() && since.is_some_and(WaitStart::waited_long) {
+                starved = Some(Starved::new(self));
+            }
+            // Listen before re-checking so a release between the check and the wait is seen.
+            let listener = self.unlocked.listen_unfenced();
+            if self.try_acquire_as(since.is_some()) {
+                break Some(listener);
+            }
+            since.get_or_insert_with(WaitStart::now);
+            listener.await;
+        };
+        // The guard is made before the listener and the starved count are dropped. A listener
+        // that was notified passes its notification on as it is dropped, and the event re-raises
+        // a panic of the waker that wakes. A panic in a drop that runs as a function returns leaks
+        // the value it returns, which would leave the lock taken with no guard to release it. Made
+        // before the drops, the guard is still a local of this function when one panics, and the
+        // unwinding drops it.
+        let guard = guard();
+        drop(listener);
+        drop(starved);
+
+        guard
+    }
+
+    /// Takes the mutex as a newcomer if nobody holds it and no starved waiter holds newcomers
+    /// back, and tells whether it did: the try of [`try_lock`](Mutex::try_lock) and
+    /// [`try_lock_arc`](Mutex::try_lock_arc).
+    fn try_acquire(&self) -> bool {
+        self.state
+            .compare_exchange(0, LOCKED, Ordering::Acquire, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Takes the mutex if nobody holds it, and tells whether it did: as a newcomer, held back by
+    /// starved waiters, until the `lock` call trying has `waited`, and whether or not they hold
+    /// newcomers back from then on.
     ///
     /// A newcomer that starved waiters hold back from a free mutex waits all the same, and is not
     /// stranded: a release notifies the event, and so does a starved waiter that stops counting
     /// while the mutex is free; a notified listener that is dropped passes its notification on;
     /// and a call that has waited takes a free mutex on each of its tries, the one after its wake
     /// and the one after it listens again.
-    fn try_lock_as(&self, waited: bool) -> Option<MutexGuard<'_, T>> {
+    fn try_acquire_as(&self, waited: bool) -> bool {
         if !waited {
-            return self.try_lock();
-        }
-        if self.state.fetch_or(LOCKED, Ordering::SeqCst) & LOCKED != 0 {
-            return None;
+            return self.try_acquire();
         }
 
-        Some(MutexGuard(self))
+        self.state.fetch_or(LOCKED, Ordering::SeqCst) & LOCKED == 0
+    }
+
+    /// Releases the lock that a guard held, and wakes a task waiting for it, if there is one: what
+    /// dropping a [`MutexGuard`] or a [`MutexGuardArc`] does.
+    fn unlock(&self) {
+        self.state.fetch_sub(LOCKED, Ordering::SeqCst);
+        // A notification whose listener is dropped before polling it is passed on to the next
+        // listener, so a `lock` future abandoned after being woken strands nobody behind it.
+        self.unlocked.notify_unfenced(1);
     }
 }
 
@@ -283,7 +383,8 @@ where
 /// The guard of a [`Mutex`] that is held, through which its value is used.
 ///
 /// Made by [`Mutex::lock`] and [`Mutex::try_lock`]. The guard dereferences to the value, mutably
-/// too, and dropping it releases the mutex and wakes a task waiting for it, if there is one.
+/// too, and dropping it releases the mutex and wakes a task waiting for it, if there is one. A
+/// guard that has to outlive a borrow of the mutex is a [`MutexGuardArc`].
 ///
 /// A guard is `Send` wherever `T` is `Send`, and `Sync` wherever `T` is `Sync`, so holding one
 /// across an await does not keep a future from moving between threads.
@@ -334,10 +435,99 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        self.0.state.fetch_sub(LOCKED, Ordering::SeqCst);
-        // A notification whose listener is dropped before polling it is passed on to the next
-        // listener, so a `lock` future abandoned after being woken strands nobody behind it.
-        self.0.unlocked.notify_unfenced(1);
+        self.0.unlock();
+    }
+}
+
+/// The guard of a [`Mutex`] that is held, which holds an `Arc` of the mutex rather than a borrow of
+/// it.
+///
+/// Made by [`Mutex::lock_arc`] and [`Mutex::try_lock_arc`]. It does what a [`MutexGuard`] does: it
+/// dereferences to the value, mutably too, and dropping it releases the mutex and wakes a task
+/// waiting for it, if there is one. Unlike a `MutexGuard`, it is not tied to a borrow of the mutex:
+/// the `Arc` it holds keeps the mutex alive for as long as the guard lives, so the guard can be
+/// kept in a struct, or moved into a spawned task or onto another thread.
+///
+/// A guard is `Send` wherever `T` is `Send`, and `Sync` wherever `T` is `Sync`, as a `MutexGuard`
+/// is.
+///
+/// # Example
+///
+/// A guard kept in a struct, which holds the value for as long as the struct lives:
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use futures_lite::future::block_on;
+/// use zruntime::lock::{Mutex, MutexGuardArc};
+///
+/// /// A log that nothing else may write to while it is open.
+/// struct OpenLog {
+///     lines: MutexGuardArc<Vec<String>>,
+/// }
+///
+/// let log = Arc::new(Mutex::new(Vec::new()));
+/// let mut open = OpenLog {
+///     lines: block_on(log.lock_arc()),
+/// };
+/// open.lines.push(String::from("opened"));
+/// assert!(log.try_lock().is_none());
+///
+/// drop(open);
+/// assert_eq!(*block_on(log.lock()), ["opened"]);
+/// ```
+#[must_use = "if unused the Mutex will immediately unlock"]
+pub struct MutexGuardArc<T>(Arc<Mutex<T>>)
+where
+    T: ?Sized;
+
+// The auto `Sync` of the guard would follow the `Arc`'s, which asks only for `T: Send`: that would
+// let two threads share a guard of a `Cell` and use the cell at once through it.
+//
+// SAFETY: sharing the guard only shares the `&T` it derefs to, which `Sync` allows: nothing else of
+// the guard, the `Arc` it holds included, is reachable through a shared reference to it.
+unsafe impl<T> Sync for MutexGuardArc<T> where T: ?Sized + Sync {}
+
+impl<T> Deref for MutexGuardArc<T>
+where
+    T: ?Sized,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists, so `LOCKED` is set and only this guard clears it, and the
+        // guard's clone of the `Arc` rules out `get_mut` and `into_inner`, which no shared `Arc`
+        // can reach: no other reference to the cell's contents can be live.
+        unsafe { &*self.0.value.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuardArc<T>
+where
+    T: ?Sized,
+{
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, this guard is the only path to the cell's contents, and `&mut
+        // self` rules out a second reference taken through the guard itself.
+        unsafe { &mut *self.0.value.get() }
+    }
+}
+
+impl<T> fmt::Debug for MutexGuardArc<T>
+where
+    T: ?Sized + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T> Drop for MutexGuardArc<T>
+where
+    T: ?Sized,
+{
+    fn drop(&mut self) {
+        self.0.unlock();
     }
 }
 

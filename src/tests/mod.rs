@@ -375,7 +375,7 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// ```
 ///
 /// ...and a write guard of a `Cell`, which may be sent, is not `Sync`, for the same reason as a
-/// mutex guard of one.
+/// mutex guard of one...
 ///
 /// ```compile_fail
 /// use std::cell::Cell;
@@ -389,16 +389,161 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// shared::<zruntime::lock::RwLockWriteGuard<'static, Cell<u8>>>();
 /// ```
 ///
+/// ...while a guard that holds an `Arc` of its lock rather than a borrow is as `Send` as that
+/// `Arc`, which it may drop, and the value with it, on the thread it goes to. A mutex's `Arc` guard
+/// of an `Rc` is not `Send`, as a mutex guard of one is not...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::lock::MutexGuardArc<Rc<u8>>>();
+/// ```
+///
+/// ...and one of a `Cell` is not `Sync`, as a mutex guard of one is not, though its `Arc` is: the
+/// guard asks for `T` to be `Sync` itself, or sharing it would share the `&Cell` it dereferences
+/// to...
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::lock::MutexGuardArc<Cell<u8>>>();
+/// ```
+///
+/// ...the `Arc` guards of a readers-writer lock are `Send` and `Sync` where the lock may be shared,
+/// which takes a value that is `Send` and `Sync`: a read guard of a `Cell` is not `Send`...
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::lock::RwLockReadGuardArc<Cell<u8>>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::lock::RwLockReadGuardArc<Cell<u8>>>();
+/// ```
+///
+/// ...a write guard of an `Rc` is not `Send`...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::lock::RwLockWriteGuardArc<Rc<u8>>>();
+/// ```
+///
+/// ...and a write guard of a `Cell` is neither `Send`, unlike a write guard that borrows the lock,
+/// for an `Arc` of a lock of a `Cell` cannot go to another thread...
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::lock::RwLockWriteGuardArc<Cell<u8>>>();
+/// ```
+///
+/// ...nor `Sync`.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::lock::RwLockWriteGuardArc<Cell<u8>>>();
+/// ```
+///
+/// A once cell has its value set by one task, which may be on any thread, and handed by reference
+/// to the tasks on all the others, so it goes to another thread only where its value may be sent,
+/// as a cell of an `Rc`, which cannot be, is not...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::lock::OnceCell<Rc<u8>>>();
+/// ```
+///
+/// ...and is shared with another only where its value may be shared as well as sent, so a cell of a
+/// `Cell`, which may be sent, is not `Sync`, for the tasks sharing it would share the `&Cell` it
+/// hands out.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::lock::OnceCell<Cell<u8>>>();
+/// ```
+///
 /// Where the value's own bounds hold, the locks and their guards are `Send` and `Sync` as far as
 /// the value allows, and the futures that wait for a lock are `Send`: which says the checks above
 /// fail for the reason they were written for and no other. A value that is `Sync` without being
 /// `Send`, as a `std::sync::MutexGuard` is, tells a guard that is `Sync` where `T` is `Sync` apart
-/// from one that would ask for `T` to be `Send` as well.
+/// from one that would ask for `T` to be `Send` as well. A semaphore keeps no value, so it and its
+/// guards are `Send` and `Sync`, and so are the futures that wait for a permit. A barrier holds no
+/// value either, so there is nothing for it to ask of one: it and the result of waiting at it are
+/// `Send` and `Sync`, and so is the future that waits at it. A once cell is `Send` where its value
+/// is, and `Sync` where its value is `Send` and `Sync`, and its futures, which hand out references
+/// to the value, are `Send` there too, as far as the initialiser they run is.
 ///
 /// ```
-/// use std::cell::Cell;
+/// use std::{cell::Cell, sync::Arc};
 ///
-/// use zruntime::lock::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+/// use zruntime::lock::{
+///     Barrier, BarrierWaitResult, Mutex, MutexGuard, MutexGuardArc, OnceCell, RwLock,
+///     RwLockReadGuard, RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc, Semaphore,
+///     SemaphoreGuard, SemaphoreGuardArc,
+/// };
 ///
 /// fn sent<T>()
 /// where
@@ -438,11 +583,42 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// sent_and_shared::<RwLockReadGuard<'static, std::sync::MutexGuard<'static, u8>>>();
 /// shared::<RwLockWriteGuard<'static, std::sync::MutexGuard<'static, u8>>>();
 ///
-/// let mutex = Mutex::new(Cell::new(0u8));
-/// let rwlock = RwLock::new(0u8);
+/// sent::<MutexGuardArc<Cell<u8>>>();
+/// sent_and_shared::<MutexGuardArc<u8>>();
+/// shared::<MutexGuardArc<std::sync::MutexGuard<'static, u8>>>();
+/// sent_and_shared::<RwLockReadGuardArc<u8>>();
+/// sent_and_shared::<RwLockWriteGuardArc<u8>>();
+///
+/// sent_and_shared::<Semaphore>();
+/// sent_and_shared::<SemaphoreGuard<'static>>();
+/// sent_and_shared::<SemaphoreGuardArc>();
+/// sent_and_shared::<Barrier>();
+/// sent_and_shared::<BarrierWaitResult>();
+///
+/// sent_and_shared::<OnceCell<u8>>();
+/// sent::<OnceCell<Cell<u8>>>();
+///
+/// let mutex = Arc::new(Mutex::new(Cell::new(0u8)));
+/// let rwlock = Arc::new(RwLock::new(0u8));
 /// sent_future(mutex.lock());
 /// sent_future(rwlock.read());
 /// sent_future(rwlock.write());
+/// sent_future(mutex.lock_arc());
+/// sent_future(rwlock.read_arc());
+/// sent_future(rwlock.write_arc());
+///
+/// let semaphore = Arc::new(Semaphore::new(1));
+/// sent_future(semaphore.acquire());
+/// sent_future(semaphore.acquire_arc());
+///
+/// let barrier = Barrier::new(2);
+/// sent_future(barrier.wait());
+///
+/// let cell = OnceCell::<u8>::new();
+/// sent_future(cell.get_or_init(|| async { 1 }));
+/// sent_future(cell.get_or_try_init(|| async { Ok::<u8, ()>(1) }));
+/// sent_future(cell.set(1));
+/// sent_future(cell.wait());
 /// ```
 #[cfg(all(doctest, feature = "lock"))]
 struct LocksAreAsSendAndSyncAsTheirValues;

@@ -180,8 +180,10 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 * `mpmc`: the [`mpmc`] module, an async multi-producer multi-consumer channel, each of whose
   messages one receiver gets, built on [`Event`]; it implies `event`, and needs no runtime
   either.
-* `lock`: the [`lock`] module, an async `Mutex` and `RwLock`, whose guards a task may hold across
-  an await, built on [`Event`]; it implies `event`, and needs no runtime either.
+* `lock`: the [`lock`] module, an async `Mutex`, `RwLock` and `Semaphore`, whose guards a task may
+  hold across an await, a `Barrier` that tasks wait at for each other, and a `OnceCell` that is set
+  once, by an initialiser that may await, built on [`Event`]; it implies `event`, and needs no
+  runtime either.
 * `unblock`: [`unblock`], which runs a piece of blocking work on a pool of threads kept for it
   and hands back a future of its outcome, and [`Unblock`], an adapter that gives a blocking I/O
   handle, such as a file or the standard input, the async I/O traits of `futures-io` that way; it

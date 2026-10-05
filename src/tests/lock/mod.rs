@@ -1,16 +1,23 @@
-//! Tests of the locks of [`crate::lock`]: [`Mutex`] and [`RwLock`].
+//! Tests of the locks of [`crate::lock`]: [`Mutex`] and [`RwLock`]. Those of
+//! [`Semaphore`](crate::lock::Semaphore) are in the `semaphore` module, and those of the module's
+//! [`Barrier`](crate::lock::Barrier) and [`OnceCell`](crate::lock::OnceCell) in the `barrier` and
+//! `once_cell` modules, which share the helpers at the end of this one.
 //!
 //! Most of these drive the futures of a lock by hand, polling each with a waker that goes nowhere,
 //! so that every test says exactly who a release lets in and who still waits. The mutex comes
 //! first, with who it admits and who it keeps out, how a taker that has waited for long holds
 //! newcomers back and whom it does not hold back, what giving up a wait leaves behind, and what
-//! `try_lock` does. The readers-writer lock follows, with who it admits and who it keeps out, what
-//! a waiting writer does to the readers behind it, what giving up a wait leaves behind, what the
-//! calls that never wait do and do not look at, how a writer that has waited for long holds
-//! newcomer writers back, and how a reader that has waited for long is let in ahead of the writers,
-//! starved or not, and holds every one of them back until it is in. Then come the tests that cover
-//! both locks: that a panic while a guard is held releases it, the smaller conveniences (borrowing
-//! the value, taking it back, making a lock, printing it) and that a lock may be a trait object.
+//! `try_lock` does, then the guards that hold an `Arc` of the mutex: that one goes where a borrow
+//! cannot, and that the calls handing them out admit, keep out and hold back as the borrowing ones
+//! do. The readers-writer lock follows, with who it admits and who it keeps out, what a waiting
+//! writer does to the readers behind it, what giving up a wait leaves behind, what the calls that
+//! never wait do and do not look at, how a writer that has waited for long holds newcomer writers
+//! back, and how a reader that has waited for long is let in ahead of the writers, starved or not,
+//! and holds every one of them back until it is in, then its `Arc` guards, as the mutex's. Then
+//! come the tests that cover both locks: that a panic while a guard is held releases it, the
+//! smaller conveniences (borrowing the value, taking it back, making a lock, printing it), that an
+//! `Arc` guard holds its `Arc`, reaches an unsized value and prints as its value, and that a lock
+//! may be a trait object.
 //!
 //! A task has waited for long once it has waited for `PATIENCE`, so the tests that need one sleep
 //! for that long after its first poll, which is all the time they take.
@@ -32,7 +39,7 @@ use std::{
     pin::{Pin, pin},
     sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -42,6 +49,10 @@ use futures_lite::future::block_on;
 use ntest::timeout;
 
 use crate::lock::{Mutex, MutexGuard, PATIENCE, RwLock, RwLockWriteGuard};
+
+mod barrier;
+mod once_cell;
+mod semaphore;
 
 /// A second taker waits while the first holds the mutex, and is let in once the first lets go.
 #[test]
@@ -213,6 +224,99 @@ fn try_lock_takes_a_free_mutex_and_fails_on_a_held_one() {
     drop(guard);
 
     assert_eq!(*mutex.try_lock().expect("a released mutex is free"), 2);
+}
+
+/// A guard of `lock_arc` holds the mutex through an `Arc` of its own rather than a borrow, so it
+/// outlives the borrow of the `Arc` it was taken through: it goes to another thread, which changes
+/// the value and lets go of the mutex there, and this thread then sees the change.
+#[test]
+fn a_mutex_arc_guard_outlives_its_borrow_and_goes_to_another_thread() {
+    let mutex = Arc::new(Mutex::new(1));
+    let mut guard = ready(mutex.lock_arc());
+    assert!(mutex.try_lock().is_none());
+
+    thread::spawn(move || *guard = 2).join().unwrap();
+
+    assert_eq!(
+        *mutex
+            .try_lock()
+            .expect("the other thread let go of the mutex"),
+        2
+    );
+}
+
+/// `try_lock_arc` fails, without waiting, on a mutex that is held, whether a borrowed guard or an
+/// `Arc` guard holds it, and takes it once that guard is gone; a borrowed `try_lock` fails while
+/// the `Arc` guard holds it in turn.
+#[test]
+fn try_lock_arc_fails_on_a_held_mutex_and_takes_a_free_one() {
+    let mutex = Arc::new(Mutex::new(1));
+
+    let guard = ready(mutex.lock());
+    assert!(mutex.try_lock_arc().is_none());
+    drop(guard);
+
+    let mut guard = mutex.try_lock_arc().expect("a released mutex is free");
+    *guard = 2;
+    assert!(mutex.try_lock_arc().is_none());
+    assert!(mutex.try_lock().is_none());
+    drop(guard);
+
+    assert_eq!(*mutex.try_lock_arc().expect("a released mutex is free"), 2);
+}
+
+/// Dropping an `Arc` guard releases the mutex and wakes a task waiting for it, as dropping a
+/// borrowed guard does: a `lock` and a `lock_arc` that wait while it is held each get in, the
+/// first at its release and the second at the release of the guard the first took.
+#[test]
+fn dropping_a_mutex_arc_guard_lets_a_waiter_in() {
+    let mutex = Arc::new(Mutex::new(()));
+    let guard = ready(mutex.lock_arc());
+    let mut borrowing = Box::pin(mutex.lock());
+    assert!(poll_once(&mut borrowing).is_pending());
+    let mut owning = Box::pin(mutex.lock_arc());
+    assert!(poll_once(&mut owning).is_pending());
+
+    drop(guard);
+    let Poll::Ready(guard) = poll_once(&mut borrowing) else {
+        panic!("the release of the Arc guard lets the first waiter in");
+    };
+    assert!(poll_once(&mut owning).is_pending());
+    drop(guard);
+
+    assert!(poll_once(&mut owning).is_ready());
+}
+
+/// The calls that hand out `Arc` guards are served as the borrowing ones are: a `lock_arc`
+/// newcomer takes a free mutex ahead of a waiter that has not waited for long, and a `lock_arc`
+/// that has waited for long, once it has lost such a race, holds newcomers back, `try_lock_arc`
+/// and a `lock_arc` that has not waited yet alike, until it has had its turn.
+#[test]
+fn a_lock_arc_that_waited_long_holds_newcomers_back() {
+    let mutex = Arc::new(Mutex::new(()));
+    let holder = ready(mutex.lock_arc());
+    let mut waiter = Box::pin(mutex.lock_arc());
+    assert!(poll_once(&mut waiter).is_pending());
+    thread::sleep(PATIENCE);
+    // The release wakes the waiter, which has not run yet when the first newcomer comes.
+    drop(holder);
+    let barging = mutex
+        .try_lock_arc()
+        .expect("a free mutex is taken, whoever waits for it");
+
+    // The waiter finds the mutex taken, having waited for long: it holds newcomers back from now
+    // on.
+    assert!(poll_once(&mut waiter).is_pending());
+    drop(barging);
+    assert!(mutex.try_lock_arc().is_none());
+    let mut newcomer = Box::pin(mutex.lock_arc());
+    assert!(poll_once(&mut newcomer).is_pending());
+
+    let Poll::Ready(guard) = poll_once(&mut waiter) else {
+        panic!("the release of the barging guard lets the starved waiter in");
+    };
+    drop(guard);
+    assert!(poll_once(&mut newcomer).is_ready());
 }
 
 /// Readers share the lock and keep a writer waiting until the last of them is gone; a writer in
@@ -568,6 +672,127 @@ fn a_starved_reader_goes_ahead_of_a_starved_writer() {
     assert!(poll_once(&mut writer).is_ready());
 }
 
+/// Guards of `read_arc` and `write_arc` hold the lock through an `Arc` of their own rather than a
+/// borrow, so they outlive the borrow of the `Arc` they were taken through: a write guard goes to
+/// another thread, which changes the value and lets go of the lock there, and read guards go to
+/// two threads at once, which both see the change.
+#[test]
+fn rwlock_arc_guards_outlive_their_borrow_and_go_to_other_threads() {
+    let lock = Arc::new(RwLock::new(1));
+    let mut writer = ready(lock.write_arc());
+    assert!(lock.try_read().is_none());
+    thread::spawn(move || *writer = 2).join().unwrap();
+
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let reader = ready(lock.read_arc());
+            thread::spawn(move || *reader)
+        })
+        .collect();
+    for reader in readers {
+        assert_eq!(reader.join().unwrap(), 2);
+    }
+
+    assert!(lock.try_write().is_some());
+}
+
+/// `read_arc` guards share the lock, with each other and with borrowed read guards, and keep a
+/// `write_arc` waiting until the last of them is gone; the write guard in turn keeps readers of
+/// either kind out until it lets go, and they then see what it wrote.
+#[test]
+fn read_arc_guards_share_and_a_write_arc_guard_excludes() {
+    let lock = Arc::new(RwLock::new(1));
+    let first = ready(lock.read_arc());
+    let second = ready(lock.read());
+    let third = ready(lock.read_arc());
+    let mut writer = Box::pin(lock.write_arc());
+    assert!(poll_once(&mut writer).is_pending());
+    drop(first);
+    drop(second);
+    assert!(poll_once(&mut writer).is_pending());
+    drop(third);
+    let Poll::Ready(mut guard) = poll_once(&mut writer) else {
+        panic!("the last reader lets the writer in");
+    };
+    *guard = 2;
+
+    let mut owning = Box::pin(lock.read_arc());
+    assert!(poll_once(&mut owning).is_pending());
+    let mut borrowing = Box::pin(lock.read());
+    assert!(poll_once(&mut borrowing).is_pending());
+    drop(guard);
+    let Poll::Ready(owning) = poll_once(&mut owning) else {
+        panic!("the writer's release lets readers in");
+    };
+    let Poll::Ready(borrowing) = poll_once(&mut borrowing) else {
+        panic!("the writer's release lets every reader in");
+    };
+    assert_eq!((*owning, *borrowing), (2, 2));
+}
+
+/// `try_read_arc` and `try_write_arc` each take a lock that is free, and fail, without waiting,
+/// wherever `try_read` and `try_write` would: readers let other readers in and keep every writer
+/// out, a writer keeps everyone out, and a waiting writer keeps new readers out.
+#[test]
+fn try_read_arc_and_try_write_arc_take_a_free_lock_and_fail_on_a_held_one() {
+    let lock = Arc::new(RwLock::new(1));
+
+    let first = lock.try_read_arc().expect("a new lock is free to read");
+    let second = lock.try_read_arc().expect("readers share the lock");
+    assert!(lock.try_write_arc().is_none());
+    let mut writer = Box::pin(lock.write());
+    assert!(poll_once(&mut writer).is_pending());
+    assert!(lock.try_read_arc().is_none());
+    drop(writer);
+    drop(first);
+    assert!(lock.try_write_arc().is_none());
+    drop(second);
+
+    let mut writer = lock.try_write_arc().expect("the readers are gone");
+    *writer = 2;
+    assert!(lock.try_read_arc().is_none());
+    assert!(lock.try_write_arc().is_none());
+    assert!(lock.try_read().is_none());
+    drop(writer);
+
+    assert_eq!(*lock.try_read_arc().expect("the writer is gone"), 2);
+}
+
+/// A waiting `write_arc` holds new readers back, `read_arc` among them, as a waiting `write` does,
+/// and once it has waited for long and lost a race for the lock, it holds newcomer writers back
+/// too, `try_write_arc` and a `write_arc` that has not waited yet alike, until it has had its turn.
+#[test]
+fn a_write_arc_holds_readers_back_and_once_it_waited_long_newcomer_writers() {
+    let lock = Arc::new(RwLock::new(()));
+    let reader = ready(lock.read_arc());
+    let mut waiter = Box::pin(lock.write_arc());
+    assert!(poll_once(&mut waiter).is_pending());
+    let mut late_reader = Box::pin(lock.read_arc());
+    assert!(poll_once(&mut late_reader).is_pending());
+    assert!(lock.try_read_arc().is_none());
+    // Given up before it has waited for long, so that no reader is let in ahead of the writers.
+    drop(late_reader);
+    thread::sleep(PATIENCE);
+    // The release wakes the waiter, which has not run yet when the first newcomer comes.
+    drop(reader);
+    let barging = lock
+        .try_write_arc()
+        .expect("a free lock is taken, whoever waits for it");
+
+    // The waiter finds the lock taken, having waited for long: it holds newcomers back from now on.
+    assert!(poll_once(&mut waiter).is_pending());
+    drop(barging);
+    assert!(lock.try_write_arc().is_none());
+    let mut newcomer = Box::pin(lock.write_arc());
+    assert!(poll_once(&mut newcomer).is_pending());
+
+    let Poll::Ready(guard) = poll_once(&mut waiter) else {
+        panic!("the release of the barging guard lets the starved writer in");
+    };
+    drop(guard);
+    assert!(poll_once(&mut newcomer).is_ready());
+}
+
 /// A panic while a guard of a mutex is held drops the guard on the way out, which releases the
 /// mutex: nothing poisons it, and the next holder finds the value as the panicking code left it.
 #[test]
@@ -712,6 +937,75 @@ fn a_guard_prints_as_its_value() {
     assert_eq!(format!("{reader:#?}"), "[\n    1,\n    2,\n]");
     drop(reader);
     let writer = ready(lock.write());
+    assert_eq!(format!("{writer:?}"), "[1, 2]");
+    assert_eq!(format!("{writer:#?}"), "[\n    1,\n    2,\n]");
+}
+
+/// An `Arc` guard holds a clone of the `Arc` it was taken through, whichever call made it, and
+/// lets go of that clone as it is dropped: the lock lives on in its guard once every other handle
+/// to it is gone, and the guard still reaches the value.
+#[test]
+fn an_arc_guard_holds_a_clone_of_the_arc_until_dropped() {
+    let mutex = Arc::new(Mutex::new(vec![1]));
+    let guard = ready(mutex.lock_arc());
+    assert_eq!(Arc::strong_count(&mutex), 2);
+    drop(guard);
+    assert_eq!(Arc::strong_count(&mutex), 1);
+    let mut guard = mutex.try_lock_arc().expect("a released mutex is free");
+    assert_eq!(Arc::strong_count(&mutex), 2);
+    drop(mutex);
+    guard.push(2);
+    assert_eq!(*guard, [1, 2]);
+
+    let lock = Arc::new(RwLock::new(vec![1]));
+    let first = ready(lock.read_arc());
+    let second = lock.try_read_arc().expect("readers share the lock");
+    assert_eq!(Arc::strong_count(&lock), 3);
+    drop(first);
+    drop(second);
+    assert_eq!(Arc::strong_count(&lock), 1);
+    let writer = ready(lock.write_arc());
+    assert_eq!(Arc::strong_count(&lock), 2);
+    drop(writer);
+    let mut writer = lock.try_write_arc().expect("the writer is gone");
+    assert_eq!(Arc::strong_count(&lock), 2);
+    drop(lock);
+    writer.push(2);
+    assert_eq!(*writer, [1, 2]);
+}
+
+/// A lock of an unsized value, behind an `Arc`, hands out `Arc` guards of that value: of a slice
+/// for a mutex, and of a trait object for a readers-writer lock.
+#[test]
+fn arc_guards_reach_an_unsized_value() {
+    let mutex: Arc<Mutex<[u8]>> = Arc::new(Mutex::new([1, 2, 3]));
+    ready(mutex.lock_arc())[0] = 4;
+    assert_eq!(
+        *mutex.try_lock_arc().expect("a released mutex is free"),
+        [4, 2, 3]
+    );
+
+    let lock: Arc<RwLock<dyn fmt::Debug + Send + Sync>> = Arc::new(RwLock::new(5u8));
+    assert_eq!(format!("{:?}", &*ready(lock.read_arc())), "5");
+    assert_eq!(format!("{:?}", &*ready(lock.write_arc())), "5");
+}
+
+/// Each `Arc` guard prints as the value it stands for, as a borrowed guard does, with the options
+/// of the format it is printed with passed on to the value.
+#[test]
+fn an_arc_guard_prints_as_its_value() {
+    let mutex = Arc::new(Mutex::new(1));
+    let guard = ready(mutex.lock_arc());
+    assert_eq!(format!("{guard:?}"), "1");
+    assert_eq!(format!("{guard:>3?}"), "  1");
+    drop(guard);
+
+    let lock = Arc::new(RwLock::new(vec![1, 2]));
+    let reader = ready(lock.read_arc());
+    assert_eq!(format!("{reader:?}"), "[1, 2]");
+    assert_eq!(format!("{reader:#?}"), "[\n    1,\n    2,\n]");
+    drop(reader);
+    let writer = ready(lock.write_arc());
     assert_eq!(format!("{writer:?}"), "[1, 2]");
     assert_eq!(format!("{writer:#?}"), "[\n    1,\n    2,\n]");
 }
@@ -1088,6 +1382,22 @@ where
     output
 }
 
+/// Polls `future` once with `waker`.
+fn poll_with<F>(future: &mut F, waker: &Waker) -> Poll<F::Output>
+where
+    F: Future + Unpin,
+{
+    Pin::new(future).poll(&mut Context::from_waker(waker))
+}
+
+/// A waker that counts how often it is woken, and the count.
+fn counting_waker() -> (Arc<AtomicUsize>, Waker) {
+    let woken = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(CountWakes(woken.clone())));
+
+    (woken, waker)
+}
+
 /// A `lock` future of `mutex` that holds newcomers back, on a mutex that is free and whose last
 /// release notified it: the future has waited for long, and then found the mutex taken.
 fn starved_lock(mutex: &Mutex<()>) -> Pin<Box<impl Future<Output = MutexGuard<'_, ()>>>> {
@@ -1227,5 +1537,18 @@ impl Wake for ComeBackThenWake {
         // statement, so whatever the poll took is let go of before the task is woken.
         drop(pin!(self.mutex.lock()).poll(&mut Context::from_waker(Waker::noop())));
         self.task.wake_by_ref();
+    }
+}
+
+/// A waker that counts its wakes.
+struct CountWakes(Arc<AtomicUsize>);
+
+impl Wake for CountWakes {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
