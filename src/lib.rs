@@ -259,6 +259,10 @@ pub type SharedRuntime = Runtime<Shared>;
 /// atomics or locks beyond what a [`Waker`](std::task::Waker) forces. [`Shared`] costs an `Arc`
 /// and a `Mutex` where `Local` costs an `Rc` and a `RefCell`, and only runs `Send` futures, in
 /// return for being usable from, and drivable on, any thread.
+///
+/// Either way, a runtime is driven by one thread at a time, so all of its tasks share one core.
+/// Work that needs more runs on several runtimes, one per thread, as
+/// [Running on several threads](crate#running-on-several-threads) describes.
 #[cfg(feature = "runtime")]
 pub struct Runtime<M = Local>
 where

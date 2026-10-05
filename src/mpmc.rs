@@ -61,6 +61,74 @@
 //! });
 //! ```
 //!
+//! # Spreading work over threads
+//!
+//! A runtime of this crate is driven by one thread at a time, so all of its tasks share one core. A
+//! program whose work needs more runs several runtimes, one per thread, and spreads the work over
+//! them through a channel: each thread waits for the next piece of work on a clone of the same
+//! receiver, so that each piece goes to one thread, whichever takes it first, and a thread that is
+//! busy leaves it to the others. The results come back through a channel of their own.
+//!
+//! ```
+//! # #[cfg(feature = "runtime")]
+//! # {
+//! use std::{num::NonZeroUsize, thread};
+//!
+//! use zruntime::{LocalRuntime, mpmc};
+//!
+//! let (jobs, job_receiver) = mpmc::bounded::<u64>(NonZeroUsize::new(16).unwrap());
+//! let (result_sender, results) = mpmc::unbounded();
+//!
+//! let workers: Vec<_> = (0..4)
+//!     .map(|_| {
+//!         let jobs = job_receiver.clone();
+//!         let results = result_sender.clone();
+//!
+//!         thread::spawn(move || {
+//!             // A runtime of the thread's own, which no other thread drives.
+//!             let runtime = LocalRuntime::new().unwrap();
+//!             runtime.block_on(async {
+//!                 // Ends once the channel is closed and no job is left in it.
+//!                 while let Ok(n) = jobs.recv().await {
+//!                     let sum: u64 = (1..=n).sum();
+//!                     results.send(sum).await.unwrap();
+//!                 }
+//!             });
+//!         })
+//!     })
+//!     .collect();
+//! // From here on, only the workers receive jobs and send results: the loop over the results
+//! // below ends once every sender of them is gone.
+//! drop(job_receiver);
+//! drop(result_sender);
+//!
+//! let runtime = LocalRuntime::new().unwrap();
+//! let total = runtime.block_on(async {
+//!     for n in 1..=100 {
+//!         jobs.send(n).await.unwrap();
+//!     }
+//!     // No more jobs: once the workers have taken the last of them, their loops end.
+//!     drop(jobs);
+//!
+//!     // The results come in whichever order the workers finish their jobs in, and stop coming
+//!     // once every worker has dropped its sender.
+//!     let mut total = 0;
+//!     while let Ok(sum) = results.recv().await {
+//!         total += sum;
+//!     }
+//!     total
+//! });
+//!
+//! for worker in workers {
+//!     worker.join().unwrap();
+//! }
+//! assert_eq!(total, (1..=100u64).map(|n| n * (n + 1) / 2).sum());
+//! # }
+//! ```
+//!
+//! A worker whose jobs wait on I/O rather than keep the CPU busy can spawn a task for each job on
+//! its runtime instead of running them one after the other, so that its jobs wait together.
+//!
 //! # Giving up a wait
 //!
 //! Dropping the future that [`Sender::send`] or [`Receiver::recv`] returned, before it completes,

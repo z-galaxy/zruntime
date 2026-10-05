@@ -146,6 +146,26 @@ arrives while the helper holds the runtime is handed it straight away, so a prog
 thread of the runtime's own. With it, [`spawn`] has a runtime to go on from any thread: where the
 calling thread drives none, the task goes on the one [`SharedRuntime::current`] hands out.
 
+## Running on several threads
+
+A runtime is driven by one thread at a time: the one inside `block_on` on it or, for a runtime
+the `helper` feature hands out, its helper thread while nobody is. All of its tasks share that
+thread, so a task that keeps the CPU busy holds up every other task on the same runtime. Nor can
+two threads drive one runtime together: a second `block_on` on a [`SharedRuntime`] made by
+`SharedRuntime::new` panics while another thread is inside one, and a second one on a runtime from
+[`SharedRuntime::current`] waits for its turn.
+
+Work that needs more than one core runs on several runtimes instead, one per thread, each driven
+by a `block_on` of its own, in parallel with the others. With the `helper` feature, the free
+[`block_on`] already works this way: each thread that calls it drives a runtime of its own. An
+[`mpmc`] channel, behind the non-default feature of that name, spreads the work over the threads:
+each of them waits for the next piece of work on a clone of the same receiver, and each piece goes
+to one of them, whichever is free to take it first, as [the module's example] shows. [`Event`],
+the channels and the locks of this crate all work across runtimes and threads, as they work under
+any executor, so tasks on different runtimes can share them. To put a task on a thread of its
+choosing, a program spawns it on that thread's runtime instead: a [`SharedRuntime`] can be spawned
+on from any thread, as the second example above shows.
+
 ## Sockets
 
 The non-default `tcp`, `udp` and `unix` features add ready-made async sockets, as smol has in
@@ -251,6 +271,8 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html
 [`mpmc`]: https://docs.rs/zruntime/latest/zruntime/mpmc/index.html
+[the module's example]:
+    https://docs.rs/zruntime/latest/zruntime/mpmc/index.html#spreading-work-over-threads
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
 [`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
 [`Unblock`]: https://docs.rs/zruntime/latest/zruntime/struct.Unblock.html
