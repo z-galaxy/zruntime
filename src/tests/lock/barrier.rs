@@ -17,20 +17,18 @@
 //! more slowly.
 
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Wake, Waker},
+    task::Poll,
     thread,
 };
 
 use futures_lite::future::block_on;
 use ntest::timeout;
 
-use super::{handoff, poll_once, ready};
+use super::{counting_waker, handoff, poll_once, poll_with, ready};
 use crate::lock::Barrier;
 
 /// The tasks of a round wait until the last of them has arrived, and are all released by that
@@ -334,33 +332,4 @@ fn a_trip_racing_a_wait_is_not_missed() {
             block_on(barrier.wait());
         },
     );
-}
-
-/// A waker that counts how often it is woken, and the count.
-fn counting_waker() -> (Arc<AtomicUsize>, Waker) {
-    let woken = Arc::new(AtomicUsize::new(0));
-    let waker = Waker::from(Arc::new(CountWakes(woken.clone())));
-
-    (woken, waker)
-}
-
-/// Polls `future` once with `waker`.
-fn poll_with<F>(future: &mut F, waker: &Waker) -> Poll<F::Output>
-where
-    F: Future + Unpin,
-{
-    Pin::new(future).poll(&mut Context::from_waker(waker))
-}
-
-/// A waker that counts its wakes.
-struct CountWakes(Arc<AtomicUsize>);
-
-impl Wake for CountWakes {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
 }

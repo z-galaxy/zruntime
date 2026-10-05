@@ -1,7 +1,7 @@
 //! Tests of the locks of [`crate::lock`]: [`Mutex`] and [`RwLock`]. Those of
 //! [`Semaphore`](crate::lock::Semaphore) are in the `semaphore` module, and those of the module's
-//! [`Barrier`](crate::lock::Barrier) in the `barrier` module, which share the helpers at the end of
-//! this one.
+//! [`Barrier`](crate::lock::Barrier) and [`OnceCell`](crate::lock::OnceCell) in the `barrier` and
+//! `once_cell` modules, which share the helpers at the end of this one.
 //!
 //! Most of these drive the futures of a lock by hand, polling each with a waker that goes nowhere,
 //! so that every test says exactly who a release lets in and who still waits. The mutex comes
@@ -39,7 +39,7 @@ use std::{
     pin::{Pin, pin},
     sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -51,6 +51,7 @@ use ntest::timeout;
 use crate::lock::{Mutex, MutexGuard, PATIENCE, RwLock, RwLockWriteGuard};
 
 mod barrier;
+mod once_cell;
 mod semaphore;
 
 /// A second taker waits while the first holds the mutex, and is let in once the first lets go.
@@ -1381,6 +1382,22 @@ where
     output
 }
 
+/// Polls `future` once with `waker`.
+fn poll_with<F>(future: &mut F, waker: &Waker) -> Poll<F::Output>
+where
+    F: Future + Unpin,
+{
+    Pin::new(future).poll(&mut Context::from_waker(waker))
+}
+
+/// A waker that counts how often it is woken, and the count.
+fn counting_waker() -> (Arc<AtomicUsize>, Waker) {
+    let woken = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(CountWakes(woken.clone())));
+
+    (woken, waker)
+}
+
 /// A `lock` future of `mutex` that holds newcomers back, on a mutex that is free and whose last
 /// release notified it: the future has waited for long, and then found the mutex taken.
 fn starved_lock(mutex: &Mutex<()>) -> Pin<Box<impl Future<Output = MutexGuard<'_, ()>>>> {
@@ -1520,5 +1537,18 @@ impl Wake for ComeBackThenWake {
         // statement, so whatever the poll took is let go of before the task is woken.
         drop(pin!(self.mutex.lock()).poll(&mut Context::from_waker(Waker::noop())));
         self.task.wake_by_ref();
+    }
+}
+
+/// A waker that counts its wakes.
+struct CountWakes(Arc<AtomicUsize>);
+
+impl Wake for CountWakes {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }

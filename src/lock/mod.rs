@@ -1,8 +1,9 @@
 //! Async synchronization whose waits suspend the task rather than block the thread: the locks
-//! [`Mutex`], [`RwLock`] and [`Semaphore`], and a [`Barrier`].
+//! [`Mutex`], [`RwLock`] and [`Semaphore`], a [`Barrier`] and a [`OnceCell`].
 //!
-//! The locks hand out guards that a future can hold across an await, and the [`Barrier`] makes a
-//! number of tasks wait for each other.
+//! The locks hand out guards that a future can hold across an await, the [`Barrier`] makes a
+//! number of tasks wait for each other, and the [`OnceCell`] holds a value that is set once, by an
+//! initialiser that may await, and that tasks can wait for.
 //!
 //! Tasks that share state often have to keep hold of it while they wait for something else: a task
 //! that writes a message to a shared socket holds the socket until all of the message is out,
@@ -19,13 +20,15 @@
 //! connection or have a request in flight. It keeps no value, and its guards stand for the permits
 //! it hands out.
 //!
-//! The locks and the barrier are built on [`Event`](crate::Event) and need no runtime. They work
-//! under any executor, and from any thread, inside a task or outside of one: a thread with no task
-//! to run can wait for a lock with the `block_on` of any executor. A future that waits for a lock,
-//! or that holds a guard across an await, may move between threads as long as the lock may be
-//! shared between them, which takes a value that is `Send` for a [`Mutex`], and `Send` and `Sync`
-//! for an [`RwLock`]. A [`Semaphore`], which keeps no value, may always be shared. A [`Barrier`]
-//! holds no value either, so the future that waits at one may always move between threads.
+//! The locks, the barrier and the cell are built on [`Event`](crate::Event) and need no runtime.
+//! They work under any executor, and from any thread, inside a task or outside of one: a thread
+//! with no task to run can wait for a lock with the `block_on` of any executor. A future that waits
+//! for a lock, or that holds a guard across an await, may move between threads as long as the lock
+//! may be shared between them, which takes a value that is `Send` for a [`Mutex`], and `Send` and
+//! `Sync` for an [`RwLock`]. A [`Semaphore`], which keeps no value, may always be shared. A
+//! [`Barrier`] holds no value either, so the future that waits at one may always move between
+//! threads, and the futures of a [`OnceCell`] may where the cell may be shared, which takes a value
+//! that is `Send` and `Sync`, and where the initialiser they run may move as well.
 //!
 //! Each lock hands out guards of two kinds. [`Mutex::lock`], [`RwLock::read`] and [`RwLock::write`]
 //! hand out a guard that borrows the lock, which suits a guard held within one scope or one async
@@ -71,7 +74,9 @@
 //! finds the value as the panicking code left it, which can be half-way through an update. A
 //! [`Semaphore`] keeps no value: a guard dropped as a panic unwinds just gives its permit back. A
 //! [`Barrier`] has no guard, and a task that panics instead of arriving at one leaves the others
-//! waiting for it, as it does with [`std::sync::Barrier`].
+//! waiting for it, as it does with [`std::sync::Barrier`]. Nor does a [`OnceCell`] poison: an
+//! initialiser that panics leaves the cell empty, and the next one to ask for the value runs its
+//! own.
 //!
 //! # Fairness
 //!
@@ -111,6 +116,9 @@
 //! long it has waited, and holds newcomers back the first time it is woken only to find the lock
 //! taken.
 //!
+//! The tasks that initialise a [`OnceCell`] take their turns in the order a [`Mutex`] serves its
+//! waiters.
+//!
 //! # Write preference
 //!
 //! An [`RwLock`] prefers writers: while a writer waits for it, new readers wait too. A task that
@@ -130,9 +138,16 @@
 //! then: the barrier again needs the arrival to release the tasks that wait at it, and nobody is
 //! released early. A round that was completed before the drop does not count the dropped task
 //! towards the next one.
+//!
+//! Dropping the future that [`OnceCell::get_or_init`], [`OnceCell::get_or_try_init`] or
+//! [`OnceCell::set`] returned, before it completes, gives up the call. Where it was the
+//! initialiser, the future it was running is dropped with it, the cell stays empty, and the next
+//! task waiting to initialise the cell runs its own initialiser. Dropping the future of
+//! [`OnceCell::wait`] gives up the wait, and affects no one else.
 
 mod barrier;
 mod mutex;
+mod once_cell;
 mod rwlock;
 mod semaphore;
 
@@ -141,6 +156,7 @@ use std::time::{Duration, Instant};
 
 pub use barrier::{Barrier, BarrierWaitResult};
 pub use mutex::{Mutex, MutexGuard, MutexGuardArc};
+pub use once_cell::OnceCell;
 pub use rwlock::{
     RwLock, RwLockReadGuard, RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc,
 };

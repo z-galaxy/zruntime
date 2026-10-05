@@ -493,6 +493,38 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// shared::<zruntime::lock::RwLockWriteGuardArc<Cell<u8>>>();
 /// ```
 ///
+/// A once cell has its value set by one task, which may be on any thread, and handed by reference
+/// to the tasks on all the others, so it goes to another thread only where its value may be sent,
+/// as a cell of an `Rc`, which cannot be, is not...
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::lock::OnceCell<Rc<u8>>>();
+/// ```
+///
+/// ...and is shared with another only where its value may be shared as well as sent, so a cell of a
+/// `Cell`, which may be sent, is not `Sync`, for the tasks sharing it would share the `&Cell` it
+/// hands out.
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+///
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::lock::OnceCell<Cell<u8>>>();
+/// ```
+///
 /// Where the value's own bounds hold, the locks and their guards are `Send` and `Sync` as far as
 /// the value allows, and the futures that wait for a lock are `Send`: which says the checks above
 /// fail for the reason they were written for and no other. A value that is `Sync` without being
@@ -500,15 +532,17 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// from one that would ask for `T` to be `Send` as well. A semaphore keeps no value, so it and its
 /// guards are `Send` and `Sync`, and so are the futures that wait for a permit. A barrier holds no
 /// value either, so there is nothing for it to ask of one: it and the result of waiting at it are
-/// `Send` and `Sync`, and so is the future that waits at it.
+/// `Send` and `Sync`, and so is the future that waits at it. A once cell is `Send` where its value
+/// is, and `Sync` where its value is `Send` and `Sync`, and its futures, which hand out references
+/// to the value, are `Send` there too, as far as the initialiser they run is.
 ///
 /// ```
 /// use std::{cell::Cell, sync::Arc};
 ///
 /// use zruntime::lock::{
-///     Barrier, BarrierWaitResult, Mutex, MutexGuard, MutexGuardArc, RwLock, RwLockReadGuard,
-///     RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc, Semaphore, SemaphoreGuard,
-///     SemaphoreGuardArc,
+///     Barrier, BarrierWaitResult, Mutex, MutexGuard, MutexGuardArc, OnceCell, RwLock,
+///     RwLockReadGuard, RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc, Semaphore,
+///     SemaphoreGuard, SemaphoreGuardArc,
 /// };
 ///
 /// fn sent<T>()
@@ -561,6 +595,9 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// sent_and_shared::<Barrier>();
 /// sent_and_shared::<BarrierWaitResult>();
 ///
+/// sent_and_shared::<OnceCell<u8>>();
+/// sent::<OnceCell<Cell<u8>>>();
+///
 /// let mutex = Arc::new(Mutex::new(Cell::new(0u8)));
 /// let rwlock = Arc::new(RwLock::new(0u8));
 /// sent_future(mutex.lock());
@@ -576,6 +613,12 @@ struct SharedRuntimeTakesSendFuturesOnly;
 ///
 /// let barrier = Barrier::new(2);
 /// sent_future(barrier.wait());
+///
+/// let cell = OnceCell::<u8>::new();
+/// sent_future(cell.get_or_init(|| async { 1 }));
+/// sent_future(cell.get_or_try_init(|| async { Ok::<u8, ()>(1) }));
+/// sent_future(cell.set(1));
+/// sent_future(cell.wait());
 /// ```
 #[cfg(all(doctest, feature = "lock"))]
 struct LocksAreAsSendAndSyncAsTheirValues;
