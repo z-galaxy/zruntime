@@ -13,7 +13,8 @@
 //! stream, and then what a call that has to wait does: a write waits for room and a read for
 //! bytes, without spinning, and giving up an `accept` loses no connection. After them come the
 //! tests of `incoming`, `peek` and the socket options, of a shared runtime's sockets crossing
-//! threads and serving tasks, and last, of the sockets' `Debug`, descriptors and auto traits.
+//! threads, serving tasks and having several of them wait at once, and last, of the sockets'
+//! `Debug`, descriptors and auto traits.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -25,6 +26,7 @@ use std::{
     io::{self, Read, Write},
     net::Shutdown,
     pin::{Pin, pin},
+    sync::Arc,
     task::Poll,
     thread,
 };
@@ -677,6 +679,138 @@ fn shared_tasks_use_sockets() {
 
         assert_eq!(client.await.unwrap(), b"hello");
         server.await.unwrap();
+    });
+}
+
+/// Several tasks wait in `accept` on one listener at once, and each gets a connection of its own:
+/// none is left waiting for a wake-up that another's wait took.
+///
+/// The accepts run in tasks because a task is polled when it is woken, and only then. The future
+/// that `block_on` polls is polled after every wait, woken or not, which would hide a connection
+/// that woke the wrong task.
+#[test]
+#[timeout(15000)]
+fn several_tasks_accept_from_one_listener() {
+    let runtime = SharedRuntime::new().unwrap();
+    let listener = Arc::new(TcpListener::bind(&runtime, loopback()).unwrap());
+    let address = listener.local_addr().unwrap();
+
+    runtime.block_on(async {
+        let acceptors: Vec<_> = (0..3)
+            .map(|_| {
+                let listener = listener.clone();
+                runtime.spawn("an acceptor", async move {
+                    let (_stream, peer) = listener.accept().await.unwrap();
+
+                    peer
+                })
+            })
+            .collect();
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            clients.push(TcpStream::connect(&runtime, address).await.unwrap());
+        }
+
+        let mut accepted = Vec::new();
+        for acceptor in acceptors {
+            accepted.push(acceptor.await.unwrap());
+        }
+        accepted.sort();
+        let mut made: Vec<_> = clients
+            .iter()
+            .map(|client| client.local_addr().unwrap())
+            .collect();
+        made.sort();
+        assert_eq!(accepted, made);
+    });
+}
+
+/// A task waiting in `accept` and another waiting for the next item of `incoming`, on one listener
+/// at once, each get a connection: neither wait takes the place of the other, so neither is left
+/// waiting for a wake-up that the other's wait took.
+///
+/// The waits run in tasks for the reason given at `several_tasks_accept_from_one_listener`: a task
+/// is polled when it is woken, and only then.
+#[test]
+#[timeout(15000)]
+fn accept_and_incoming_wait_together() {
+    let runtime = SharedRuntime::new().unwrap();
+    let listener = Arc::new(TcpListener::bind(&runtime, loopback()).unwrap());
+    let address = listener.local_addr().unwrap();
+
+    runtime.block_on(async {
+        let acceptor = runtime.spawn("an acceptor", {
+            let listener = listener.clone();
+            async move {
+                let (_stream, peer) = listener.accept().await.unwrap();
+
+                peer
+            }
+        });
+        let streamer = runtime.spawn("an incoming stream", {
+            let listener = listener.clone();
+            async move {
+                let stream = listener
+                    .incoming()
+                    .next()
+                    .await
+                    .expect("the stream never ends")
+                    .unwrap();
+
+                stream.peer_addr().unwrap()
+            }
+        });
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        let first = TcpStream::connect(&runtime, address).await.unwrap();
+        let second = TcpStream::connect(&runtime, address).await.unwrap();
+
+        let mut accepted = [acceptor.await.unwrap(), streamer.await.unwrap()];
+        accepted.sort();
+        let mut made = [first.local_addr().unwrap(), second.local_addr().unwrap()];
+        made.sort();
+        assert_eq!(accepted, made);
+    });
+}
+
+/// Two tasks wait in `peek` on one stream at once, and both see the bytes the peer writes once.
+///
+/// The peeks run in tasks for the reason given at `several_tasks_accept_from_one_listener`: a task
+/// is polled when it is woken, and only then.
+#[test]
+#[timeout(15000)]
+fn several_tasks_peek_at_one_stream() {
+    let runtime = SharedRuntime::new().unwrap();
+
+    runtime.block_on(async {
+        let (mut client, server) = connected(&runtime).await;
+        let server = Arc::new(server);
+
+        let peekers: Vec<_> = (0..2)
+            .map(|_| {
+                let server = server.clone();
+                runtime.spawn("a peeker", async move {
+                    let mut peeked = [0; 16];
+                    let len = server.peek(&mut peeked).await.unwrap();
+
+                    peeked[..len].to_vec()
+                })
+            })
+            .collect();
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        client.write_all(b"peeked").await.unwrap();
+
+        for peeker in peekers {
+            let peeked = peeker.await.unwrap();
+
+            assert!(!peeked.is_empty() && b"peeked".starts_with(&peeked));
+        }
     });
 }
 

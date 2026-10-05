@@ -226,11 +226,10 @@ is behind the `event` feature, which builds without the runtime: see [Features](
   `smol::fs`, with each operation run as blocking work on [`unblock`]'s pool; it implies `unblock`
   and `lock`, and needs no runtime either.
 * `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
-  and brings the `socket2`, `futures-io` and `futures-core` crates.
+  and brings the `socket2` crate.
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
 * `unix`: the [`net`] module's `unix` module, with unix-domain sockets, on unix only; it implies
-  `runtime`, and brings the `socket2`, `futures-io` and `futures-core` crates and `rustix`'s
-  `net` feature.
+  `runtime`, and brings the `socket2` crate and `rustix`'s `net` feature.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,

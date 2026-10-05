@@ -34,11 +34,10 @@ it last, and an event may be notified from any thread.
 * `fs`: the `fs` module, async access to the filesystem, with each operation run as blocking work
   on `unblock`'s pool; it implies `unblock` and `lock`, and needs no runtime.
 * `tcp`: the `net` module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
-  and brings the `socket2`, `futures-io` and `futures-core` crates.
+  and brings the `socket2` crate.
 * `udp`: the `net` module's `UdpSocket`; it implies `runtime`.
 * `unix`: the `net` module's `unix` module, with unix-domain sockets, on unix only; it implies
-  `runtime`, and brings the `socket2`, `futures-io` and `futures-core` crates and `rustix`'s `net`
-  feature.
+  `runtime`, and brings the `socket2` crate and `rustix`'s `net` feature.
 
 `event`, `runtime` and `tracing` are on by default, and `event` and `runtime` each build without
 the other: a crate that only notifies depends on zruntime with

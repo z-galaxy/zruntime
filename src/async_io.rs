@@ -1,8 +1,12 @@
 //! [`Async`]: a non-blocking I/O handle that waits for its readiness on a runtime, and the I/O
 //! traits it implements.
 
+#[cfg(all(unix, any(feature = "tcp", feature = "udp", feature = "unix")))]
+use std::os::fd::AsFd as AsSource;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+#[cfg(all(windows, any(feature = "tcp", feature = "udp")))]
+use std::os::windows::io::AsSocket as AsSource;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::{
@@ -306,6 +310,33 @@ where
         operation: impl FnMut(&T) -> io::Result<R>,
     ) -> Poll<io::Result<R>> {
         self.poll_io(cx, Interest::Writable, operation)
+    }
+
+    /// An `Async` on `runtime` that does its I/O on `io`, as it is: the constructor the sockets of
+    /// the `net` module are built with.
+    ///
+    /// Those sockets are generic over the flavour, and a [`Source<M>`](Source) bound cannot be met
+    /// for an abstract `M`, so this takes what both flavours need of a source instead, `Send` and
+    /// `Sync` included. `io` must be in non-blocking mode already, as for
+    /// [`new_nonblocking`](Async::new_nonblocking).
+    #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
+    pub(crate) fn from_nonblocking(runtime: &Runtime<M>, io: T) -> io::Result<Self>
+    where
+        T: AsSource + Send + Sync + 'static,
+    {
+        let io = M::new_ptr(io);
+        let registration = reactor::register::<M>(&runtime.core, M::source_ptr(io.clone()))?;
+        // Asked for once the source is in the reactor's map, so that a helper starting here takes
+        // it into its very first wait.
+        M::ensure_progress(&runtime.core);
+
+        Ok(Self { registration, io })
+    }
+
+    /// A handle on the runtime the source is registered on.
+    #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+    pub(crate) fn runtime(&self) -> Runtime<M> {
+        self.registration.runtime()
     }
 
     /// Runs `operation` on the source while it is ready for `interest`: see

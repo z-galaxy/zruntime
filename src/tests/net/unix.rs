@@ -14,8 +14,8 @@
 //! sharing a stream and what a call that has to wait does: a write waits for room and a read for
 //! bytes, without spinning, and giving up an `accept` loses no connection. After the tests of
 //! `incoming` come those of the datagram sockets, a `send_to` that finds the receiver's queue full
-//! among them, of a shared runtime's sockets crossing threads and serving tasks, and last, of the
-//! sockets' `Debug`, descriptors and auto traits.
+//! among them, of a shared runtime's sockets crossing threads, serving tasks and having several of
+//! them wait at once, and last, of the sockets' `Debug`, descriptors and auto traits.
 
 use std::{
     cell::Cell,
@@ -25,7 +25,10 @@ use std::{
     os::fd::AsRawFd,
     path::PathBuf,
     pin::{Pin, pin},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::Poll,
     thread,
 };
@@ -1018,6 +1021,148 @@ fn shared_tasks_use_sockets() {
 
         assert_eq!(client.await.unwrap(), b"hello");
         server.await.unwrap();
+    });
+}
+
+/// Several tasks wait in `accept` on one listener at once, and each gets a connection of its own:
+/// none is left waiting for a wake-up that another's wait took.
+///
+/// Each client sends a byte of its own once connected, which what each accepted stream reads tells
+/// the connections apart by. The accepts run in tasks because a task is polled when it is woken,
+/// and only then. The future that `block_on` polls is polled after every wait, woken or not, which
+/// would hide a connection that woke the wrong task.
+#[test]
+#[timeout(15000)]
+fn several_tasks_accept_from_one_listener() {
+    let runtime = SharedRuntime::new().unwrap();
+    let directory = Directory::new("accepts");
+    let path = directory.socket("listener");
+    let listener = Arc::new(UnixListener::bind(&runtime, &path).unwrap());
+
+    runtime.block_on(async {
+        let acceptors: Vec<_> = (0..3)
+            .map(|_| {
+                let listener = listener.clone();
+                runtime.spawn("an acceptor", async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+
+                    stream
+                })
+            })
+            .collect();
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        let mut clients = Vec::new();
+        for id in 0..3u8 {
+            let mut client = UnixStream::connect(&runtime, &path).await.unwrap();
+            client.write_all(&[id]).await.unwrap();
+            clients.push(client);
+        }
+
+        let mut ids = Vec::new();
+        for acceptor in acceptors {
+            let mut stream = acceptor.await.unwrap();
+            let mut id = [0];
+            stream.read_exact(&mut id).await.unwrap();
+            ids.push(id[0]);
+        }
+        ids.sort();
+        assert_eq!(ids, [0, 1, 2]);
+    });
+}
+
+/// A task waiting in `accept` and another waiting for the next item of `incoming`, on one listener
+/// at once, each get a connection: neither wait takes the place of the other, so neither is left
+/// waiting for a wake-up that the other's wait took.
+///
+/// The waits run in tasks for the reason given at `several_tasks_accept_from_one_listener`: a task
+/// is polled when it is woken, and only then.
+#[test]
+#[timeout(15000)]
+fn accept_and_incoming_wait_together() {
+    let runtime = SharedRuntime::new().unwrap();
+    let directory = Directory::new("together");
+    let path = directory.socket("listener");
+    let listener = Arc::new(UnixListener::bind(&runtime, &path).unwrap());
+
+    runtime.block_on(async {
+        let acceptor = runtime.spawn("an acceptor", {
+            let listener = listener.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+
+                stream
+            }
+        });
+        let streamer = runtime.spawn("an incoming stream", {
+            let listener = listener.clone();
+            async move {
+                listener
+                    .incoming()
+                    .next()
+                    .await
+                    .expect("the stream never ends")
+                    .unwrap()
+            }
+        });
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        let mut clients = Vec::new();
+        for id in 0..2u8 {
+            let mut client = UnixStream::connect(&runtime, &path).await.unwrap();
+            client.write_all(&[id]).await.unwrap();
+            clients.push(client);
+        }
+
+        let mut ids = Vec::new();
+        for mut stream in [acceptor.await.unwrap(), streamer.await.unwrap()] {
+            let mut id = [0];
+            stream.read_exact(&mut id).await.unwrap();
+            ids.push(id[0]);
+        }
+        ids.sort();
+        assert_eq!(ids, [0, 1]);
+    });
+}
+
+/// Two tasks wait in `recv_from` on one datagram socket at once, and each gets one of the two
+/// datagrams that are sent: none is left waiting for a wake-up that another's wait took.
+///
+/// The receives run in tasks for the reason given at `several_tasks_accept_from_one_listener`: a
+/// task is polled when it is woken, and only then.
+#[test]
+#[timeout(15000)]
+fn several_tasks_receive_on_one_datagram_socket() {
+    let runtime = SharedRuntime::new().unwrap();
+    let (client, server) = UnixDatagram::pair(&runtime).unwrap();
+    let server = Arc::new(server);
+
+    runtime.block_on(async {
+        let receivers: Vec<_> = (0..2)
+            .map(|_| {
+                let server = server.clone();
+                runtime.spawn("a receiver", async move {
+                    let mut buffer = [0; 16];
+                    let (len, _) = server.recv_from(&mut buffer).await.unwrap();
+
+                    buffer[..len].to_vec()
+                })
+            })
+            .collect();
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        client.send(b"first").await.unwrap();
+        client.send(b"second").await.unwrap();
+
+        let mut received = Vec::new();
+        for receiver in receivers {
+            received.push(receiver.await.unwrap());
+        }
+        received.sort();
+        assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
     });
 }
 

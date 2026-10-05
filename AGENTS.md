@@ -62,16 +62,16 @@ gives `zruntime::fs`: async access to the filesystem in the shape of `std::fs`, 
 `smol::fs` (the async-fs crate), with each operation run as blocking work through `unblock`, and a
 `File` built on `Unblock`. It needs no runtime and works under any executor.
 
-A non-default `tcp` feature, which implies `runtime` and adds `socket2`, `futures-io` and
-`futures-core` dependencies, gives the `zruntime::net` module's TCP sockets, `TcpListener` and
-`TcpStream`, as smol has in `smol::net`. They run on a `Runtime` of either flavour, connect
-without blocking the thread, take socket addresses rather than host names, and implement
-`futures-io`'s `AsyncRead` and `AsyncWrite`. Their non-blocking connect is carried over from zbus,
-whose own socket layer stays there: it drives its sockets through whichever runtime a connection
-runs on. A non-default `udp` feature, which implies `runtime` and adds no dependency, gives the
-module's `UdpSocket`, likewise. A non-default `unix` feature, which implies `runtime` and adds the
-same dependencies as `tcp` and `rustix`'s `net` feature, gives the `zruntime::net::unix` module's
-`UnixListener`, `UnixStream` and `UnixDatagram`, on unix only: on Windows it builds nothing.
+A non-default `tcp` feature, which implies `runtime` and adds the `socket2` dependency, gives the
+`zruntime::net` module's TCP sockets, `TcpListener` and `TcpStream`, as smol has in `smol::net`.
+They run on a `Runtime` of either flavour, connect without blocking the thread, take socket
+addresses rather than host names, and implement `futures-io`'s `AsyncRead` and `AsyncWrite`. Their
+non-blocking connect is carried over from zbus, whose own socket layer stays there: it drives its
+sockets through whichever runtime a connection runs on. A non-default `udp` feature, which implies
+`runtime` and adds no dependency, gives the module's `UdpSocket`, likewise. A non-default `unix`
+feature, which implies `runtime` and adds the `socket2` dependency and `rustix`'s `net` feature,
+gives the `zruntime::net::unix` module's `UnixListener`, `UnixStream` and `UnixDatagram`, on unix
+only: on Windows it builds nothing.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -186,9 +186,9 @@ src/
 │                 # with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
-├── net/          # [tcp, udp, unix features] Async sockets: io.rs, `Io<T, M>`, a socket and its
-│                 # registration, which every socket is built on; connect.rs, the non-blocking
-│                 # connect; tcp.rs; udp.rs; unix.rs, the `net::unix` module (unix only)
+├── net/          # [tcp, udp, unix features] Async sockets, each built on `Async<T, M>`:
+│                 # connect.rs, the non-blocking connect; tcp.rs; udp.rs; unix.rs, the
+│                 # `net::unix` module (unix only)
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
@@ -285,12 +285,16 @@ that fallback brings into being inside the free `block_on` is held by that call 
 (`HELD`) that, like the records, has no destructor. Both name the task by `Location::caller()`
 through `scheduler::Name`, which never allocates.
 
-**Sockets (the `net` features)**: every socket is an `Io<T, M>`: the std socket, non-blocking, in
-the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
-`Mode::source_ptr`, and the `Registration` its I/O waits on. A registration keeps one waker per
-direction, so a socket serves one waiting reader and one waiting writer at a time; a stream
-implements `futures-io`'s traits for `&Stream` as well, which is how a reader and a writer share
-it. No socket is `Clone`.
+**Sockets (the `net` features)**: every socket is an `Async<T, M>`: the std socket, non-blocking,
+in the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
+`Mode::source_ptr`, and the `Registration` its I/O waits on, made by the crate-private
+`Async::from_nonblocking`. The async methods (`accept`, `peek`, `recv`, `send` and the like) wait
+through `read_with` and `write_with`, which wait on `Registration::ready`, so any number of tasks
+wait in them at once. The poll-based traits and the `Incoming` streams go through `poll_read_with`
+and `poll_write_with` instead, and so through `Registration::poll_io`, which keeps one waker per
+direction: a socket serves one waiting reader and one waiting writer at a time through them, and
+neither kind of wait takes the place of the other. A stream implements `futures-io`'s traits for
+`&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`.
 
 ## Development Guidelines
 
@@ -338,6 +342,4 @@ it. No socket is `Clone`.
 - `src/fs/`: [fs feature] Async filesystem access: the free functions (`mod.rs`), `File` on
   `Unblock` (`file.rs`), `ReadDir`/`DirEntry`/`DirBuilder` (`dir.rs`), `OpenOptions`
   (`options.rs`), and the platform extension traits (`unix.rs`, `windows.rs`)
-- `src/net/io.rs`: [tcp, udp, unix features] `Io<T, M>`, the socket and registration every
-  socket is built on
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one
