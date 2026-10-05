@@ -17,6 +17,13 @@
 //! between them, which takes a value that is `Send` for a [`Mutex`], and `Send` and `Sync` for an
 //! [`RwLock`].
 //!
+//! Each lock hands out guards of two kinds. [`Mutex::lock`], [`RwLock::read`] and [`RwLock::write`]
+//! hand out a guard that borrows the lock, which suits a guard held within one scope or one async
+//! block. [`Mutex::lock_arc`], [`RwLock::read_arc`] and [`RwLock::write_arc`], called on an `Arc`
+//! of the lock, hand out one that holds a clone of that `Arc` instead, and so is not tied to a
+//! borrow: it can be kept in a struct, or moved into a spawned task, with nothing to borrow the
+//! lock from. The two wait, and treat the other tasks waiting for the lock, in just the same way.
+//!
 //! # Example
 //!
 //! A counter that a task on another thread bumps, with its guard held across an await. A guard of a
@@ -60,7 +67,8 @@
 //! task that is woken and finds the lock taken again goes back to waiting, behind the tasks that
 //! began to wait after it did. Under steady contention, this lets the task that is running take a
 //! lock as it is released, rather than leave it free until a waiting task has been woken and has
-//! run, which keeps a contended lock busy.
+//! run, which keeps a contended lock busy. The calls that hand out a guard holding an `Arc` of the
+//! lock, such as [`Mutex::lock_arc`], are served in just the same way as those that borrow it.
 //!
 //! How long newcomers can keep a task waiting this way is bounded. A task that has waited for a
 //! lock for a while, and is woken only to find it taken again, starts holding newcomers back, for
@@ -91,7 +99,8 @@
 //!
 //! Dropping the future that [`Mutex::lock`], [`RwLock::read`] or [`RwLock::write`] returned, before
 //! it completes, is fine: a timeout may do it, or a `select` that goes another way. The wait is
-//! given up, the lock is not taken, and no other task waiting for it is left stranded.
+//! given up, the lock is not taken, and no other task waiting for it is left stranded. The same
+//! goes for the futures of [`Mutex::lock_arc`], [`RwLock::read_arc`] and [`RwLock::write_arc`].
 
 mod mutex;
 mod rwlock;
@@ -99,8 +108,10 @@ mod rwlock;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::time::{Duration, Instant};
 
-pub use mutex::{Mutex, MutexGuard};
-pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use mutex::{Mutex, MutexGuard, MutexGuardArc};
+pub use rwlock::{
+    RwLock, RwLockReadGuard, RwLockReadGuardArc, RwLockWriteGuard, RwLockWriteGuardArc,
+};
 
 /// When a `lock`, `read` or `write` call began to wait, so that it can tell once it has waited for
 /// long enough to hold newcomers back.

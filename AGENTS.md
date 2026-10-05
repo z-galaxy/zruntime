@@ -40,7 +40,9 @@ executor.
 
 A non-default `lock` feature, which implies `event` and adds no dependency, gives `zruntime::lock`:
 an async `Mutex` and `RwLock` whose guards may be held across an await, moved here from zbus. They
-are built on `Event`, need no runtime and work under any executor.
+are built on `Event`, need no runtime and work under any executor. Each hands out guards that
+borrow it and, through `lock_arc`, `read_arc` and `write_arc` on an `Arc` of it, guards that hold a
+clone of that `Arc` instead, to be kept in a struct or moved into a spawned task.
 
 A non-default `unblock` feature, which adds `futures-io` and `futures-core` dependencies, gives
 `zruntime::unblock`: a piece of blocking work run on a pool of threads kept for it, out of the way
@@ -288,7 +290,8 @@ it. No socket is `Clone`.
 - `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
-- `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`
+- `src/lock/`: [lock feature] `Mutex` and `RwLock`, the async locks built on `Event`, with guards
+  that borrow the lock and guards that hold an `Arc` of it
 - `src/unblock/`: [unblock feature] `unblock`, blocking work on a pool of threads (`pool.rs`), and
   `Unblock`, the async adapter of a blocking I/O handle built on it (`io.rs`)
 - `src/fs/`: [fs feature] Async filesystem access: the free functions (`mod.rs`), `File` on
