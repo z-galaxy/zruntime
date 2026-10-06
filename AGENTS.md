@@ -8,8 +8,9 @@ more — follow the guidelines in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Project Overview
 
 zruntime is a simple, single-threaded Rust async runtime: an owned `Runtime<M: Mode = Local>`, a
-scheduler that holds tasks and hands them out to be polled, a `poll(2)`/`select` reactor that
-watches registered I/O sources and keeps timers, and `Runtime::block_on` to drive a future to
+scheduler that holds tasks and hands them out to be polled, a reactor that watches registered I/O
+sources (on epoll, kqueue, `select` or `poll(2)`, whichever the platform waits best on) and keeps
+timers, and `Runtime::block_on` to drive a future to
 completion on the calling thread. It comes in two flavours: `Local` (the default, aliased
 `LocalRuntime`), which stays on the thread it was made on and holds its state in `Rc`/`RefCell`,
 and `Shared` (aliased `SharedRuntime`), which may be reached from and driven on any thread and
@@ -193,7 +194,10 @@ src/
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
 ├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, Timeout and Interval
-├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
+├── poll/         # [runtime feature] The OS pollers: epoll.rs (Linux, Android), kqueue.rs (the
+│                 # BSDs), select.rs (Apple), generic.rs (poll(2), any other unix), windows.rs
+│                 # (Winsock's select); list.rs, the list the last three keep; pipe.rs, the
+│                 # channel that breaks a unix wait
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
 │                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime

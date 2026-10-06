@@ -145,7 +145,11 @@ impl Poller {
                     writable: writable.binary_search(&descriptor).is_ok(),
                 };
 
-                (!directions.is_empty()).then_some(Ready { key, directions })
+                (!directions.is_empty()).then_some(Ready {
+                    key,
+                    directions,
+                    dropped: Directions::NONE,
+                })
             })
             .collect())
     }

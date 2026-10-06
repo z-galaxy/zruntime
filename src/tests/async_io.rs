@@ -993,6 +993,35 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A wait for room in a pipe whose reader closed completes, and so does the next one, made at
+    /// once after it. FreeBSD lets go of the pipe's write filter as it reports the first, and then
+    /// refuses to watch the pipe (`EPIPE`), which is what the second ends with there; anywhere
+    /// else the pipe is reported ready again.
+    #[cfg(unix)]
+    fn a_pipe_whose_reader_closed_is_waited_on_twice<M>() {
+        use std::pin::pin;
+
+        use futures_lite::future::poll_once;
+
+        let runtime = Runtime::<M>::new().unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let writer = Async::new(&runtime, writer).unwrap();
+
+        runtime.block_on(async {
+            let mut writable = pin!(writer.writable());
+            // The first poll has the runtime watch the pipe for room while the reader is open.
+            assert!(poll_once(writable.as_mut()).await.is_none());
+            drop(reader);
+            writable.await.unwrap();
+
+            if let Err(refused) = writer.writable().await {
+                assert_eq!(refused.kind(), io::ErrorKind::BrokenPipe);
+            }
+        });
+    }
+}
+
+in_both_modes! {
     /// A unix-domain socket pair is a pair of handles, each end reading and writing through the
     /// traits.
     #[cfg(unix)]

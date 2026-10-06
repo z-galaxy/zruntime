@@ -127,6 +127,10 @@ where
                 if event.directions.writable {
                     state.wakers.writable.take_into(&mut woken);
                 }
+                // A direction the poller let go of by itself is watched no more: the next waiter
+                // in it has the poller watch it again.
+                state.armed.readable &= !event.dropped.readable;
+                state.armed.writable &= !event.dropped.writable;
                 // Watched still in what it was found ready in, which nobody may wait in any
                 // more: looked at again before the next wait.
                 state.mark_stale(event.key, stale);
@@ -827,8 +831,9 @@ where
     /// The descriptor the source lent when it was registered, which is what a wait watches.
     descriptor: RawSource,
     wakers: Wakers,
-    /// The directions the poller was last told to watch the source in: every direction somebody
-    /// waits in, and maybe more, until the source is next looked at.
+    /// The directions the poller watches the source in, as it was last told to, less any it
+    /// reported it let go of by itself: every direction somebody waits in, and maybe more, until
+    /// the source is next looked at.
     armed: Directions,
     /// Whether the source's key is in [`Sources::stale`].
     stale: bool,

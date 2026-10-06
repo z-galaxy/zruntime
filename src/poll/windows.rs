@@ -193,7 +193,11 @@ impl Poller {
                     writable: holds(&writable, socket) || is_excepted,
                 };
 
-                (!directions.is_empty()).then_some(Ready { key, directions })
+                (!directions.is_empty()).then_some(Ready {
+                    key,
+                    directions,
+                    dropped: Directions::NONE,
+                })
             })
             .collect())
     }

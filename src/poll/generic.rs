@@ -115,7 +115,11 @@ impl Poller {
                     writable: revents.contains(PollFlags::OUT) || hung_up,
                 };
 
-                (!directions.is_empty()).then_some(Ready { key, directions })
+                (!directions.is_empty()).then_some(Ready {
+                    key,
+                    directions,
+                    dropped: Directions::NONE,
+                })
             })
             .collect())
     }

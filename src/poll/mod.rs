@@ -17,13 +17,28 @@
 //! waits that start after it, and a descriptor a wait under way copied has to stay open until that
 //! wait returns.
 
-// Which poller a platform waits on: epoll on Linux and Android, `select(2)` on Apple's platforms,
-// where `poll(2)` cannot watch a terminal, `poll(2)` on any other unix and Winsock's `select` on
-// Windows.
+// Which poller a platform waits on: epoll on Linux and Android, kqueue on the BSDs, `select(2)` on
+// Apple's platforms, where neither `poll(2)` nor kqueue can watch a terminal, `poll(2)` on any
+// other unix and Winsock's `select` on Windows.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod epoll;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) use epoll::Poller;
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+mod kqueue;
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+pub(super) use kqueue::Poller;
 
 #[cfg(target_vendor = "apple")]
 mod select;
@@ -32,12 +47,28 @@ pub(super) use select::Poller;
 
 #[cfg(all(
     unix,
-    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_vendor = "apple",
+    )),
 ))]
 mod generic;
 #[cfg(all(
     unix,
-    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_vendor = "apple",
+    )),
 ))]
 pub(super) use generic::Poller;
 
@@ -47,7 +78,14 @@ mod windows;
 pub(super) use windows::Poller;
 
 // The list that `poll(2)` and both `select`s keep of what they watch.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
 mod list;
 // The channel that breaks the wait of every unix poller.
 #[cfg(unix)]
@@ -73,10 +111,15 @@ impl Directions {
     }
 }
 
-/// A source a wait found ready, and the directions it was found ready in.
+/// A source a wait found ready, the directions it was found ready in, and those of them it is no
+/// longer watched in.
 pub(super) struct Ready {
     pub(super) key: usize,
     pub(super) directions: Directions,
+    /// The directions the poller stopped watching the source in as it reported them, which it
+    /// has to be told to watch again: kqueue lets go of a filter that the kernel drops, as
+    /// FreeBSD does the write filter of a pipe whose reader closed.
+    pub(super) dropped: Directions,
 }
 
 /// The descriptor of a source, as the platform's wait takes it: a file descriptor on unix, and a

@@ -205,7 +205,11 @@ impl Poller {
             if !directions.is_empty() {
                 // The key `modify` added the source under, which came from a `usize`.
                 let key = data.u64() as usize;
-                ready.push(Ready { key, directions });
+                ready.push(Ready {
+                    key,
+                    directions,
+                    dropped: Directions::NONE,
+                });
             }
         }
 
