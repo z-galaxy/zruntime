@@ -11,12 +11,11 @@
 //!
 //! The sockets run on a runtime, as the sockets of the [parent module](super) do, and what its
 //! documentation says of those holds for these: which threads drive a socket's operations, how a
-//! socket's type carries the flavour of its runtime, and that two tasks must not wait in the same
-//! direction on one socket at once.
+//! socket's type carries the flavour of its runtime, and how many tasks may wait on one socket at
+//! once.
 
 use std::{
     fmt,
-    future::poll_fn,
     io::{self, Read},
     net::Shutdown,
     os::{
@@ -33,11 +32,8 @@ use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
 use socket2::SockAddr;
 
-use super::{
-    connect,
-    io::{Io, set_nosigpipe},
-};
-use crate::{Local, Mode, Runtime};
+use super::{connect, set_nosigpipe};
+use crate::{Async, Local, Mode, Runtime};
 
 /// A unix-domain socket server, listening for connections.
 ///
@@ -56,10 +52,10 @@ use crate::{Local, Mode, Runtime};
 /// built on a [`SharedRuntime`](crate::SharedRuntime) is a `UnixListener<Shared>`, which may be
 /// sent to, and used from, any thread.
 ///
-/// At most one task at a time may wait for a connection, through
-/// [`accept`](UnixListener::accept) or [`incoming`](UnixListener::incoming), counting every
-/// reference to the listener: where a second task waits as well, the one that waited first may
-/// never be woken. Tasks that accept from one listener take turns, behind a lock of their own.
+/// Any number of tasks may wait for a connection through [`accept`](UnixListener::accept) at once,
+/// each through a reference to the listener, and each connection goes to one of them. Waiting for
+/// the next item of an [`Incoming`] stream is not like that: at most one task at a time may do it,
+/// counting every stream of the listener, and the tasks in `accept` do not count against it.
 ///
 /// # Example
 ///
@@ -102,7 +98,7 @@ pub struct UnixListener<M = Local>
 where
     M: Mode,
 {
-    io: Io<std::os::unix::net::UnixListener, M>,
+    io: Async<std::os::unix::net::UnixListener, M>,
 }
 
 impl<M> UnixListener<M>
@@ -147,7 +143,7 @@ where
         set_nosigpipe(&listener)?;
 
         Ok(Self {
-            io: Io::new(runtime, listener)?,
+            io: Async::from_nonblocking(runtime, listener)?,
         })
     }
 
@@ -168,7 +164,9 @@ where
     /// the queue instead, so the error does not repeat, but the connection is lost. A caller that
     /// goes on after an error backs off first, with [`Runtime::sleep`], say.
     pub async fn accept(&self) -> io::Result<(UnixStream<M>, SocketAddr)> {
-        poll_fn(|cx| self.poll_accept(cx)).await
+        let (stream, address) = self.io.read_with(|listener| listener.accept()).await?;
+
+        self.accepted(stream, address)
     }
 
     /// A stream of the connections made to this listener.
@@ -185,8 +183,9 @@ where
     /// but the connection is lost. A caller that goes on after an error backs off first, with
     /// [`Runtime::sleep`], say.
     ///
-    /// Waiting for the next item counts as waiting in `accept`, so one task at a time may do
-    /// either, as [the listener's documentation](UnixListener) says.
+    /// At most one task at a time may wait for the next item, counting every stream this listener
+    /// hands out, and a task waiting in [`accept`](UnixListener::accept) does not count against
+    /// it, as [the stream's documentation](Incoming) says.
     pub fn incoming(&self) -> Incoming<'_, M> {
         Incoming { listener: self }
     }
@@ -256,10 +255,11 @@ where
 /// and stays on the thread it was made on; one built on a [`SharedRuntime`](crate::SharedRuntime)
 /// is a `UnixStream<Shared>`, which may be sent to, and used from, any thread.
 ///
-/// At most one task at a time may wait to read from a stream, and at most one to write to it,
-/// counting every reference to the stream: where a second task waits in the same direction, the
-/// one that waited first may never be woken. Tasks that read, or write, together take turns,
-/// behind a lock of their own.
+/// At most one task at a time may wait to read from a stream through its `AsyncRead`
+/// implementation, and at most one to write to it through its `AsyncWrite` one, counting every
+/// reference to the stream: where a second task waits in the same direction, the one that waited
+/// first may never be woken. Tasks that read, or write, together take turns, behind a lock of their
+/// own.
 ///
 /// # Example
 ///
@@ -301,7 +301,7 @@ pub struct UnixStream<M = Local>
 where
     M: Mode,
 {
-    io: Io<std::os::unix::net::UnixStream, M>,
+    io: Async<std::os::unix::net::UnixStream, M>,
 }
 
 impl<M> UnixStream<M>
@@ -378,7 +378,7 @@ where
         set_nosigpipe(&stream)?;
 
         Ok(Self {
-            io: Io::new(runtime, stream)?,
+            io: Async::from_nonblocking(runtime, stream)?,
         })
     }
 
@@ -538,11 +538,11 @@ where
 /// and stays on the thread it was made on; one built on a [`SharedRuntime`](crate::SharedRuntime)
 /// is a `UnixDatagram<Shared>`, which may be sent to, and used from, any thread.
 ///
-/// At most one task at a time may wait to receive, through [`recv`](UnixDatagram::recv) or
-/// [`recv_from`](UnixDatagram::recv_from), and at most one to send, through
-/// [`send`](UnixDatagram::send) or [`send_to`](UnixDatagram::send_to), counting every reference to
-/// the socket: where a second task waits in the same direction, the one that waited first may
-/// never be woken. Tasks that receive, or send, together take turns, behind a lock of their own.
+/// Any number of tasks may wait to receive at once, through [`recv`](UnixDatagram::recv) or
+/// [`recv_from`](UnixDatagram::recv_from), and any number to send, through
+/// [`send`](UnixDatagram::send) or [`send_to`](UnixDatagram::send_to), each through a reference to
+/// the socket. Each receive takes a datagram of its own, so tasks that receive together get one
+/// each.
 ///
 /// # Example
 ///
@@ -577,7 +577,7 @@ pub struct UnixDatagram<M = Local>
 where
     M: Mode,
 {
-    io: Io<std::os::unix::net::UnixDatagram, M>,
+    io: Async<std::os::unix::net::UnixDatagram, M>,
 }
 
 impl<M> UnixDatagram<M>
@@ -649,7 +649,7 @@ where
         set_nosigpipe(&socket)?;
 
         Ok(Self {
-            io: Io::new(runtime, socket)?,
+            io: Async::from_nonblocking(runtime, socket)?,
         })
     }
 
@@ -682,8 +682,8 @@ where
     /// future, which gives up the send. A [connected](UnixDatagram::connect) socket's
     /// [`send`](UnixDatagram::send) waits for room instead, and sends as soon as there is some.
     ///
-    /// One task at a time may send, through this or [`send`](UnixDatagram::send), as [the socket's
-    /// documentation](UnixDatagram) says.
+    /// Any number of tasks may send at once, through this or [`send`](UnixDatagram::send), as [the
+    /// socket's documentation](UnixDatagram) says.
     pub async fn send_to<P>(&self, buf: &[u8], path: P) -> io::Result<usize>
     where
         P: AsRef<Path>,
@@ -708,8 +708,8 @@ where
     /// datagram, which is unnamed unless that socket is bound to a path. A datagram longer than
     /// `buf` is cut short, and the rest of it is discarded.
     ///
-    /// Waiting to receive counts as waiting to read, so one task at a time may do either this or
-    /// [`recv`](UnixDatagram::recv), as [the socket's documentation](UnixDatagram) says.
+    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
+    /// this or [`recv`](UnixDatagram::recv), as [the socket's documentation](UnixDatagram) says.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.io.read_with(|socket| socket.recv_from(buf)).await
     }
@@ -721,7 +721,7 @@ where
     /// [`connect`](UnixDatagram::connect), or as one of a [pair](UnixDatagram::pair): a send
     /// without a peer to send to fails.
     ///
-    /// Waiting to send counts as waiting to write, so one task at a time may do either this or
+    /// Any number of tasks may wait to send at once, through this or
     /// [`send_to`](UnixDatagram::send_to), as [the socket's documentation](UnixDatagram) says.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         // Not std's `send`: that is a plain `write(2)`, which raises `SIGPIPE` on the BSDs and on
@@ -743,8 +743,9 @@ where
     /// for the address of the sender. A datagram another socket sent before the connect may still
     /// be queued, and is received all the same, without saying which socket sent it.
     ///
-    /// Waiting to receive counts as waiting to read, so one task at a time may do either this or
-    /// [`recv_from`](UnixDatagram::recv_from), as [the socket's documentation](UnixDatagram) says.
+    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
+    /// this or [`recv_from`](UnixDatagram::recv_from), as [the socket's
+    /// documentation](UnixDatagram) says.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|socket| socket.recv(buf)).await
     }
@@ -828,8 +829,11 @@ where
 /// connection it took off the queue instead, so the error does not repeat, but the connection is
 /// lost. A caller that goes on after an error backs off first, with [`Runtime::sleep`], say.
 ///
-/// Waiting for the next item counts as waiting in [`accept`](UnixListener::accept), so one task at
-/// a time may do either, as [the listener's documentation](UnixListener) says.
+/// At most one task at a time may wait for the next item, counting every `Incoming` of the
+/// listener: where a second task waits as well, the one that waited first may never be woken. Tasks
+/// that take items from one listener's streams take turns, behind a lock of their own. Tasks
+/// waiting in [`accept`](UnixListener::accept) do not count against that, nor does it count against
+/// them, as [the listener's documentation](UnixListener) says.
 ///
 /// [`futures-core`]: https://docs.rs/futures-core
 /// [`futures-lite`]: https://docs.rs/futures-lite
@@ -876,11 +880,19 @@ where
     fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(UnixStream<M>, SocketAddr)>> {
         let (stream, address) = ready!(self.io.poll_read_with(cx, |listener| listener.accept()))?;
 
+        Poll::Ready(self.accepted(stream, address))
+    }
+
+    /// The stream of a connection the std listener accepted, on this listener's runtime, with the
+    /// address of its peer.
+    fn accepted(
+        &self,
+        stream: std::os::unix::net::UnixStream,
+        address: SocketAddr,
+    ) -> io::Result<(UnixStream<M>, SocketAddr)> {
         // std's `accept` leaves the accepted socket in blocking mode on Linux, which `from_std`
         // sets right.
-        Poll::Ready(
-            UnixStream::from_std(&self.io.runtime(), stream).map(|stream| (stream, address)),
-        )
+        UnixStream::from_std(&self.io.runtime(), stream).map(|stream| (stream, address))
     }
 }
 

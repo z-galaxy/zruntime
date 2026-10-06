@@ -10,8 +10,7 @@ use std::time::Duration;
 
 use socket2::{Domain, SockAddr, SockRef, Socket, Type};
 
-use super::io::Io;
-use crate::{Mode, Runtime};
+use crate::{Async, Mode, Runtime};
 
 /// [`connect`] for a unix socket, tried again for as long as a full listen backlog turns it away.
 ///
@@ -27,7 +26,7 @@ use crate::{Mode, Runtime};
 pub(super) async fn connect_unix<S, M>(
     runtime: &Runtime<M>,
     address: &SockAddr,
-) -> io::Result<Io<S, M>>
+) -> io::Result<Async<S, M>>
 where
     S: From<Owned> + AsSource + Send + Sync + 'static,
     M: Mode,
@@ -67,7 +66,7 @@ pub(super) async fn connect<S, M>(
     runtime: &Runtime<M>,
     domain: Domain,
     address: &SockAddr,
-) -> io::Result<Io<S, M>>
+) -> io::Result<Async<S, M>>
 where
     S: From<Owned> + AsSource + Send + Sync + 'static,
     M: Mode,
@@ -80,7 +79,7 @@ where
         Err(e) => return Err(e),
     };
 
-    let io = Io::new(runtime, S::from(Owned::from(socket)))?;
+    let io = Async::from_nonblocking(runtime, S::from(Owned::from(socket)))?;
     if under_way {
         io.write_with(|socket| outcome(socket)).await?;
     }

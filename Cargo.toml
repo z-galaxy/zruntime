@@ -21,9 +21,10 @@ targets = [
 
 [features]
 default = ["runtime", "event", "tracing"]
-# The runtime: `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers and I/O registrations;
-# `futures-core` gives an interval timer its `Stream` impl.
-runtime = ["dep:rustix", "dep:windows-sys", "dep:futures-core"]
+# The runtime: `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers, I/O registrations and
+# `Async`, the async counterpart of a non-blocking I/O handle; `futures-core` gives an interval
+# timer its `Stream` impl, and `futures-io` gives `Async` its `AsyncRead` and `AsyncWrite` impls.
+runtime = ["dep:rustix", "dep:windows-sys", "dep:futures-core", "dep:futures-io"]
 # `Event` and `EventListener`, which need no runtime.
 event = []
 # Logs through `tracing`; a build without it emits no log events.
@@ -46,12 +47,12 @@ unblock = ["dep:futures-io", "dep:futures-core"]
 # needs no runtime.
 fs = ["unblock", "lock"]
 # The `net` module's TCP sockets: `TcpListener` and `TcpStream`.
-tcp = ["runtime", "dep:socket2", "dep:futures-io", "dep:futures-core", "rustix?/net"]
+tcp = ["runtime", "dep:socket2", "rustix?/net"]
 # The `net` module's UDP socket: `UdpSocket`.
 udp = ["runtime"]
 # The `net::unix` module's unix-domain sockets, `UnixListener`, `UnixStream` and `UnixDatagram`;
 # unix only.
-unix = ["runtime", "dep:socket2", "dep:futures-io", "dep:futures-core", "rustix?/net"]
+unix = ["runtime", "dep:socket2", "rustix?/net"]
 
 [dependencies]
 futures-core = { version = "0.3.34", default-features = false, optional = true }

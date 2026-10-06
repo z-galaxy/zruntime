@@ -13,8 +13,9 @@ it last, and an event may be notified from any thread.
 
 * `event`, on in this build: [`Event`] and [`EventListener`].
 * `runtime`, off in this build: the runtime itself, `Runtime`, `LocalRuntime` and `SharedRuntime`,
-  with the tasks, timers and I/O registrations built on them, the `rustix` and `windows-sys`
-  crates it polls with, and the `futures-core` crate.
+  with the tasks, timers and I/O registrations built on them, and `Async`, the async handle of any
+  source they can watch, the `rustix` and `windows-sys` crates it polls with, and the
+  `futures-core` and `futures-io` crates.
 * `tracing`: the runtime logs through the `tracing` crate. Without the runtime, it has nothing to
   log.
 * `helper`: per-thread shared runtimes, and the helper thread that keeps their work moving in
@@ -33,11 +34,10 @@ it last, and an event may be notified from any thread.
 * `fs`: the `fs` module, async access to the filesystem, with each operation run as blocking work
   on `unblock`'s pool; it implies `unblock` and `lock`, and needs no runtime.
 * `tcp`: the `net` module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
-  and brings the `socket2`, `futures-io` and `futures-core` crates.
+  and brings the `socket2` crate.
 * `udp`: the `net` module's `UdpSocket`; it implies `runtime`.
 * `unix`: the `net` module's `unix` module, with unix-domain sockets, on unix only; it implies
-  `runtime`, and brings the `socket2`, `futures-io` and `futures-core` crates and `rustix`'s `net`
-  feature.
+  `runtime`, and brings the `socket2` crate and `rustix`'s `net` feature.
 
 `event`, `runtime` and `tracing` are on by default, and `event` and `runtime` each build without
 the other: a crate that only notifies depends on zruntime with

@@ -30,6 +30,7 @@ use std::{
     pin::Pin,
     rc::{self, Rc},
     sync::{self, Arc, Mutex, MutexGuard, PoisonError},
+    thread,
 };
 
 use crate::{runtime::Core, scheduler::TaskWaker};
@@ -66,6 +67,34 @@ impl Mode for Local {}
 pub enum Shared {}
 
 impl Mode for Shared {}
+
+/// A source a runtime of the flavour `M` can watch for readiness, and so what an
+/// [`Async`](crate::Async) built on such a runtime can wrap.
+///
+/// On unix that is anything with a file descriptor (`std::os::fd::AsFd`): a socket, a pipe, a
+/// terminal or an eventfd, say. On Windows it is anything with a socket
+/// (`std::os::windows::io::AsSocket`), the only kind of handle the runtime's `select` can watch
+/// there. A [`Local`] runtime watches such a source of any type. A [`Shared`] runtime watches one
+/// that is [`Send`] and [`Sync`] as well: the thread driving it, whichever that is, holds the
+/// source while it waits.
+///
+/// The runtime asks the source for its descriptor once, as it takes the source under its watch,
+/// and watches that descriptor from then on. A source keeps the descriptor it lends the same, and
+/// open, for as long as it lives, as every type of std's does.
+///
+/// Implemented for every type that qualifies, and by nothing outside this crate.
+pub trait Source<M = Local>: AsSource + 'static + sealed::IntoSource<M>
+where
+    M: Mode,
+{
+}
+
+impl<T, M> Source<M> for T
+where
+    M: Mode,
+    T: AsSource + 'static + sealed::IntoSource<M>,
+{
+}
 
 /// What [`Mode`] carries, out of reach of every crate but this one.
 ///
@@ -112,6 +141,13 @@ pub(crate) mod sealed {
         /// Shares `value`.
         fn new_ptr<T>(value: T) -> Self::Ptr<T>;
 
+        /// The value `ptr` points to, taken back out of it.
+        ///
+        /// Called on what is left of a source's pointer once its registration is gone, so that
+        /// the one other holder there can be is a wait of the reactor that was under way when the
+        /// registration was dropped.
+        fn into_inner<T>(ptr: Self::Ptr<T>) -> T;
+
         /// A pointer to what `ptr` points to, which does not keep it alive.
         fn downgrade<T>(ptr: &Self::Ptr<T>) -> Self::Weak<T>;
 
@@ -119,6 +155,9 @@ pub(crate) mod sealed {
         fn upgrade<T>(weak: &Self::Weak<T>) -> Option<Self::Ptr<T>>;
 
         /// The descriptor, or the socket on Windows, of the source `source` points to.
+        ///
+        /// Asked for once, as the source is registered: a wait watches the descriptor it lent
+        /// then, and asks for nothing, so that it runs no code of the source's.
         ///
         /// A function rather than a bound on [`Sealed::SourcePtr`]: Windows implements
         /// `AsSocket` for an `Rc` or an `Arc` of a sized type only, and a source pointer is one
@@ -172,6 +211,37 @@ pub(crate) mod sealed {
             Self: Mode;
     }
 
+    /// How a source of this type is handed to a runtime of the flavour `M` to watch: what
+    /// [`Source`] carries, out of reach of every crate but this one.
+    ///
+    /// Implemented below for every type a runtime of each flavour can watch, and by nothing
+    /// else, so that the bounds a [`Source`] carries are the ones these impls name.
+    pub trait IntoSource<M>: Sized
+    where
+        M: Mode,
+    {
+        /// A source pointer to what `ptr` points to, sharing it with whoever holds `ptr`.
+        fn source_ptr(ptr: M::Ptr<Self>) -> M::SourcePtr;
+    }
+
+    impl<T> IntoSource<Local> for T
+    where
+        T: AsSource + 'static,
+    {
+        fn source_ptr(ptr: Rc<T>) -> Rc<dyn AsSource> {
+            ptr
+        }
+    }
+
+    impl<T> IntoSource<Shared> for T
+    where
+        T: AsSource + Send + Sync + 'static,
+    {
+        fn source_ptr(ptr: Arc<T>) -> Arc<dyn AsSource + Send + Sync> {
+            ptr
+        }
+    }
+
     /// A lock around a value, taken with no way to fail.
     ///
     /// A [`RefCell`] fails a borrow while another is out, and the runtime's lock discipline —
@@ -208,6 +278,19 @@ pub(crate) mod sealed {
 
         fn new_ptr<T>(value: T) -> Rc<T> {
             Rc::new(value)
+        }
+
+        fn into_inner<T>(ptr: Rc<T>) -> T {
+            // The reactor holds a clone of a source only while a wait runs, and a local runtime's
+            // wait runs on the thread that drives it, never across a call into user code: it lets
+            // go of its clones before it wakes anyone. So no wait is under way where this is
+            // called, and the registration's end left this the only holder.
+            Rc::try_unwrap(ptr).unwrap_or_else(|_| {
+                unreachable!(
+                    "the reactor holds a clone of a source only while a wait runs, and the wait of \
+                     a local runtime runs on this thread, never across a call into user code"
+                )
+            })
         }
 
         fn downgrade<T>(ptr: &Rc<T>) -> rc::Weak<T> {
@@ -266,6 +349,22 @@ pub(crate) mod sealed {
 
         fn new_ptr<T>(value: T) -> Arc<T> {
             Arc::new(value)
+        }
+
+        fn into_inner<T>(mut ptr: Arc<T>) -> T {
+            // Once the registration is gone, the one other holder there can be is a wait of the
+            // reactor, which a thread driving the runtime built while the source was watched, and
+            // which runs on another thread: a wait lets go of its clones of registered sources
+            // before it runs any code of somebody else's, so none of its own is here. The drop of
+            // the registration broke that wait, and it lets go of its clones as soon as it
+            // returns, so this waits for that thread and no longer.
+            loop {
+                match Arc::try_unwrap(ptr) {
+                    Ok(value) => return value,
+                    Err(shared) => ptr = shared,
+                }
+                thread::yield_now();
+            }
         }
 
         fn downgrade<T>(ptr: &Arc<T>) -> sync::Weak<T> {

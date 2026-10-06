@@ -9,8 +9,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use super::io::Io;
-use crate::{Local, Mode, Runtime};
+use crate::{Async, Local, Mode, Runtime};
 
 /// A UDP socket, to send datagrams from and to receive them on.
 ///
@@ -36,12 +35,12 @@ use crate::{Local, Mode, Runtime};
 /// stays on the thread it was made on; one built on a [`SharedRuntime`](crate::SharedRuntime) is a
 /// `UdpSocket<Shared>`, which may be sent to, and used from, any thread.
 ///
-/// At most one task at a time may wait to receive from a socket, through
+/// Any number of tasks may wait to receive from a socket at once, through
 /// [`recv`](UdpSocket::recv), [`recv_from`](UdpSocket::recv_from), [`peek`](UdpSocket::peek) or
-/// [`peek_from`](UdpSocket::peek_from), and at most one to send on it, through
-/// [`send`](UdpSocket::send) or [`send_to`](UdpSocket::send_to), counting every reference to the
-/// socket: where a second task waits in the same direction, the one that waited first may never be
-/// woken. Tasks that receive, or send, together take turns, behind a lock of their own.
+/// [`peek_from`](UdpSocket::peek_from), and any number to send on it, through
+/// [`send`](UdpSocket::send) or [`send_to`](UdpSocket::send_to), each through a reference to the
+/// socket. Each receive takes a datagram of its own, so tasks that receive together get one each,
+/// while a peek leaves the datagram on the socket for the next receive.
 ///
 /// # Example
 ///
@@ -74,7 +73,7 @@ pub struct UdpSocket<M = Local>
 where
     M: Mode,
 {
-    io: Io<std::net::UdpSocket, M>,
+    io: Async<std::net::UdpSocket, M>,
 }
 
 impl<M> UdpSocket<M>
@@ -115,7 +114,7 @@ where
         socket.set_nonblocking(true)?;
 
         Ok(Self {
-            io: Io::new(runtime, socket)?,
+            io: Async::from_nonblocking(runtime, socket)?,
         })
     }
 
@@ -157,8 +156,8 @@ where
     /// the number of bytes sent, which is the length of `buf`: a datagram goes whole or not at all.
     /// The send waits only where the system has no room for the datagram, until it has made some.
     ///
-    /// Waiting to send counts as waiting in [`send`](UdpSocket::send), so one task at a time may do
-    /// either, as [the socket's documentation](UdpSocket) says.
+    /// Any number of tasks may wait to send at once, through this or [`send`](UdpSocket::send), as
+    /// [the socket's documentation](UdpSocket) says.
     pub async fn send_to<A>(&self, buf: &[u8], addr: A) -> io::Result<usize>
     where
         A: Into<SocketAddr>,
@@ -180,9 +179,8 @@ where
     /// Dropping the future before it completes gives up the wait. No datagram is lost with it: one
     /// that arrives meanwhile stays queued for the next receive.
     ///
-    /// Waiting to receive counts as waiting in [`recv`](UdpSocket::recv),
-    /// [`peek`](UdpSocket::peek) and [`peek_from`](UdpSocket::peek_from), so one task at a time
-    /// may do any of them, as [the socket's documentation](UdpSocket) says.
+    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
+    /// this or [`recv`](UdpSocket::recv), as [the socket's documentation](UdpSocket) says.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.io.read_with(|socket| socket.recv_from(buf)).await
     }
@@ -194,8 +192,8 @@ where
     /// `buf`, only as much of it as fits is copied. On Windows the peek fails instead, with the
     /// error Winsock reports for that (`WSAEMSGSIZE`), though the datagram stays queued.
     ///
-    /// Waiting to peek counts as waiting to receive, so one task at a time may do either, as [the
-    /// socket's documentation](UdpSocket) says.
+    /// Any number of tasks may wait to peek at once, through this or [`peek`](UdpSocket::peek), as
+    /// [the socket's documentation](UdpSocket) says.
     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.io.read_with(|socket| socket.peek_from(buf)).await
     }
@@ -207,8 +205,8 @@ where
     /// [`connect`](UdpSocket::connect). The send waits only where the system has no room for the
     /// datagram, until it has made some.
     ///
-    /// Waiting to send counts as waiting in [`send_to`](UdpSocket::send_to), so one task at a time
-    /// may do either, as [the socket's documentation](UdpSocket) says.
+    /// Any number of tasks may wait to send at once, through this or
+    /// [`send_to`](UdpSocket::send_to), as [the socket's documentation](UdpSocket) says.
     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         self.io.write_with(|socket| socket.send(buf)).await
     }
@@ -226,9 +224,9 @@ where
     /// Dropping the future before it completes gives up the wait, and loses no datagram, as it
     /// does for [`recv_from`](UdpSocket::recv_from).
     ///
-    /// Waiting to receive counts as waiting in [`recv_from`](UdpSocket::recv_from),
-    /// [`peek`](UdpSocket::peek) and [`peek_from`](UdpSocket::peek_from), so one task at a time
-    /// may do any of them, as [the socket's documentation](UdpSocket) says.
+    /// Any number of tasks may wait to receive at once, each taking a datagram of its own, through
+    /// this or [`recv_from`](UdpSocket::recv_from), as [the socket's documentation](UdpSocket)
+    /// says.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|socket| socket.recv(buf)).await
     }
@@ -241,8 +239,8 @@ where
     /// Windows the peek fails instead, with the error Winsock reports for that (`WSAEMSGSIZE`),
     /// though the datagram stays queued.
     ///
-    /// Waiting to peek counts as waiting to receive, so one task at a time may do either, as [the
-    /// socket's documentation](UdpSocket) says.
+    /// Any number of tasks may wait to peek at once, through this or
+    /// [`peek_from`](UdpSocket::peek_from), as [the socket's documentation](UdpSocket) says.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|socket| socket.peek(buf)).await
     }

@@ -11,8 +11,8 @@
 //! wait does: it waits for the runtime without blocking the thread or spinning, and giving it up
 //! loses no datagram. After the forms an address may take, and the mode a socket made from std's
 //! is put in, come the tests of the socket options, of a shared runtime's sockets crossing
-//! threads, serving tasks and outliving a task that gave up its receive, and last, of the
-//! sockets' `Debug`, descriptors and auto traits.
+//! threads, serving tasks, outliving a task that gave up its receive and having several tasks
+//! receive at once, and last, of the sockets' `Debug`, descriptors and auto traits.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -484,10 +484,9 @@ fn shared_tasks_use_sockets() {
     });
 }
 
-/// A receive that was given up does not keep the next one from being woken, though the waker of
-/// the first is still where the socket's registration keeps it: the task of the first receive is
-/// cancelled while it waits, and the datagram that comes in must reach the task of the second
-/// receive instead, whose waker takes the first one's place.
+/// A receive that was given up does not keep the next one from being woken: the task of the first
+/// receive is cancelled while it waits, which gives up its wait, and the datagram that comes in
+/// must reach the task of the second receive instead.
 ///
 /// The receives run in tasks because a task is polled when it is woken, and only then. The future
 /// that `block_on` polls is polled after every wait, woken or not, which would hide a datagram
@@ -522,6 +521,47 @@ fn a_receive_is_woken_after_another_task_gave_up_its_own() {
 
         client.send_to(b"kept", server_address).await.unwrap();
         assert_eq!(second.await.unwrap(), b"kept");
+    });
+}
+
+/// Two tasks wait in `recv_from` on one socket at once, and each gets one of the two datagrams that
+/// are sent: none is left waiting for a wake-up that another's wait took.
+///
+/// The receives run in tasks because a task is polled when it is woken, and only then. The future
+/// that `block_on` polls is polled after every wait, woken or not, which would hide a datagram
+/// that woke the wrong task.
+#[test]
+#[timeout(15000)]
+fn several_tasks_receive_on_one_socket() {
+    let runtime = SharedRuntime::new().unwrap();
+    let (client, server) = pair(&runtime);
+    let server_address = server.local_addr().unwrap();
+    let server = Arc::new(server);
+
+    runtime.block_on(async {
+        let receivers: Vec<_> = (0..2)
+            .map(|_| {
+                let server = server.clone();
+                runtime.spawn("a receiver", async move {
+                    let mut buffer = [0; 16];
+                    let (len, _) = server.recv_from(&mut buffer).await.unwrap();
+
+                    buffer[..len].to_vec()
+                })
+            })
+            .collect();
+        // The tasks have begun to wait by the time the sleep is over.
+        runtime.sleep(DELAY).await;
+
+        client.send_to(b"first", server_address).await.unwrap();
+        client.send_to(b"second", server_address).await.unwrap();
+
+        let mut received = Vec::new();
+        for receiver in receivers {
+            received.push(receiver.await.unwrap());
+        }
+        received.sort();
+        assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
     });
 }
 

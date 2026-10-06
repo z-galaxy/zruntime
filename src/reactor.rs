@@ -15,9 +15,10 @@
 //! Two locks guard the sources and the timers, and neither is taken while the other is held. A
 //! source's wakers live in its entry in the map, under the map's lock. Neither lock is held
 //! across the wait, which may last until a deadline, nor across a wake or the drop of a waker or
-//! a source, each of which runs somebody else's code and may come straight back here to register
-//! a source, to ask for a timer or to let either go. The flag that spares a `notify` its write
-//! while a wake-up is on its way needs no lock: it is an atomic of the runtime's remote.
+//! of the last clone of a source, each of which runs somebody else's code and may come straight
+//! back here to register a source, to ask for a timer or to let either go. The flag that spares a
+//! `notify` its write while a wake-up is on its way needs no lock: it is an atomic of the runtime's
+//! remote.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -33,7 +34,7 @@ use std::{
 use crate::{
     Interest, Local, Mode,
     mode::sealed::Lock,
-    poll::Want,
+    poll::{RawSource, Want},
     runtime::{Core, Remote},
 };
 
@@ -58,6 +59,7 @@ where
             sources: Lock::new(Sources {
                 states: HashMap::new(),
                 next_key: 0,
+                next_waiter: 0,
             }),
             timers: Lock::new(Timers::default()),
             remote,
@@ -78,8 +80,9 @@ where
             .filter_map(|(&key, state)| {
                 let want = Want {
                     key,
-                    readable: state.wakers.readable.is_some(),
-                    writable: state.wakers.writable.is_some(),
+                    descriptor: state.descriptor,
+                    readable: state.wakers.readable.any(),
+                    writable: state.wakers.writable.any(),
                 };
 
                 (want.readable || want.writable).then(|| (state.source.clone(), want))
@@ -98,7 +101,14 @@ where
             (bound, None) | (None, bound) => bound,
         };
 
-        let ready = self.remote.poller.wait(&wants, M::as_source, timeout)?;
+        let ready = match self.remote.poller.wait(&wants, timeout) {
+            Ok(ready) => ready,
+            Err(e) => {
+                self.release(wants);
+
+                return Err(e);
+            }
+        };
         // The wait takes whatever wake-up it finds out of the channel, so the flag comes down
         // here and the next caller writes again. One that came between the two is turned away
         // without a write, and loses nothing by it: what it had to say — a task queued, a source
@@ -106,12 +116,10 @@ where
         // ones the driving thread makes look at all three afresh. The other way about, a wake-up
         // left in the channel by a wait that ended some other way only ends the next one at once.
         self.remote.wake_pending.store(false, Ordering::Release);
-        // Clear of every lock: the last clone of a source let go of during the wait closes it,
-        // which runs the destructor of whatever was registered.
-        drop(wants);
 
-        let woken = {
+        let (woken, unregistered) = {
             let mut sources = self.sources.lock();
+            let unregistered = unregistered(&sources, wants);
             let mut woken = Vec::new();
             for event in &ready {
                 // A source let go of while the wait ran has nobody left to wake.
@@ -119,15 +127,17 @@ where
                     continue;
                 };
                 if event.readable {
-                    woken.extend(state.wakers.readable.take());
+                    state.wakers.readable.take_into(&mut woken);
                 }
                 if event.writable {
-                    woken.extend(state.wakers.writable.take());
+                    state.wakers.writable.take_into(&mut woken);
                 }
             }
 
-            woken
+            (woken, unregistered)
         };
+        // Clear of every lock, and of every clone of a source still registered: see `release`.
+        drop(unregistered);
         for waker in woken {
             waker.wake();
         }
@@ -147,17 +157,32 @@ where
         Ok(())
     }
 
+    /// Lets go of the clones of the sources a wait was made with.
+    ///
+    /// A clone of a source that is still registered is not the last of its source: the map holds
+    /// another, which only goes under the map's lock, so those clones go under it, where letting
+    /// go of one runs no code but the count's. The rest may each be the last, of a source whose
+    /// registration went while the wait ran, and the drop of the last clone closes the source,
+    /// which runs the destructor of whatever was registered: those go clear of every lock, and
+    /// once no clone of a registered source is left here. A destructor that takes a source of
+    /// this runtime back, through `Async::into_inner`, waits until nothing else holds that source,
+    /// which would be for good if this thread still held a clone of it.
+    ///
+    /// A wait that succeeds does the same, under the lock it takes to wake the waiters of what it
+    /// found ready.
+    fn release(&self, wants: Vec<(M::SourcePtr, Want)>) {
+        let unregistered = unregistered(&self.sources.lock(), wants);
+        drop(unregistered);
+    }
+
     /// Wakes every stored waker, sources and timers alike; what a failed wait falls back on, so
     /// that each waiter retries its operation and sees its own error.
     pub(crate) fn wake_everything(&self) {
-        let mut woken: Vec<Waker> = self
-            .sources
-            .lock()
-            .states
-            .values_mut()
-            .flat_map(|state| [state.wakers.readable.take(), state.wakers.writable.take()])
-            .flatten()
-            .collect();
+        let mut woken = Vec::new();
+        for state in self.sources.lock().states.values_mut() {
+            state.wakers.readable.take_into(&mut woken);
+            state.wakers.writable.take_into(&mut woken);
+        }
         woken.extend(mem::take(&mut self.timers.lock().pending).into_values());
 
         for waker in woken {
@@ -182,6 +207,12 @@ pub(crate) fn register<M>(
 where
     M: Mode,
 {
+    // Read here, once, and never again: a wait watches the descriptor the source lends now, so
+    // that it runs no code of the source's. Clear of the lock, as that is somebody else's code.
+    #[cfg(unix)]
+    let descriptor = std::os::fd::AsRawFd::as_raw_fd(&M::as_source(&source));
+    #[cfg(windows)]
+    let descriptor = std::os::windows::io::AsRawSocket::as_raw_socket(&M::as_source(&source));
     let key = {
         let mut sources = core.reactor.sources.lock();
         // One `select` takes a fixed number of sockets, one place of which is spoken for by the
@@ -199,6 +230,7 @@ where
             key,
             SourceState {
                 source,
+                descriptor,
                 wakers: Wakers::default(),
             },
         );
@@ -258,10 +290,12 @@ where
     /// A `WouldBlock` means the source was not ready after all: `cx`'s waker is arranged to be
     /// woken once it is, and [`Poll::Pending`] is returned.
     ///
-    /// A registration keeps one waker per interest, so only one operation at a time may be
-    /// waiting on each: a second one waiting to read, say, takes the first one's place, which is
-    /// then never woken. One reader and one writer waiting together is fine; more of either
-    /// have to take turns, behind a lock of their own.
+    /// A registration keeps one waker per interest for this, so only one operation at a time may
+    /// be waiting on each: a second one waiting to read, say, takes the first one's place, which
+    /// is then never woken. One reader and one writer waiting together is fine; more of either
+    /// have to take turns, behind a lock of their own, or wait through
+    /// [`ready`](Registration::ready), which any number of tasks may do at once, and run their
+    /// operation once it completes.
     ///
     /// Never spins while the source is not ready and, the source being nonblocking as
     /// [`Runtime::register`](crate::Runtime#method.register) requires, never blocks the calling
@@ -285,12 +319,8 @@ where
             let Some(state) = sources.states.get_mut(&self.key) else {
                 unreachable!("a source stays in the map for as long as its registration lives");
             };
-            let stored = match interest {
-                Interest::Readable => &mut state.wakers.readable,
-                Interest::Writable => &mut state.wakers.writable,
-            };
 
-            stored.replace(waker)
+            state.wakers.get_mut(interest).operation.replace(waker)
         };
         // Clear of the lock: dropping a waker can drop a task, and the future of that task may
         // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
@@ -300,6 +330,33 @@ where
         self.core.remote.notify();
 
         Poll::Pending
+    }
+
+    /// Waits until this registration's source is ready for `interest`, without running any
+    /// operation on it.
+    ///
+    /// What a caller that does its I/O some other way waits on: through a library it hands the
+    /// source to, say, or with an operation it would rather run once, after the wait, than on
+    /// every poll. The wait completes once the runtime finds the source ready for `interest`, or
+    /// once a wait of the runtime fails, and never otherwise: its first poll only stores its
+    /// waker, and a poll the source did not cause, as when the future shares a task with others,
+    /// leaves it waiting.
+    ///
+    /// Any number of these may wait at once, on one source and in one direction, alongside an
+    /// operation of [`poll_io`](Registration::poll_io), and the readiness wakes them all.
+    /// Dropping one gives up its wait.
+    ///
+    /// Readiness is a hint rather than a promise: another task may take the bytes, or the room,
+    /// before this one gets to them, and a wait of the runtime that fails ends every wait for
+    /// readiness, so that each waiter tries its operation and sees the outcome for itself. An
+    /// operation run once this completes still has to expect
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it gets one.
+    pub fn ready(&self, interest: Interest) -> Readiness<'_, M> {
+        Readiness {
+            registration: self,
+            interest,
+            id: None,
+        }
     }
 
     /// A handle on the runtime this registration's source is watched by.
@@ -328,6 +385,118 @@ where
         // Clear of the lock as well: the wait built from a source that has gone is broken, so
         // that the wait after it leaves that source out.
         self.core.remote.notify();
+    }
+}
+
+/// A wait for a registered source to be ready for an [`Interest`], which
+/// [`Registration::ready`] hands out.
+///
+/// The future completes once the runtime finds the source ready, or once a wait of the runtime
+/// fails, and dropping it before then gives up the wait.
+#[must_use = "futures do nothing unless polled"]
+pub struct Readiness<'a, M = Local>
+where
+    M: Mode,
+{
+    registration: &'a Registration<M>,
+    interest: Interest,
+    /// The id this wait is stored under in the reactor's map: taken on the first poll, and given
+    /// up once a poll finds that the reactor took the wait out, which is what readiness does.
+    id: Option<u64>,
+}
+
+impl<M> fmt::Debug for Readiness<'_, M>
+where
+    M: Mode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Readiness")
+            .field("interest", &self.interest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> Future for Readiness<'_, M>
+where
+    M: Mode,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
+        // to run with a lock of this runtime's held.
+        let waker = cx.waker().clone();
+        let (ready, stored, unused) = {
+            let mut sources = this.registration.core.reactor.sources.lock();
+            let Sources {
+                states,
+                next_waiter,
+                ..
+            } = &mut *sources;
+            let Some(state) = states.get_mut(&this.registration.key) else {
+                unreachable!("a source stays in the map for as long as its registration lives");
+            };
+            let waiting = &mut state.wakers.get_mut(this.interest).readiness;
+            match this.id {
+                None => {
+                    let id = *next_waiter;
+                    *next_waiter += 1;
+                    waiting.insert(id, waker);
+                    this.id = Some(id);
+
+                    (false, true, None)
+                }
+                Some(id) => match waiting.get_mut(&id) {
+                    // Still there, so the reactor has not found the source ready since: this
+                    // poll came from somewhere else, and the wait goes on with its waker.
+                    Some(stored) => (false, false, Some(mem::replace(stored, waker))),
+                    // Taken out by the reactor, along with the waker it then woke.
+                    None => (true, false, Some(waker)),
+                },
+            }
+        };
+        // Clear of the lock: dropping a waker can drop a task, and the future of that task may
+        // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
+        drop(unused);
+        if ready {
+            this.id = None;
+
+            return Poll::Ready(());
+        }
+        // The wait under way was built before this waiter was stored, so it is broken here and
+        // the one that follows it watches the source. A waiter already stored is in that wait.
+        if stored {
+            this.registration.core.remote.notify();
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<M> Drop for Readiness<'_, M>
+where
+    M: Mode,
+{
+    fn drop(&mut self) {
+        // Nothing in the map for a wait nobody polled, nor for one the source was found ready for.
+        let Some(id) = self.id else {
+            return;
+        };
+        let removed = {
+            let mut sources = self.registration.core.reactor.sources.lock();
+            let Some(state) = sources.states.get_mut(&self.registration.key) else {
+                unreachable!("a source stays in the map for as long as its registration lives");
+            };
+
+            state.wakers.get_mut(self.interest).readiness.remove(&id)
+        };
+        // Clear of the lock: dropping a waker can drop a task, and the future of that task may
+        // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
+        // No wake-up for the wait under way, which may still watch the source for this waiter:
+        // it costs that wait no more than one early return, and the wait after it leaves the
+        // source out unless somebody else waits on it.
+        drop(removed);
     }
 }
 
@@ -498,6 +667,21 @@ where
     }
 }
 
+/// The clones in `wants` of the sources `sources` no longer holds, having let go of the others:
+/// what [`Reactor::release`] keeps to let go of clear of the map's lock, which the caller holds.
+fn unregistered<M>(
+    sources: &Sources<M>,
+    wants: Vec<(M::SourcePtr, Want)>,
+) -> Vec<(M::SourcePtr, Want)>
+where
+    M: Mode,
+{
+    wants
+        .into_iter()
+        .filter(|(_, want)| !sources.states.contains_key(&want.key))
+        .collect()
+}
+
 /// The sources the reactor watches, under the keys it reports them by.
 struct Sources<M>
 where
@@ -505,6 +689,8 @@ where
 {
     states: HashMap<usize, SourceState<M>>,
     next_key: usize,
+    /// The id the next [`Readiness`] to store itself takes.
+    next_waiter: u64,
 }
 
 /// One watched source: the descriptor, and who to wake for each direction of it.
@@ -513,14 +699,52 @@ where
     M: Mode,
 {
     source: M::SourcePtr,
+    /// The descriptor the source lent when it was registered, which is what a wait watches.
+    descriptor: RawSource,
     wakers: Wakers,
 }
 
 /// Who waits for each direction of one source.
 #[derive(Default)]
 struct Wakers {
-    readable: Option<Waker>,
-    writable: Option<Waker>,
+    readable: Waiters,
+    writable: Waiters,
+}
+
+impl Wakers {
+    /// Who waits for the direction `interest` names.
+    fn get_mut(&mut self, interest: Interest) -> &mut Waiters {
+        match interest {
+            Interest::Readable => &mut self.readable,
+            Interest::Writable => &mut self.writable,
+        }
+    }
+}
+
+/// Who waits for one direction of one source.
+#[derive(Default)]
+struct Waiters {
+    /// The operation [`Registration::poll_io`] keeps waiting, which the next one to wait in this
+    /// direction takes the place of.
+    operation: Option<Waker>,
+    /// The waits for readiness alone, each under the id it took on its first poll: as many as
+    /// there are [`Readiness`] futures waiting, each of which finds its own entry, or its
+    /// absence, without a look at the others.
+    readiness: HashMap<u64, Waker>,
+}
+
+impl Waiters {
+    /// Whether anybody waits in this direction, which is what has a wait watch for it.
+    fn any(&self) -> bool {
+        self.operation.is_some() || !self.readiness.is_empty()
+    }
+
+    /// Takes every waker out, into `woken`: the direction is ready, or a failed wait has every
+    /// waiter try again. A [`Readiness`] that finds itself gone on its next poll completes.
+    fn take_into(&mut self, woken: &mut Vec<Waker>) {
+        woken.extend(self.operation.take());
+        woken.extend(self.readiness.drain().map(|(_, waker)| waker));
+    }
 }
 
 /// The timers waiting for their deadline, keyed so that two of the same deadline stay apart.
@@ -1007,6 +1231,346 @@ mod tests {
         assert!(reactor.is_idle());
     }
 
+    /// A wait for readiness completes once the source is ready, and the reactor takes it out of
+    /// its map as it finds that, so that the wait has nothing left to give up.
+    #[test]
+    #[timeout(15000)]
+    fn a_readiness_wait_completes_once_the_source_is_ready() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        assert!(waiters(&registration, Interest::Readable, Waiters::any));
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(counter.count(), 1);
+        assert!(!waiters(&registration, Interest::Readable, Waiters::any));
+        assert!(poll_with(&mut ready, &waker).is_ready());
+    }
+
+    /// A wait for readiness stays pending on a poll the source did not cause.
+    ///
+    /// A future that shares its task with others is polled whenever any of them wakes the task, a
+    /// timer's wake included, and it must not take that for the source being ready. Neither the
+    /// polls nor the waits that follow them, which find the source quiet, complete it or wake it.
+    #[test]
+    #[timeout(15000)]
+    fn a_readiness_wait_stays_pending_on_a_poll_the_source_did_not_cause() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        // The wake-up the first poll wrote, taken out of the channel.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        // Nothing was written to the peer, so this wait ends at its bound, or on a wake-up that
+        // reached the channel late, and finds the source quiet either way.
+        reactor.wait(Some(Duration::from_millis(50))).unwrap();
+
+        assert_eq!(counter.count(), 0);
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        assert!(waiters(&registration, Interest::Readable, Waiters::any));
+    }
+
+    /// Every wait for readiness in one direction is woken by that direction's readiness, each
+    /// once, and each then completes.
+    #[test]
+    #[timeout(15000)]
+    fn every_readiness_wait_in_one_direction_is_woken() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let wakers = [counting_waker(), counting_waker(), counting_waker()];
+        let mut waits = [
+            registration.ready(Interest::Readable),
+            registration.ready(Interest::Readable),
+            registration.ready(Interest::Readable),
+        ];
+        for (wait, (_, waker)) in waits.iter_mut().zip(&wakers) {
+            assert!(poll_with(wait, waker).is_pending());
+        }
+        let stored = waiters(&registration, Interest::Readable, |waiters| {
+            waiters.readiness.len()
+        });
+        assert_eq!(stored, 3);
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        for (wait, (counter, waker)) in waits.iter_mut().zip(&wakers) {
+            assert_eq!(counter.count(), 1);
+            assert!(poll_with(wait, waker).is_ready());
+        }
+    }
+
+    /// A wait for readiness and an operation of `poll_io` waiting together are both woken by one
+    /// readiness, and neither takes the other's place.
+    #[test]
+    #[timeout(15000)]
+    fn a_readiness_wait_and_an_operation_are_woken_together() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source.clone()).unwrap();
+        let (operation, operation_waker) = counting_waker();
+        let (readiness, readiness_waker) = counting_waker();
+        let mut operation_cx = Context::from_waker(&operation_waker);
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(read_one(&registration, &source, &mut operation_cx).is_pending());
+        assert!(poll_with(&mut ready, &readiness_waker).is_pending());
+        // The operation waiting again, as a poll the source did not cause has it do, takes the
+        // place of its own waker and of no other.
+        assert!(read_one(&registration, &source, &mut operation_cx).is_pending());
+        let stored = waiters(&registration, Interest::Readable, |waiters| {
+            (waiters.operation.is_some(), waiters.readiness.len())
+        });
+        assert_eq!(stored, (true, 1));
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(operation.count(), 1);
+        assert_eq!(readiness.count(), 1);
+        assert!(poll_with(&mut ready, &readiness_waker).is_ready());
+        assert!(matches!(
+            read_one(&registration, &source, &mut operation_cx),
+            Poll::Ready(Ok(1))
+        ));
+    }
+
+    /// A dropped wait for readiness leaves nothing behind: its entry is out of the map, so the
+    /// source is no longer watched on its account, and the waker it stored is let go of.
+    #[test]
+    #[timeout(15000)]
+    fn a_dropped_readiness_wait_leaves_nothing_behind() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        // The test's own handle on the counter, its waker, and the one the reactor keeps.
+        assert_eq!(Arc::strong_count(&counter), 3);
+        assert!(waiters(&registration, Interest::Readable, Waiters::any));
+
+        drop(ready);
+
+        assert!(!waiters(&registration, Interest::Readable, Waiters::any));
+        assert_eq!(Arc::strong_count(&counter), 2);
+        drop(waker);
+        assert_eq!(Arc::strong_count(&counter), 1);
+        // Nobody is left to wake for what the source now has to say.
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_millis(50))).unwrap();
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Dropping one of two waits for readiness takes its own entry out and no other: the wait left
+    /// is still woken, and the dropped one's waker is let go of.
+    #[test]
+    #[timeout(15000)]
+    fn dropping_the_first_of_two_readiness_waits_leaves_the_second_waiting() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (first, first_waker) = counting_waker();
+        let (second, second_waker) = counting_waker();
+        let mut dropped = registration.ready(Interest::Readable);
+        let mut kept = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut dropped, &first_waker).is_pending());
+        assert!(poll_with(&mut kept, &second_waker).is_pending());
+
+        drop(dropped);
+
+        // The test's own handle on each counter and its waker, and for the second, the one the
+        // reactor keeps.
+        assert_eq!(Arc::strong_count(&first), 2);
+        assert_eq!(Arc::strong_count(&second), 3);
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(first.count(), 0);
+        assert_eq!(second.count(), 1);
+        assert!(poll_with(&mut kept, &second_waker).is_ready());
+    }
+
+    /// A wait for readiness that was never polled stores nothing, and writes no wake-up, as there
+    /// is no wait under way that it could be news to.
+    #[test]
+    #[timeout(15000)]
+    fn an_unpolled_readiness_wait_stores_nothing() {
+        let runtime = runtime();
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+
+        let ready = registration.ready(Interest::Readable);
+        assert!(!waiters(&registration, Interest::Readable, Waiters::any));
+        drop(ready);
+
+        assert!(!waiters(&registration, Interest::Readable, Waiters::any));
+        assert!(!runtime.core.remote.wake_pending());
+    }
+
+    /// Only the poll that stores a wait for readiness writes a wake-up, which breaks the wait
+    /// under way, built before there was anything to watch for it. A later poll finds the wait
+    /// stored, and so already in whichever wait follows.
+    #[test]
+    #[timeout(15000)]
+    fn only_the_first_poll_of_a_readiness_wait_writes_a_wake_up() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let remote = &runtime.core.remote;
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (_counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(!remote.wake_pending());
+
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        assert!(remote.wake_pending());
+        // The wake-up taken out of the channel, and the flag down with it.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert!(!remote.wake_pending());
+
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        assert!(!remote.wake_pending());
+    }
+
+    /// A failed wait ends the waits for readiness: it wakes them with every other waiter, so that
+    /// each tries its operation and sees the outcome for itself.
+    #[test]
+    #[timeout(15000)]
+    fn a_failed_wait_ends_a_readiness_wait() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut ready, &waker).is_pending());
+
+        reactor.wake_everything();
+
+        assert_eq!(counter.count(), 1);
+        assert!(!waiters(&registration, Interest::Readable, Waiters::any));
+        assert!(poll_with(&mut ready, &waker).is_ready());
+    }
+
+    /// A wait for writability completes after one wait on a fresh connected pair, whose buffers
+    /// have room.
+    #[test]
+    #[timeout(15000)]
+    fn a_writable_readiness_wait_completes_on_a_fresh_pair() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Writable);
+        assert!(poll_with(&mut ready, &waker).is_pending());
+
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(counter.count(), 1);
+        assert!(poll_with(&mut ready, &waker).is_ready());
+    }
+
+    /// A wait for readiness is woken by the direction it waits for and by no other.
+    ///
+    /// A fresh pair is writable and not readable, so the wait for writability is woken by the
+    /// first wait and the one for readability only by the second, once a byte has been written,
+    /// and neither is woken again by the readiness the other found.
+    #[test]
+    #[timeout(15000)]
+    fn a_readiness_wait_is_not_woken_by_the_other_direction() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (readable, readable_waker) = counting_waker();
+        let (writable, writable_waker) = counting_waker();
+        let mut reading = registration.ready(Interest::Readable);
+        let mut writing = registration.ready(Interest::Writable);
+        assert!(poll_with(&mut reading, &readable_waker).is_pending());
+        assert!(poll_with(&mut writing, &writable_waker).is_pending());
+
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(writable.count(), 1);
+        assert_eq!(readable.count(), 0);
+        assert!(poll_with(&mut writing, &writable_waker).is_ready());
+        assert!(poll_with(&mut reading, &readable_waker).is_pending());
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(readable.count(), 1);
+        assert_eq!(writable.count(), 1);
+        assert!(poll_with(&mut reading, &readable_waker).is_ready());
+    }
+
+    /// A wait for readiness polled again before the readiness is woken through the waker of that
+    /// poll, and the waker it replaced is let go of.
+    #[test]
+    #[timeout(15000)]
+    fn a_readiness_wait_is_woken_through_the_waker_of_its_last_poll() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (first, first_waker) = counting_waker();
+        let (second, second_waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut ready, &first_waker).is_pending());
+        assert!(poll_with(&mut ready, &second_waker).is_pending());
+        // The first poll's waker is gone from the reactor, and the second's is there.
+        drop(first_waker);
+        assert_eq!(Arc::strong_count(&first), 1);
+        assert_eq!(Arc::strong_count(&second), 3);
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+
+        assert_eq!(first.count(), 0);
+        assert_eq!(second.count(), 1);
+        assert!(poll_with(&mut ready, &second_waker).is_ready());
+    }
+
+    /// A wait for readiness polled with another waker once the readiness has come completes: it
+    /// was woken through the waker it stored, and the one it is polled with now is let go of.
+    #[test]
+    #[timeout(15000)]
+    fn a_readiness_wait_polled_with_another_waker_after_readiness_completes() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (first, first_waker) = counting_waker();
+        let (second, second_waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut ready, &first_waker).is_pending());
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(first.count(), 1);
+
+        assert!(poll_with(&mut ready, &second_waker).is_ready());
+        assert_eq!(second.count(), 0);
+        // The test's own handle on the counter and its waker: the poll kept no clone of it.
+        assert_eq!(Arc::strong_count(&second), 2);
+    }
+
     /// A runtime of the test's own, whose reactor the test waits on as the thread driving it
     /// would. Shared, so that a test can hand it to a thread of its own.
     fn runtime() -> SharedRuntime {
@@ -1099,6 +1663,28 @@ mod tests {
         registration.poll_io(cx, Interest::Readable, || {
             SockRef::from(source).recv(&mut byte)
         })
+    }
+
+    /// Polls `ready` once with `waker`, as a task whose waker that is would.
+    fn poll_with(ready: &mut Readiness<'_, Shared>, waker: &Waker) -> Poll<()> {
+        Pin::new(ready).poll(&mut Context::from_waker(waker))
+    }
+
+    /// What `read` makes of who waits for `interest` of `registration`'s source.
+    ///
+    /// The lock of the sources is let go of as this returns, before the test polls or drops
+    /// anything that takes it.
+    fn waiters<T>(
+        registration: &Registration<Shared>,
+        interest: Interest,
+        read: impl FnOnce(&Waiters) -> T,
+    ) -> T {
+        let mut sources = Lock::lock(&registration.core.reactor.sources);
+        let Some(state) = sources.states.get_mut(&registration.key) else {
+            unreachable!("a source stays in the map for as long as its registration lives");
+        };
+
+        read(state.wakers.get_mut(interest))
     }
 
     /// A waker that counts how often it has been woken.

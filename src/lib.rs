@@ -13,6 +13,8 @@
     allow(unused_extern_crates),
 )))]
 
+#[cfg(feature = "runtime")]
+mod async_io;
 #[cfg(feature = "broadcast")]
 pub mod broadcast;
 #[cfg(feature = "helper")]
@@ -62,14 +64,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "runtime")]
+pub use async_io::Async;
 #[cfg(feature = "event")]
 pub use event::{Event, EventListener};
 #[cfg(feature = "runtime")]
 use mode::sealed::Sealed as _;
 #[cfg(feature = "runtime")]
-pub use mode::{Local, Mode, Shared};
+pub use mode::{Local, Mode, Shared, Source};
 #[cfg(feature = "runtime")]
-pub use reactor::Registration;
+pub use reactor::{Readiness, Registration};
 #[cfg(feature = "runtime")]
 use runtime::Core;
 #[cfg(feature = "runtime")]
@@ -535,13 +539,19 @@ impl Runtime<Local> {
     ///
     /// `source` must be in nonblocking mode, which this leaves to the caller to set: the runtime
     /// waits for readiness, not for I/O, so a read or write on a blocking source blocks the
-    /// thread running every other task along with it.
+    /// thread running every other task along with it. The runtime asks `source` for its
+    /// descriptor once, here, and watches that one from then on, so `source` keeps it the same,
+    /// and open, for as long as it lives, as every type of std's does.
     ///
     /// The registration this hands back stops watching `source` once it is dropped. A read or
     /// write on `source` should go through [`Registration::poll_io`], so that a `WouldBlock`
     /// becomes a wait for the readiness that would clear it rather than a busy loop. `source`
     /// itself is kept by the registration, so the I/O is done through another handle on the
     /// same socket: an `Rc` of it, say, or a clone of its descriptor.
+    ///
+    /// [`Async`] is the handle that registers a source, keeps it and does the I/O for the caller;
+    /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
+    /// other way.
     ///
     /// # Example
     ///
@@ -684,13 +694,19 @@ impl Runtime<Shared> {
     ///
     /// `source` must be in nonblocking mode, which this leaves to the caller to set: the runtime
     /// waits for readiness, not for I/O, so a read or write on a blocking source blocks the
-    /// thread running every other task along with it.
+    /// thread running every other task along with it. The runtime asks `source` for its
+    /// descriptor once, here, and watches that one from then on, so `source` keeps it the same,
+    /// and open, for as long as it lives, as every type of std's does.
     ///
     /// The registration this hands back stops watching `source` once it is dropped. A read or
     /// write on `source` should go through [`Registration::poll_io`], so that a `WouldBlock`
     /// becomes a wait for the readiness that would clear it rather than a busy loop. `source`
     /// itself is kept by the registration, so the I/O is done through another handle on the
     /// same socket: an `Arc` of it, say, or a clone of its descriptor.
+    ///
+    /// [`Async`] is the handle that registers a source, keeps it and does the I/O for the caller;
+    /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
+    /// other way.
     pub fn register<S>(&self, source: S) -> io::Result<Registration<Shared>>
     where
         S: AsSource + Send + Sync + 'static,

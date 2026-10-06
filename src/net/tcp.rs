@@ -7,7 +7,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::{
     fmt,
-    future::poll_fn,
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr},
     pin::Pin,
@@ -19,11 +18,8 @@ use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
 use socket2::{Domain, SockAddr};
 
-use super::{
-    connect,
-    io::{Io, set_nosigpipe},
-};
-use crate::{Local, Mode, Runtime};
+use super::{connect, set_nosigpipe};
+use crate::{Async, Local, Mode, Runtime};
 
 /// A TCP socket server, listening for connections.
 ///
@@ -42,10 +38,10 @@ use crate::{Local, Mode, Runtime};
 /// built on a [`SharedRuntime`](crate::SharedRuntime) is a `TcpListener<Shared>`, which may be
 /// sent to, and used from, any thread.
 ///
-/// At most one task at a time may wait for a connection, through [`accept`](TcpListener::accept) or
-/// [`incoming`](TcpListener::incoming), counting every reference to the listener: where a second
-/// task waits as well, the one that waited first may never be woken. Tasks that accept from one
-/// listener take turns, behind a lock of their own.
+/// Any number of tasks may wait for a connection through [`accept`](TcpListener::accept) at once,
+/// each through a reference to the listener, and each connection goes to one of them. Waiting for
+/// the next item of an [`Incoming`] stream is not like that: at most one task at a time may do it,
+/// counting every stream of the listener, and the tasks in `accept` do not count against it.
 ///
 /// # Example
 ///
@@ -84,7 +80,7 @@ pub struct TcpListener<M = Local>
 where
     M: Mode,
 {
-    io: Io<std::net::TcpListener, M>,
+    io: Async<std::net::TcpListener, M>,
 }
 
 impl<M> TcpListener<M>
@@ -125,7 +121,7 @@ where
         listener.set_nonblocking(true)?;
 
         Ok(Self {
-            io: Io::new(runtime, listener)?,
+            io: Async::from_nonblocking(runtime, listener)?,
         })
     }
 
@@ -150,7 +146,9 @@ where
     /// connection off the queue and then fails to register it: the connection is closed, which its
     /// peer sees as its end, and the accept fails.
     pub async fn accept(&self) -> io::Result<(TcpStream<M>, SocketAddr)> {
-        poll_fn(|cx| self.poll_accept(cx)).await
+        let (stream, address) = self.io.read_with(|listener| listener.accept()).await?;
+
+        self.accepted(stream, address)
     }
 
     /// A stream of the connections made to this listener.
@@ -171,8 +169,9 @@ where
     /// an accept that took the connection off the queue and closed it, as
     /// [`accept`](TcpListener::accept) says.
     ///
-    /// Waiting for the next item counts as waiting in `accept`, so one task at a time may do
-    /// either, as [the listener's documentation](TcpListener) says.
+    /// At most one task at a time may wait for the next item, counting every stream this listener
+    /// hands out, and a task waiting in [`accept`](TcpListener::accept) does not count against it,
+    /// as [the stream's documentation](Incoming) says.
     ///
     /// # Example
     ///
@@ -310,10 +309,13 @@ where
 /// built on a [`SharedRuntime`](crate::SharedRuntime) is a `TcpStream<Shared>`, which may be sent
 /// to, and used from, any thread.
 ///
-/// At most one task at a time may wait to read from a stream, [`peek`](TcpStream::peek) included,
-/// and at most one to write to it, counting every reference to the stream: where a second task
-/// waits in the same direction, the one that waited first may never be woken. Tasks that read, or
-/// write, together take turns, behind a lock of their own.
+/// At most one task at a time may wait to read from a stream through its `AsyncRead`
+/// implementation, and at most one to write to it through its `AsyncWrite` one, counting every
+/// reference to the stream: where a second task waits in the same direction, the one that waited
+/// first may never be woken. Tasks that read, or write, together take turns, behind a lock of their
+/// own. [`peek`](TcpStream::peek) is not subject to that: any number of tasks may wait in it at
+/// once, and one that does never takes the place of a task waiting to read, nor the other way
+/// round.
 ///
 /// # Example
 ///
@@ -362,7 +364,7 @@ pub struct TcpStream<M = Local>
 where
     M: Mode,
 {
-    io: Io<std::net::TcpStream, M>,
+    io: Async<std::net::TcpStream, M>,
     /// Whether the write half of the socket is shut down already, by a close or by a `shutdown`
     /// of it, so that a close finding it so shuts nothing down again.
     ///
@@ -441,7 +443,7 @@ where
         set_nosigpipe(&stream)?;
 
         Ok(Self {
-            io: Io::new(runtime, stream)?,
+            io: Async::from_nonblocking(runtime, stream)?,
             write_shut: AtomicBool::new(false),
         })
     }
@@ -484,7 +486,7 @@ where
     /// has closed its end and nothing is left to read. The next read, or `peek`, finds the same
     /// bytes again.
     ///
-    /// Waiting to peek counts as waiting to read, so one task at a time may do either, as [the
+    /// Any number of tasks may wait to peek at once, alongside the one that waits to read, as [the
     /// stream's documentation](TcpStream) says.
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.io.read_with(|stream| stream.peek(buf)).await
@@ -668,8 +670,11 @@ where
 /// connection it took off the queue instead, so the error does not repeat, but the connection is
 /// lost. A caller that goes on after an error backs off first, with [`Runtime::sleep`], say.
 ///
-/// Waiting for the next item counts as waiting in [`accept`](TcpListener::accept), so one task at a
-/// time may do either, as [the listener's documentation](TcpListener) says.
+/// At most one task at a time may wait for the next item, counting every `Incoming` of the
+/// listener: where a second task waits as well, the one that waited first may never be woken. Tasks
+/// that take items from one listener's streams take turns, behind a lock of their own. Tasks
+/// waiting in [`accept`](TcpListener::accept) do not count against that, nor does it count against
+/// them, as [the listener's documentation](TcpListener) says.
 ///
 /// [`futures-core`]: https://docs.rs/futures-core
 /// [`futures-lite`]: https://docs.rs/futures-lite
@@ -716,8 +721,18 @@ where
     fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream<M>, SocketAddr)>> {
         let (stream, address) = ready!(self.io.poll_read_with(cx, |listener| listener.accept()))?;
 
+        Poll::Ready(self.accepted(stream, address))
+    }
+
+    /// The stream of a connection the std listener accepted, on this listener's runtime, with the
+    /// address of its peer.
+    fn accepted(
+        &self,
+        stream: std::net::TcpStream,
+        address: SocketAddr,
+    ) -> io::Result<(TcpStream<M>, SocketAddr)> {
         // std's `accept` leaves the accepted socket in blocking mode on Linux, which `from_std`
         // sets right.
-        Poll::Ready(TcpStream::from_std(&self.io.runtime(), stream).map(|stream| (stream, address)))
+        TcpStream::from_std(&self.io.runtime(), stream).map(|stream| (stream, address))
     }
 }

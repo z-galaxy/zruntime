@@ -32,10 +32,15 @@
 //! and write to them. So does a shared reference to one, which lets a reader and a writer share a
 //! stream. Closing a stream shuts its write half down, and the peer reads the end of the stream.
 //!
-//! A socket wakes one task per direction: one waiting to read and one waiting to write. Two tasks
-//! waiting in the same direction on one socket at once — to read, peek, accept or receive through
-//! two references to it, or to write or send — is one too many: the one that waited first may
-//! never be woken. Tasks that share a direction take turns, behind a lock of their own.
+//! Any number of tasks may wait in the async methods of one socket at once, through shared
+//! references to it: to accept, peek, receive or send, in either direction. Each is woken when the
+//! socket is ready, and one that finds another task got there first waits again. Only the
+//! poll-based paths keep one waiting task per direction: the `AsyncRead` and `AsyncWrite`
+//! implementations of a stream, and the `Incoming` stream of a listener. Where a second task waits
+//! in the same direction through one of those, it takes the first one's place, which is then never
+//! woken, so tasks that share a direction there take turns, behind a lock of their own. A task
+//! waiting in an async method never takes the place of one waiting through a poll-based path, nor
+//! the other way round.
 //!
 //! On Windows, a runtime watches at most 1023 sockets at a time, which its reactor waits on in a
 //! single `select` call: a server there holds at most that many sockets on one runtime, its
@@ -50,8 +55,14 @@
 //! [`SharedRuntime`]: crate::SharedRuntime
 
 #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+use std::io;
+#[cfg(all(unix, any(feature = "tcp", feature = "unix")))]
+use std::os::fd::AsFd as AsSource;
+#[cfg(all(windows, feature = "tcp"))]
+use std::os::windows::io::AsSocket as AsSource;
+
+#[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
 mod connect;
-mod io;
 #[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(feature = "udp")]
@@ -63,3 +74,39 @@ pub mod unix;
 pub use tcp::{Incoming, TcpListener, TcpStream};
 #[cfg(feature = "udp")]
 pub use udp::UdpSocket;
+
+/// Makes a write to `socket`, once its peer has gone, fail rather than raise `SIGPIPE`, on
+/// Apple's platforms, and does nothing elsewhere.
+///
+/// Those platforms have no `MSG_NOSIGNAL` for a write to ask for that with, so the socket sees to
+/// it itself, through its `SO_NOSIGPIPE` option. std and socket2 set the option on the sockets
+/// they make, but std's `pair` sets it on neither socket, and a socket handed to a `from_std` may
+/// come from elsewhere.
+#[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+pub(crate) fn set_nosigpipe<S>(socket: &S) -> io::Result<()>
+where
+    S: AsSource,
+{
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    {
+        Ok(rustix::net::sockopt::set_socket_nosigpipe(socket, true)?)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )))]
+    {
+        let _ = socket;
+
+        Ok(())
+    }
+}

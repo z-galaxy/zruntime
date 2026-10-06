@@ -12,7 +12,7 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
-    os::windows::io::{AsRawSocket, BorrowedSocket},
+    os::windows::io::AsRawSocket,
     ptr,
     time::Duration,
 };
@@ -82,12 +82,9 @@ impl Poller {
     /// except set is left open, which is why every source is offered for that set and a source
     /// found there is reported readable and writable both: whichever of the two a waiter parked
     /// for, it then retries its own operation and reads the error off that.
-    ///
-    /// `as_source` borrows the socket of each source for the call.
     pub(crate) fn wait<S>(
         &self,
         sources: &[(S, Want)],
-        as_source: impl Fn(&S) -> BorrowedSocket<'_>,
         timeout: Option<Duration>,
     ) -> io::Result<Vec<Ready>> {
         debug_assert!(sources.len() <= MAX_SOURCES);
@@ -98,8 +95,8 @@ impl Poller {
         let mut excepted = FdSet::new();
         let wake = self.wake_read.as_raw_socket() as SOCKET;
         push(&mut readable, wake);
-        for (source, want) in sources {
-            let socket = as_source(source).as_raw_socket() as SOCKET;
+        for (_source, want) in sources {
+            let socket = want.descriptor as SOCKET;
             if want.readable {
                 push(&mut readable, socket);
             }
@@ -118,7 +115,8 @@ impl Poller {
         // layout `FD_SET` has, and `select` reads and writes only the entries the count names,
         // which lie within the array. Every socket in them is held open across the call: the
         // wake socket by `self`, which outlives the call, and each of the others by the source the
-        // caller lends in `sources`, a shared pointer it holds until the call returns. The timeout
+        // caller lends in `sources`, a shared pointer it holds until the call returns, which
+        // keeps the socket it lent when it was registered open for as long as it lives. The timeout
         // is a live local of this frame as well, or a null pointer, which is how a wait
         // without limit is asked for. The first argument is ignored on Winsock, and zero is
         // passed for it.
@@ -145,8 +143,8 @@ impl Poller {
 
         Ok(sources
             .iter()
-            .filter_map(|(source, want)| {
-                let socket = as_source(source).as_raw_socket() as SOCKET;
+            .filter_map(|(_source, want)| {
+                let socket = want.descriptor as SOCKET;
                 let is_excepted = holds(&excepted, socket);
                 let is_readable = holds(&readable, socket) || is_excepted;
                 let is_writable = holds(&writable, socket) || is_excepted;

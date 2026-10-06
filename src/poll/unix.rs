@@ -40,17 +40,14 @@ impl Poller {
     /// Waits until a wanted source is ready, `notify` is called or `timeout` passes; `None`
     /// waits without limit. The sources are held for the whole call, so no descriptor in the
     /// set can close under it.
-    ///
-    /// `as_source` borrows the descriptor of each source for the call.
     pub(crate) fn wait<S>(
         &self,
         sources: &[(S, Want)],
-        as_source: impl Fn(&S) -> BorrowedFd<'_>,
         timeout: Option<Duration>,
     ) -> io::Result<Vec<Ready>> {
         let mut fds = Vec::with_capacity(sources.len() + 1);
         fds.push(PollFd::new(&self.wake_read, PollFlags::IN));
-        for (source, want) in sources {
+        for (_source, want) in sources {
             let mut flags = PollFlags::empty();
             if want.readable {
                 flags |= PollFlags::IN;
@@ -58,7 +55,12 @@ impl Poller {
             if want.writable {
                 flags |= PollFlags::OUT;
             }
-            fds.push(PollFd::from_borrowed_fd(as_source(source), flags));
+            // SAFETY: the descriptor is the one the source lent when it was registered, which a
+            // source keeps open for as long as it lives, as `Source` says and as nothing done
+            // through a shared reference to it can undo in safe code; and `sources` holds the
+            // source for the length of this call, across which the borrow lives.
+            let fd = unsafe { BorrowedFd::borrow_raw(want.descriptor) };
+            fds.push(PollFd::from_borrowed_fd(fd, flags));
         }
         // A duration too long for a `Timespec` is as good as no limit.
         let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());

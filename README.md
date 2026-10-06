@@ -175,6 +175,19 @@ either flavour. A stream implements the `AsyncRead` and `AsyncWrite` traits of `
 connecting it never blocks the thread. The TCP and UDP sockets take socket addresses rather than
 host names: a name is the caller's to look up, which the `unblock` feature can do off the thread.
 
+## Other sources
+
+[`Async`] wraps any source the runtime can watch, as smol has in `smol::Async`. On unix that is
+anything with a file descriptor: a pipe, a terminal, an eventfd, an inotify instance, the standard
+I/O of a child process, or a socket of a type the [`net`] module has none for. On Windows it is a
+socket, and nothing else. [`Async::readable`] and [`Async::writable`] wait for readiness alone, to
+hand the descriptor to a library that does its own I/O, and [`Async::read_with`] and
+[`Async::write_with`] run an operation on the source until it stops reporting `WouldBlock`. Any
+number of tasks may wait at once through these four. The `AsyncRead` and `AsyncWrite` traits of
+`futures-io`, which [`Async`] implements wherever `&T` implements `Read` or `Write`, keep one
+waiting task per direction instead. [`Runtime::register`] and [`Registration`] are the lower level
+it is built on.
+
 ## Events
 
 An [`Event`] is a notification that tasks can wait for. A task takes an [`EventListener`] from it
@@ -190,7 +203,8 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 ## Features
 
 * `runtime` (default): [`Runtime`], [`LocalRuntime`] and [`SharedRuntime`], with the tasks,
-  timers and I/O registrations built on them; it brings the `futures-core` crate.
+  timers and I/O registrations built on them, and [`Async`], the async handle of any source they
+  can watch; it brings the `futures-core` and `futures-io` crates.
 * `event` (default): [`Event`] and [`EventListener`], which need no runtime.
 * `tracing` (default): the runtime logs through [`tracing`]; a build without it emits no log
   events.
@@ -212,11 +226,10 @@ is behind the `event` feature, which builds without the runtime: see [Features](
   `smol::fs`, with each operation run as blocking work on [`unblock`]'s pool; it implies `unblock`
   and `lock`, and needs no runtime either.
 * `tcp`: the [`net`] module's TCP sockets, `TcpListener` and `TcpStream`; it implies `runtime`,
-  and brings the `socket2`, `futures-io` and `futures-core` crates.
+  and brings the `socket2` crate.
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
 * `unix`: the [`net`] module's `unix` module, with unix-domain sockets, on unix only; it implies
-  `runtime`, and brings the `socket2`, `futures-io` and `futures-core` crates and `rustix`'s
-  `net` feature.
+  `runtime`, and brings the `socket2` crate and `rustix`'s `net` feature.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
@@ -267,6 +280,18 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Runtime::timeout`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.timeout
 [`Runtime::interval`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.interval
+[`Runtime::register`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.register
+[`Registration`]: https://docs.rs/zruntime/latest/zruntime/struct.Registration.html
+[`Async`]: https://docs.rs/zruntime/latest/zruntime/struct.Async.html
+[`Async::readable`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.readable
+[`Async::writable`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.writable
+[`Async::read_with`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.read_with
+[`Async::write_with`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.write_with
 [`Event`]: https://docs.rs/zruntime/latest/zruntime/struct.Event.html
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html

@@ -10,7 +10,7 @@ use std::{
     any::Any,
     cell::{Cell, RefCell},
     future::{Future, Pending, pending, poll_fn},
-    io::{self, Write},
+    io::{self, Read, Write},
     mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::{Pin, pin},
@@ -27,7 +27,7 @@ use std::{
 
 use futures_lite::{
     Stream, StreamExt,
-    future::{block_on, poll_once, yield_now},
+    future::{block_on, or, poll_once, yield_now},
 };
 use ntest::timeout;
 use socket2::{SockRef, Socket};
@@ -1123,6 +1123,160 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A wait for readiness completes once another thread has written to the peer, and the read
+    /// that follows it finds the byte at once, with no retry of its own.
+    fn a_registration_waits_for_readiness<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (source, mut peer) = pair();
+        let registration = M::register(&runtime, source.clone()).unwrap();
+        // Written from another thread once the wait below is under way, so that the byte is one
+        // the wait reports rather than one that was there before it.
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            peer.write_all(&[7]).unwrap();
+        });
+
+        runtime.block_on(registration.ready(Interest::Readable));
+
+        assert_eq!(read_ready_byte(&source), 7);
+        writer.join().unwrap();
+    }
+}
+
+/// Four tasks of a local runtime wait for the readiness of one registration at once, and one
+/// byte ends all four waits, leaving the byte there to be read.
+#[test]
+#[timeout(15000)]
+fn four_local_tasks_wait_for_one_readiness_together() {
+    let runtime = LocalRuntime::new().unwrap();
+    let (source, mut peer) = pair();
+    let registration = Rc::new(runtime.register(source.clone()).unwrap());
+    let tasks: Vec<_> = (0..4)
+        .map(|_| {
+            let registration = registration.clone();
+            runtime.spawn("a task waiting for readiness", async move {
+                registration.ready(Interest::Readable).await;
+            })
+        })
+        .collect();
+    // Written from another thread once the four tasks are waiting.
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(&[7]).unwrap();
+    });
+
+    runtime.block_on(async {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    });
+
+    // Waiting for readiness took nothing from the source.
+    let read = runtime.block_on(read_one(&registration, &source));
+    assert_eq!(read.unwrap(), 1);
+    writer.join().unwrap();
+}
+
+/// Four tasks of a shared runtime wait for the readiness of one registration at once, and one
+/// byte ends all four waits, leaving the byte there to be read.
+#[test]
+#[timeout(15000)]
+fn four_shared_tasks_wait_for_one_readiness_together() {
+    let runtime = SharedRuntime::new().unwrap();
+    let (source, mut peer) = pair();
+    let registration = Arc::new(runtime.register(source.clone()).unwrap());
+    let tasks: Vec<_> = (0..4)
+        .map(|_| {
+            let registration = registration.clone();
+            runtime.spawn("a task waiting for readiness", async move {
+                registration.ready(Interest::Readable).await;
+            })
+        })
+        .collect();
+    // Written from another thread once the four tasks are waiting.
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        peer.write_all(&[7]).unwrap();
+    });
+
+    runtime.block_on(async {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    });
+
+    // Waiting for readiness took nothing from the source.
+    let read = runtime.block_on(read_one(&registration, &source));
+    assert_eq!(read.unwrap(), 1);
+    writer.join().unwrap();
+}
+
+in_both_modes! {
+    /// A wait for readiness is not completed by the wake of a timer it shares its task with.
+    ///
+    /// The timer wakes the task, which polls both futures again, and the wait for readiness has
+    /// to take that for what it is: a poll the source did not cause. Nothing is written to the
+    /// peer, which is kept so that the source does not become readable by its end.
+    fn a_readiness_wait_is_not_completed_by_a_timer<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (source, _peer) = pair();
+        let registration = M::register(&runtime, source).unwrap();
+        let started = Instant::now();
+
+        let winner = runtime.block_on(or(
+            async {
+                registration.ready(Interest::Readable).await;
+                "ready"
+            },
+            async {
+                runtime.sleep(Duration::from_millis(20)).await;
+                "timer"
+            },
+        ));
+
+        assert_eq!(winner, "timer");
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+}
+
+in_both_modes! {
+    /// A wait for readiness dropped while it waits, whether by a poll that gave up on it or by
+    /// the race it lost, leaves the runtime able to finish its `block_on` and the registration
+    /// able to wait again.
+    fn a_dropped_readiness_wait_leaves_the_registration_usable<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (source, mut peer) = pair();
+        let registration = M::register(&runtime, source.clone()).unwrap();
+
+        // Dropped after a single poll, which left it waiting.
+        let polled = runtime.block_on(poll_once(registration.ready(Interest::Readable)));
+        assert!(polled.is_none());
+        // Dropped by the race it lost, when the timer won.
+        let winner = runtime.block_on(or(
+            async {
+                registration.ready(Interest::Readable).await;
+                "ready"
+            },
+            async {
+                runtime.sleep(Duration::from_millis(20)).await;
+                "timer"
+            },
+        ));
+        assert_eq!(winner, "timer");
+        // Written from another thread once the wait below is under way.
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            peer.write_all(&[7]).unwrap();
+        });
+
+        runtime.block_on(registration.ready(Interest::Readable));
+
+        assert_eq!(read_ready_byte(&source), 7);
+        writer.join().unwrap();
+    }
+}
+
+in_both_modes! {
     /// A socket of one protocol family is watched beside a wake channel of another.
     ///
     /// Winsock takes every socket of one `select` call to come from a single service provider,
@@ -1685,6 +1839,16 @@ where
         })
     })
     .await
+}
+
+/// Reads the one byte `source` has right now, with no waiting and no retry, the way a caller does
+/// that has just been told the source is ready: a `WouldBlock` here fails the test.
+fn read_ready_byte(source: &TestSource) -> u8 {
+    let mut byte = [0];
+    let socket = SockRef::from(source);
+    assert_eq!((&*socket).read(&mut byte).unwrap(), 1);
+
+    byte[0]
 }
 
 /// The message a panic carried, which is a string for a panic made from a string literal or a
