@@ -10,7 +10,8 @@
 //! wait.
 //!
 //! This is not the poller of Apple's platforms, although they have kqueue as well: theirs turns a
-//! terminal device away (`EINVAL`), which is why those wait with `select(2)`.
+//! terminal device away (`EINVAL`), which is why those wait with `select(2)`. A build there with
+//! `--cfg zruntime_kqueue` waits on this one all the same, which is how CI runs the tests on it.
 
 use std::{
     io,

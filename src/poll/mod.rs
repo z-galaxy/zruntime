@@ -19,56 +19,72 @@
 
 // Which poller a platform waits on: epoll on Linux and Android, kqueue on the BSDs, `select(2)` on
 // Apple's platforms, where neither `poll(2)` nor kqueue can watch a terminal, `poll(2)` on any
-// other unix and Winsock's `select` on Windows.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// other unix and Winsock's `select` on Windows. A build with `--cfg zruntime_poll` waits on
+// `poll(2)` on every unix, and one with `--cfg zruntime_kqueue` on kqueue on Apple's platforms,
+// which is how CI runs the tests on those two pollers on a platform that has another.
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)))]
 mod epoll;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)))]
 pub(super) use epoll::Poller;
 
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
+#[cfg(all(
+    any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        all(target_vendor = "apple", zruntime_kqueue),
+    ),
+    not(zruntime_poll),
 ))]
 mod kqueue;
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
+#[cfg(all(
+    any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        all(target_vendor = "apple", zruntime_kqueue),
+    ),
+    not(zruntime_poll),
 ))]
 pub(super) use kqueue::Poller;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(any(zruntime_poll, zruntime_kqueue))))]
 mod select;
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(any(zruntime_poll, zruntime_kqueue))))]
 pub(super) use select::Poller;
 
 #[cfg(all(
     unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_vendor = "apple",
-    )),
+    any(
+        zruntime_poll,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_vendor = "apple",
+        )),
+    ),
 ))]
 mod generic;
 #[cfg(all(
     unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_vendor = "apple",
-    )),
+    any(
+        zruntime_poll,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_vendor = "apple",
+        )),
+    ),
 ))]
 pub(super) use generic::Poller;
 
@@ -79,12 +95,17 @@ pub(super) use windows::Poller;
 
 // The list that `poll(2)` and both `select`s keep of what they watch.
 #[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
+    all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)),
+    all(
+        any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            all(target_vendor = "apple", zruntime_kqueue),
+        ),
+        not(zruntime_poll),
+    )
 )))]
 mod list;
 // The channel that breaks the wait of every unix poller.

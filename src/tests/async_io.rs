@@ -924,7 +924,7 @@ in_both_modes! {
 in_both_modes! {
     /// Linux and Android cannot watch a regular file, and a wait on one fails, where the caller
     /// hears of it, rather than waits for readiness that nothing would report.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)))]
     fn a_wait_on_a_regular_file_fails<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();

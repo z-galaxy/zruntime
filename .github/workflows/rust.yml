@@ -94,6 +94,11 @@ jobs:
           cargo --locked clippy --all-targets --all-features --target x86_64-unknown-netbsd
           cargo --locked clippy --all-targets --all-features --target x86_64-pc-windows-gnu
           cargo --locked clippy --all-targets --all-features --target aarch64-linux-android
+      # The pollers that no runner waits on by default, as the test job runs them.
+      - name: Catch common mistakes in the poll(2) and kqueue pollers
+        run: |
+          RUSTFLAGS="-D warnings --cfg zruntime_poll" cargo --locked clippy --all-targets --all-features
+          RUSTFLAGS="-D warnings --cfg zruntime_kqueue" cargo --locked clippy --all-targets --all-features --target x86_64-apple-darwin
 
   test:
     runs-on: ${{ matrix.os }}
@@ -122,6 +127,19 @@ jobs:
       # rest of its tests.
       - name: Test the runtime alone
         run: cargo --locked test --no-default-features --features runtime
+      # Linux waits on epoll and macOS on `select(2)`, which leaves two of the unix pollers with no
+      # runner of their own: `poll(2)`, which a unix with neither epoll nor kqueue waits on, runs
+      # the tests on Linux, and kqueue, which the BSDs wait on, on macOS.
+      - name: Test on poll(2)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTFLAGS: -D warnings --cfg zruntime_poll
+        run: cargo --locked test --all-features
+      - name: Test on kqueue
+        if: matrix.os == 'macos-latest'
+        env:
+          RUSTFLAGS: -D warnings --cfg zruntime_kqueue
+        run: cargo --locked test --all-features
 
   # Miri checks the lock module's `unsafe` code, and the concurrency of everything that needs no
   # runtime: Event, the locks, the two channels and unblock, doc tests included. The runtime's

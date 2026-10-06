@@ -90,6 +90,11 @@ cargo test --no-default-features --features runtime
 
 # Run a single test
 cargo test --all-features some_test_name
+
+# The tests on the pollers no CI runner waits on by default, as CI runs them: `poll(2)` on any unix
+# (on Linux, say), and kqueue on macOS, where the BSDs' poller runs as well
+RUSTFLAGS="--cfg zruntime_poll" cargo test --all-features
+RUSTFLAGS="--cfg zruntime_kqueue" cargo test --all-features
 ```
 
 ### Code Quality
@@ -99,6 +104,11 @@ cargo +nightly fmt --all
 
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
+
+# Lint the pollers no CI runner waits on by default, as CI does
+RUSTFLAGS="--cfg zruntime_poll" cargo clippy --all-targets --all-features -- -D warnings
+RUSTFLAGS="--cfg zruntime_kqueue" cargo clippy --all-targets --all-features \
+    --target x86_64-apple-darwin -- -D warnings
 
 # Check the runtime, Event, the two channels, the locks, unblock, fs and each family of socket
 # built alone: `--all-features` cannot show that each builds without the others, and leaves out
