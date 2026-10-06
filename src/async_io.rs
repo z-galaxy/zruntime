@@ -64,17 +64,18 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// extension traits of [`futures-lite`] or [`futures-util`] read from and write to it. So does a
 /// shared reference to it, `&Async<T, M>`, which lets a reader and a writer share one handle. Both
 /// are there wherever `&T` implements `Read`, for the first trait, and `Write`, for the second,
-/// as it does for a `File`, for `std::io::PipeReader` and `PipeWriter`, and for std's stream
-/// sockets, `TcpStream` and `UnixStream`: a listener or a datagram socket implements neither.
+/// as it does for `std::io::PipeReader` and `PipeWriter`, and for std's stream sockets,
+/// `TcpStream` and `UnixStream`: a listener or a datagram socket implements neither.
 ///
 /// The source sits behind a pointer that the runtime's reactor shares, so no `&mut T` is ever
 /// handed out. A type that implements `Read` or `Write` only for `&mut self`, such as
 /// `std::process::ChildStdout` and `ChildStdin`, has to be converted first. On unix that is
 /// through `OwnedFd`: a `ChildStdout` becomes a `PipeReader`, and a `ChildStdin` a `PipeWriter`.
 ///
-/// A regular file is always reported ready by the system's poll, so a read of one blocks the thread
-/// whatever the mode it is in. A regular file is not what this is for: `zruntime::Unblock` and
-/// `zruntime::fs` run each operation on a thread of their own instead.
+/// A regular file is not what this is for. Linux and Android cannot watch one, and a wait on one
+/// fails there; elsewhere one is reported ready whether or not the disk has its data at hand, and
+/// a read of it blocks the thread whatever the mode it is in. `zruntime::Unblock`
+/// and `zruntime::fs` run each operation on a thread of their own instead.
 ///
 /// # Example
 ///

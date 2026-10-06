@@ -72,7 +72,8 @@ impl Mode for Shared {}
 /// [`Async`](crate::Async) built on such a runtime can wrap.
 ///
 /// On unix that is anything with a file descriptor (`std::os::fd::AsFd`): a socket, a pipe, a
-/// terminal or an eventfd, say. On Windows it is anything with a socket
+/// terminal or an eventfd, say. Linux and Android cannot watch a regular file, a directory or
+/// `/dev/null`, and a wait on one fails there. On Windows it is anything with a socket
 /// (`std::os::windows::io::AsSocket`), the only kind of handle the runtime's `select` can watch
 /// there. A [`Local`] runtime watches such a source of any type. A [`Shared`] runtime watches one
 /// that is [`Send`] and [`Sync`] as well: the thread driving it, whichever that is, holds the

@@ -684,6 +684,28 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A sleep shorter than a millisecond ends well before a millisecond has passed: the wait
+    /// does not round its timeout up to whole milliseconds, as epoll's own timeout would, which
+    /// would have every one of these sleeps take a millisecond at least. The bound leaves several
+    /// times the sleep's length for a busy machine to wake the thread late.
+    ///
+    /// Written for Linux and Android, whose epoll takes a timeout in milliseconds; other kernels
+    /// may let timers that close together go off at once, a millisecond late.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_short_sleep_does_not_wait_a_whole_millisecond<M>() {
+        const ROUNDS: u32 = 20;
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        for _ in 0..ROUNDS {
+            runtime.block_on(runtime.sleep(Duration::from_micros(100)));
+        }
+
+        assert!(started.elapsed() < Duration::from_millis(1) * ROUNDS);
+    }
+}
+
+in_both_modes! {
     fn sleep_until_resolves_once_the_deadline_has_passed<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let started = Instant::now();

@@ -17,16 +17,28 @@
 //! waits that start after it, and a descriptor a wait under way copied has to stay open until that
 //! wait returns.
 
-// Which poller a platform waits on: `select(2)` on Apple's platforms, where `poll(2)` cannot watch
-// a terminal, `poll(2)` on any other unix and Winsock's `select` on Windows.
+// Which poller a platform waits on: epoll on Linux and Android, `select(2)` on Apple's platforms,
+// where `poll(2)` cannot watch a terminal, `poll(2)` on any other unix and Winsock's `select` on
+// Windows.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod epoll;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) use epoll::Poller;
+
 #[cfg(target_vendor = "apple")]
 mod select;
 #[cfg(target_vendor = "apple")]
 pub(super) use select::Poller;
 
-#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+))]
 mod generic;
-#[cfg(all(unix, not(target_vendor = "apple")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+))]
 pub(super) use generic::Poller;
 
 #[cfg(windows)]
@@ -35,6 +47,7 @@ mod windows;
 pub(super) use windows::Poller;
 
 // The list that `poll(2)` and both `select`s keep of what they watch.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod list;
 // The channel that breaks the wait of every unix poller.
 #[cfg(unix)]

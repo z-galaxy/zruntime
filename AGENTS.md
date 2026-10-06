@@ -114,8 +114,8 @@ cargo check --no-default-features --features udp
 cargo check --no-default-features --features unix
 
 # Run what needs no runtime (Event, the locks, the two channels, unblock) under Miri, as CI does;
-# the runtime polls with `ppoll`, which Miri cannot run, and fs reaches the filesystem, which
-# Miri's isolation keeps it from
+# the runtime's poller on Linux keeps a timerfd, which Miri does not run, and fs reaches the
+# filesystem, which Miri's isolation keeps it from
 cargo +nightly miri test --no-default-features --features lock,broadcast,mpmc,unblock
 
 # Run the locks' waiting paths on `wasm32-unknown-unknown`, which has no clock, in Node, as CI

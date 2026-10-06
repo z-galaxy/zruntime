@@ -921,6 +921,21 @@ in_both_modes! {
     }
 }
 
+in_both_modes! {
+    /// Linux and Android cannot watch a regular file, and a wait on one fails, where the caller
+    /// hears of it, rather than waits for readiness that nothing would report.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_wait_on_a_regular_file_fails<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let file = Async::new(&runtime, file).unwrap();
+
+        let refused = runtime.block_on(file.readable()).unwrap_err();
+
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
 /// A local runtime watches a source that is neither `Send` nor `Sync`, and the handle does its
 /// I/O on it: its type says that it stays on the thread, which the compile-fail doc tests show.
 #[test]
