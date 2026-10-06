@@ -1152,7 +1152,7 @@ in_both_modes! {
             peer.write_all(&[7]).unwrap();
         });
 
-        runtime.block_on(registration.ready(Interest::Readable));
+        runtime.block_on(registration.ready(Interest::Readable)).unwrap();
 
         assert_eq!(read_ready_byte(&source), 7);
         writer.join().unwrap();
@@ -1171,7 +1171,7 @@ fn four_local_tasks_wait_for_one_readiness_together() {
         .map(|_| {
             let registration = registration.clone();
             runtime.spawn("a task waiting for readiness", async move {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
             })
         })
         .collect();
@@ -1205,7 +1205,7 @@ fn four_shared_tasks_wait_for_one_readiness_together() {
         .map(|_| {
             let registration = registration.clone();
             runtime.spawn("a task waiting for readiness", async move {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
             })
         })
         .collect();
@@ -1241,7 +1241,7 @@ in_both_modes! {
 
         let winner = runtime.block_on(or(
             async {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
                 "ready"
             },
             async {
@@ -1270,7 +1270,7 @@ in_both_modes! {
         // Dropped by the race it lost, when the timer won.
         let winner = runtime.block_on(or(
             async {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
                 "ready"
             },
             async {
@@ -1285,7 +1285,7 @@ in_both_modes! {
             peer.write_all(&[7]).unwrap();
         });
 
-        runtime.block_on(registration.ready(Interest::Readable));
+        runtime.block_on(registration.ready(Interest::Readable)).unwrap();
 
         assert_eq!(read_ready_byte(&source), 7);
         writer.join().unwrap();

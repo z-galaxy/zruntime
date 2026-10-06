@@ -389,7 +389,7 @@ in_both_modes! {
                     // Each task goes on from here to its wait without yielding, so that a task
                     // counted is a task that waits.
                     waiting.fetch_add(1, Ordering::SeqCst);
-                    reader.readable().await;
+                    reader.readable().await.unwrap();
                 })
             })
             .collect();
@@ -408,7 +408,7 @@ in_both_modes! {
                 task.await.unwrap();
             }
             // Nothing took the byte, so the source is still ready.
-            reader.readable().await;
+            reader.readable().await.unwrap();
         });
     }
 }
@@ -420,7 +420,7 @@ in_both_modes! {
         let (near, _far) = tcp_pair();
         let near = Async::new(&runtime, near).unwrap();
 
-        runtime.block_on(near.writable());
+        runtime.block_on(near.writable()).unwrap();
     }
 }
 
@@ -456,7 +456,7 @@ in_both_modes! {
             // Read from a plain socket with the bytes on their way, which does not wait for the
             // runtime.
             far.read_exact(&mut vec![0; filled]).unwrap();
-            writable.await;
+            writable.await.unwrap();
         });
     }
 }

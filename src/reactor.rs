@@ -389,7 +389,8 @@ where
     /// every poll. The wait completes once the runtime finds the source ready for `interest`, or
     /// once a wait of the runtime fails, and never otherwise: its first poll only stores its
     /// waker, and a poll the source did not cause, as when the future shares a task with others,
-    /// leaves it waiting.
+    /// leaves it waiting. It fails, on its first poll, where the runtime cannot start to watch the
+    /// source for `interest`, which the system's poller may refuse to.
     ///
     /// Any number of these may wait at once, on one source and in one direction, alongside an
     /// operation of [`poll_io`](Registration::poll_io), and the readiness wakes them all.
@@ -467,7 +468,8 @@ where
 /// [`Registration::ready`] hands out.
 ///
 /// The future completes once the runtime finds the source ready, or once a wait of the runtime
-/// fails, and dropping it before then gives up the wait.
+/// fails, and dropping it before then gives up the wait. It fails where the runtime cannot start
+/// to watch the source for the interest, which its first poll finds out.
 #[must_use = "futures do nothing unless polled"]
 pub struct Readiness<'a, M = Local>
 where
@@ -495,14 +497,14 @@ impl<M> Future for Readiness<'_, M>
 where
     M: Mode,
 {
-    type Output = ();
+    type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
         // to run with a lock of this runtime's held.
         let waker = cx.waker().clone();
-        let (ready, told, unused) = {
+        let (done, told, unused) = {
             let mut sources = this.registration.core.reactor.sources.lock();
             let Sources {
                 states,
@@ -519,37 +521,33 @@ where
                         Ok(told) => {
                             let id = *next_waiter;
                             *next_waiter += 1;
-                            state
-                                .wakers
-                                .get_mut(this.interest)
-                                .readiness
-                                .insert(id, waker);
+                            let waiting = &mut state.wakers.get_mut(this.interest).readiness;
+                            waiting.insert(id, waker);
                             this.id = Some(id);
 
-                            (false, told, None)
+                            (None, told, None)
                         }
-                        // The runtime cannot watch the source for this, which ends the wait as a
-                        // failed wait of the runtime does: the caller tries its operation, and sees
-                        // the outcome for itself.
-                        Err(_) => (true, false, Some(waker)),
+                        // The runtime cannot watch the source for this, which the caller hears of
+                        // rather than waits for readiness that nothing would report.
+                        Err(e) => (Some(Err(e)), false, Some(waker)),
                     }
                 }
                 Some(id) => match state.wakers.get_mut(this.interest).readiness.get_mut(&id) {
                     // Still there, so the reactor has not found the source ready since: this
                     // poll came from somewhere else, and the wait goes on with its waker.
-                    Some(stored) => (false, false, Some(mem::replace(stored, waker))),
+                    Some(stored) => (None, false, Some(mem::replace(stored, waker))),
                     // Taken out by the reactor, along with the waker it then woke.
-                    None => (true, false, Some(waker)),
+                    None => (Some(Ok(())), false, Some(waker)),
                 },
             }
         };
         // Clear of the lock: dropping a waker can drop a task, and the future of that task may
         // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
         drop(unused);
-        if ready {
+        if let Some(outcome) = done {
             this.id = None;
 
-            return Poll::Ready(());
+            return Poll::Ready(outcome);
         }
         // A poller that sees a change only in the wait after the one under way has that wait
         // broken here, so that the one after it watches this direction. A waiter already stored
@@ -2006,8 +2004,12 @@ mod tests {
     }
 
     /// Polls `ready` once with `waker`, as a task whose waker that is would.
+    ///
+    /// The tests' sources are ones every poller watches, so the wait never fails.
     fn poll_with(ready: &mut Readiness<'_, Shared>, waker: &Waker) -> Poll<()> {
-        Pin::new(ready).poll(&mut Context::from_waker(waker))
+        Pin::new(ready)
+            .poll(&mut Context::from_waker(waker))
+            .map(|outcome| outcome.expect("the runtime watches the source"))
     }
 
     /// What `read` makes of who waits for `interest` of `registration`'s source.

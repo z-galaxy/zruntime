@@ -205,8 +205,9 @@ where
     /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
     /// task may take the bytes before this one gets to them, so an operation run after the wait
     /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`read_with`](Async::read_with) does. See [`Registration::ready`] for what
-    /// the wait is.
+    /// gets one, as [`read_with`](Async::read_with) does. The wait fails where the runtime cannot
+    /// start to watch the source, which the system's poller may refuse to. See
+    /// [`Registration::ready`] for what the wait is.
     pub fn readable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Readable)
     }
@@ -217,8 +218,9 @@ where
     /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
     /// task may take the room before this one gets to it, so an operation run after the wait
     /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`write_with`](Async::write_with) does. See [`Registration::ready`] for what
-    /// the wait is.
+    /// gets one, as [`write_with`](Async::write_with) does. The wait fails where the runtime cannot
+    /// start to watch the source, which the system's poller may refuse to. See
+    /// [`Registration::ready`] for what the wait is.
     pub fn writable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Writable)
     }
@@ -228,7 +230,8 @@ where
     /// between.
     ///
     /// Resolves to the first success `operation` returns, and to the first error other than
-    /// `WouldBlock`. A call the kernel interrupted is made again straight away.
+    /// `WouldBlock`, or to the error of a wait for readiness, as [`readable`](Async::readable)
+    /// says. A call the kernel interrupted is made again straight away.
     ///
     /// `operation` must not block: the source is in non-blocking mode so that a call on it
     /// returns at once, and `operation` runs on the thread that every task of the runtime shares.
@@ -248,7 +251,7 @@ where
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
-            self.readable().await;
+            self.readable().await?;
         }
     }
 
@@ -257,7 +260,8 @@ where
     /// between.
     ///
     /// Resolves to the first success `operation` returns, a partial write included, and to the
-    /// first error other than `WouldBlock`. A call the kernel interrupted is made again straight
+    /// first error other than `WouldBlock`, or to the error of a wait for readiness, as
+    /// [`writable`](Async::writable) says. A call the kernel interrupted is made again straight
     /// away.
     ///
     /// `operation` must not block: the source is in non-blocking mode so that a call on it
@@ -278,7 +282,7 @@ where
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
-            self.writable().await;
+            self.writable().await?;
         }
     }
 
