@@ -21,7 +21,7 @@
 //! remote.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
     io, mem,
@@ -58,6 +58,7 @@ where
         Self {
             sources: Lock::new(Sources {
                 states: HashMap::new(),
+                descriptors: HashSet::new(),
                 next_key: 0,
                 next_waiter: 0,
             }),
@@ -232,6 +233,15 @@ where
                 crate::poll::MAX_SOURCES
             )));
         }
+        // One descriptor under two keys is more than some of the systems' pollers take: epoll
+        // turns the second away, and kqueue would have it take the place of the first. A runtime
+        // turns it away on every platform, so that a program does on each what it does on any.
+        if !sources.descriptors.insert(descriptor) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this runtime watches the source's descriptor already",
+            ));
+        }
         let key = sources.next_key;
         sources.next_key += 1;
         sources.states.insert(
@@ -384,7 +394,15 @@ where
         // The entry goes with this registration, and with it the reactor's clone of the source;
         // a wait holding a clone of that source keeps the descriptor open until it returns, so
         // the watch is over before the descriptor can close.
-        let removed = self.core.reactor.sources.lock().states.remove(&self.key);
+        let removed = {
+            let mut sources = self.core.reactor.sources.lock();
+            let removed = sources.states.remove(&self.key);
+            if let Some(state) = &removed {
+                sources.descriptors.remove(&state.descriptor);
+            }
+
+            removed
+        };
         // Clear of the lock: the entry that came out of the map may hold a waker, and dropping a
         // waker can drop a task whose future holds a registration or a timer of this reactor,
         // each of which takes a lock as it goes. The source itself may be the last clone of
@@ -696,6 +714,8 @@ where
     M: Mode,
 {
     states: HashMap<usize, SourceState<M>>,
+    /// The descriptor of each source in `states`, which no other source may lend as well.
+    descriptors: HashSet<RawSource>,
     next_key: usize,
     /// The id the next [`Readiness`] to store itself takes.
     next_waiter: u64,

@@ -1123,6 +1123,22 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A runtime watches a descriptor through one registration at a time: a second one is turned
+    /// away while the first lives, and made once it is gone.
+    fn a_descriptor_is_registered_once_at_a_time<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (source, _peer) = pair();
+        let registration = M::register(&runtime, source.clone()).unwrap();
+
+        let again = M::register(&runtime, source.clone()).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+
+        drop(registration);
+        M::register(&runtime, source).unwrap();
+    }
+}
+
+in_both_modes! {
     /// A wait for readiness completes once another thread has written to the peer, and the read
     /// that follows it finds the byte at once, with no retry of its own.
     fn a_registration_waits_for_readiness<M>() {

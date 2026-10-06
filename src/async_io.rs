@@ -140,8 +140,10 @@ where
     /// the handle with [`new_nonblocking`](Async::new_nonblocking).
     ///
     /// What can fail is the switch to non-blocking mode, and the runtime taking the source under
-    /// its watch, which on Windows it does for a limited number of sockets: a runtime watches at
-    /// most 1023 sockets at a time, which its reactor waits on in a single `select` call.
+    /// its watch. A runtime watches a descriptor through one handle at a time, and turns away a
+    /// source whose descriptor it watches already with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists). On Windows it watches a limited number of
+    /// sockets: at most 1023 at a time, which its reactor waits on in a single `select` call.
     pub fn new(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: Source<M>,
@@ -158,9 +160,11 @@ where
     /// [`WouldBlock`](io::ErrorKind::WouldBlock), so an operation on a blocking source with nothing
     /// ready would hold up the thread it runs on, and every other task with it.
     ///
-    /// What can fail is the runtime taking the source under its watch, which on Windows it does
-    /// for a limited number of sockets: a runtime watches at most 1023 sockets at a time, which
-    /// its reactor waits on in a single `select` call.
+    /// What can fail is the runtime taking the source under its watch. A runtime watches a
+    /// descriptor through one handle at a time, and turns away a source whose descriptor it
+    /// watches already with [`AlreadyExists`](io::ErrorKind::AlreadyExists). On Windows it watches
+    /// a limited number of sockets: at most 1023 at a time, which its reactor waits on in a single
+    /// `select` call.
     pub fn new_nonblocking(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: Source<M>,

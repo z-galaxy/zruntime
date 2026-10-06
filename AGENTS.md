@@ -242,10 +242,12 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 `Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`, and whose `ready` hands out a
 `Readiness` future that waits for readiness alone. The source's descriptor is read once, at
 registration, and kept beside it in the map: a wait watches that and calls no `as_fd` or
-`as_socket`, so it runs no code of a source's while it holds the clones of the sources. Each direction of a source keeps one waker for
-`poll_io`, which the next operation to wait takes the place of, and a map of `Readiness` waits
-under ids of their own, any number of which may wait at once: readiness wakes them all and takes
-them out of the map, which is how a `Readiness` tells readiness from a poll anything else caused.
+`as_socket`, so it runs no code of a source's while it holds the clones of the sources. A runtime
+watches a descriptor through one registration at a time, and turns a second away with
+`AlreadyExists`. Each direction of a source keeps one waker for `poll_io`, which the next operation
+to wait takes the place of, and a map of `Readiness` waits under ids of their own, any number of
+which may wait at once: readiness wakes them all and takes them out of the map, which is how a
+`Readiness` tells readiness from a poll anything else caused.
 
 **`Async`, the handle of a source**: `Async<T, M>` is a `Registration` and the mode's `Ptr<T>`
 (`Rc`/`Arc`) of the source, of which the reactor holds a clone through the sealed
