@@ -1,4 +1,5 @@
-//! The wait on unix: `poll(2)` over the sources' descriptors and a pipe that breaks the wait.
+//! The wait on any unix the other pollers do not serve: `poll(2)` over the sources' descriptors and
+//! a pipe that breaks the wait.
 //!
 //! `poll(2)` takes the whole set of descriptors on every call, so this poller keeps the list it is
 //! told about and hands it over afresh on each wait.

@@ -17,17 +17,28 @@
 //! waits that start after it, and a descriptor a wait under way copied has to stay open until that
 //! wait returns.
 
-#[cfg(unix)]
+// Which poller a platform waits on: `select(2)` on Apple's platforms, where `poll(2)` cannot watch
+// a terminal, `poll(2)` on any other unix and Winsock's `select` on Windows.
+#[cfg(target_vendor = "apple")]
+mod select;
+#[cfg(target_vendor = "apple")]
+pub(super) use select::Poller;
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
 mod generic;
-mod list;
-#[cfg(unix)]
-mod pipe;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 pub(super) use generic::Poller;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(super) use windows::Poller;
+
+// The list that `poll(2)` and both `select`s keep of what they watch.
+mod list;
+// The channel that breaks the wait of every unix poller.
+#[cfg(unix)]
+mod pipe;
 
 /// Which directions of a source are watched, or were found ready.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

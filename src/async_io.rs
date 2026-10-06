@@ -76,11 +76,6 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// whatever the mode it is in. A regular file is not what this is for: `zruntime::Unblock` and
 /// `zruntime::fs` run each operation on a thread of their own instead.
 ///
-/// On Apple's platforms, the system's poll cannot watch some devices, `/dev/tty` and `/dev/null`
-/// among them, and reports them ready on every wait, so a wait for one of them never blocks. A
-/// terminal is watched there through the pseudo-terminal device it runs on, such as the standard
-/// input of a program started in it.
-///
 /// # Example
 ///
 /// The reading end of a pipe, read to its end while a thread writes to the other end:
