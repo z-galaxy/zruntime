@@ -34,7 +34,7 @@ use std::{
 use crate::{
     Interest, Local, Mode,
     mode::sealed::Lock,
-    poll::{RawSource, Want},
+    poll::{self, RawSource, Want},
     runtime::{Core, Remote},
 };
 
@@ -88,18 +88,7 @@ where
                 (want.readable || want.writable).then(|| (state.source.clone(), want))
             })
             .collect();
-        let deadline = self
-            .timers
-            .lock()
-            .pending
-            .keys()
-            .next()
-            .map(|(deadline, _)| *deadline);
-        let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-        let timeout = match (at_most, until_deadline) {
-            (Some(at_most), Some(until_deadline)) => Some(at_most.min(until_deadline)),
-            (bound, None) | (None, bound) => bound,
-        };
+        let timeout = self.timeout(at_most);
 
         let ready = match self.remote.poller.wait(&wants, timeout) {
             Ok(ready) => ready,
@@ -155,6 +144,25 @@ where
         }
 
         Ok(())
+    }
+
+    /// How long a wait may last: no longer than `at_most`, than until the nearest deadline, or
+    /// than [`poll::MAX_TIMEOUT`], and without limit where none of those bounds it.
+    fn timeout(&self, at_most: Option<Duration>) -> Option<Duration> {
+        let deadline = self
+            .timers
+            .lock()
+            .pending
+            .keys()
+            .next()
+            .map(|(deadline, _)| *deadline);
+        let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        let timeout = match (at_most, until_deadline) {
+            (Some(at_most), Some(until_deadline)) => Some(at_most.min(until_deadline)),
+            (bound, None) | (None, bound) => bound,
+        };
+
+        timeout.map(|timeout| timeout.min(poll::MAX_TIMEOUT))
     }
 
     /// Lets go of the clones of the sources a wait was made with.
@@ -887,6 +895,43 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(counter.count(), 1);
         assert!(reactor.is_idle());
+    }
+
+    /// A deadline further off than some platforms' waits take a timeout for, about 24 days in
+    /// milliseconds, bounds a wait to what every platform's wait takes.
+    #[test]
+    #[timeout(15000)]
+    fn a_deadline_further_off_than_a_wait_takes_bounds_it_to_what_a_wait_takes() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (_counter, waker) = counting_waker();
+        let mut sleep = pin!(runtime.sleep(Duration::from_secs(30 * 24 * 60 * 60)));
+        let polled = sleep.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+
+        assert_eq!(reactor.timeout(None), Some(poll::MAX_TIMEOUT));
+        assert_eq!(
+            reactor.timeout(Some(Duration::from_secs(1))),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    /// A wait bounded by a deadline further off than some platforms' waits take a timeout for
+    /// runs, rather than failing.
+    #[test]
+    #[timeout(15000)]
+    fn a_deadline_further_off_than_a_wait_takes_lets_the_wait_run() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (counter, waker) = counting_waker();
+        let mut sleep = pin!(runtime.sleep(Duration::from_secs(30 * 24 * 60 * 60)));
+        let polled = sleep.as_mut().poll(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+
+        // Bounded by the deadline alone, and ended at once by the wake-up the poll wrote.
+        reactor.wait(None).unwrap();
+
+        assert_eq!(counter.count(), 0);
     }
 
     #[test]

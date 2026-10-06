@@ -39,3 +39,11 @@ pub(super) struct Ready {
     pub(super) readable: bool,
     pub(super) writable: bool,
 }
+
+/// The longest a wait is asked to last.
+///
+/// Some of the platforms' waits take their timeout as a count of milliseconds in an `int`, and
+/// fail one longer than that holds, about 24 days, rather than wait for it. A wait bounded here
+/// returns early, and the reactor's next wait goes on from there.
+pub(super) const MAX_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(i32::MAX as u64);

@@ -62,7 +62,7 @@ impl Poller {
             let fd = unsafe { BorrowedFd::borrow_raw(want.descriptor) };
             fds.push(PollFd::from_borrowed_fd(fd, flags));
         }
-        // A duration too long for a `Timespec` is as good as no limit.
+        // The reactor bounds every timeout to `MAX_TIMEOUT`, which a `Timespec` holds.
         let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());
         match poll(&mut fds, timeout.as_ref()) {
             Ok(_) => {}
