@@ -2,23 +2,29 @@
 //!
 //! A reactor holds every source registered on it and every timer taken from it, and the thread
 //! driving the runtime hands it that thread through [`Reactor::wait`]: one wait on the platform's
-//! poll, bounded by the nearest deadline, and then the wakes for whatever that wait found ready
+//! poller, bounded by the nearest deadline, and then the wakes for whatever that wait found ready
 //! and for whatever timer has come due.
 //!
-//! The poll is level-triggered, and nothing here arms or disarms a source as readiness comes and
-//! goes. Each wait is told afresh what to watch, worked out from the wakers stored for each
-//! source, so a source nobody waits for any more is simply left out of the next wait, and one
-//! that became ready between two waits is reported by the second. That is also why a waiter which
-//! stores a waker breaks the wait under way: that wait was built before the waker existed, and
-//! only the wait after it takes the source in.
+//! The poller watches each source in the directions the reactor last told it to, and is told of a
+//! change rather than handed every source on each wait, so that a wait costs what the sources
+//! found ready cost and no more, where the platform's poller allows. The poll is level-triggered:
+//! a source watched in a direction it is ready in is reported by every wait until it is not. A
+//! direction is watched from the moment somebody waits in it: the waiter that stores the first
+//! waker of a direction has the poller told there and then, and breaks the wait under way where
+//! the platform's poller sees the change only in the wait after it. A direction nobody waits in
+//! any more is let go of later, before the next wait, and only where nobody has come back to wait
+//! in it again by then: a task woken by readiness usually stores its waker again as it runs out
+//! of what to read, and that costs the poller nothing. A source a wait found ready, or one a
+//! waiter gave up on, is listed for that look before the next wait.
 //!
 //! Two locks guard the sources and the timers, and neither is taken while the other is held. A
-//! source's wakers live in its entry in the map, under the map's lock. Neither lock is held
-//! across the wait, which may last until a deadline, nor across a wake or the drop of a waker or
-//! of the last clone of a source, each of which runs somebody else's code and may come straight
-//! back here to register a source, to ask for a timer or to let either go. The flag that spares a
-//! `notify` its write while a wake-up is on its way needs no lock: it is an atomic of the runtime's
-//! remote.
+//! source's wakers live in its entry in the map, under the map's lock, and every change the poller
+//! is told of is made under that lock too, so that two of them never reach it out of order. Neither
+//! lock is held across the wait, which may last until a deadline, nor across a wake or the drop of
+//! a waker or of the last clone of a source, each of which runs somebody else's code and may come
+//! straight back here to register a source, to ask for a timer or to let either go. The flag that
+//! spares a `notify` its write while a wake-up is on its way needs no lock: it is an atomic of the
+//! runtime's remote.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -33,8 +39,9 @@ use std::{
 
 use crate::{
     Interest, Local, Mode,
+    log::error,
     mode::sealed::Lock,
-    poll::{self, RawSource, Want},
+    poll::{self, Directions, Poller, RawSource},
     runtime::{Core, Remote},
 };
 
@@ -61,6 +68,9 @@ where
                 descriptors: HashSet::new(),
                 next_key: 0,
                 next_waiter: 0,
+                stale: Vec::new(),
+                waiting: false,
+                retired: Vec::new(),
             }),
             timers: Lock::new(Timers::default()),
             remote,
@@ -70,31 +80,20 @@ where
     /// One wait on the poller, bounded by `at_most` and by the nearest deadline, then the wakes
     /// for what it found ready and for the timers that are due.
     pub(crate) fn wait(&self, at_most: Option<Duration>) -> io::Result<()> {
-        // Clones of the sources rather than borrows of them: the wait is made with no lock held,
-        // and a registration let go of while it runs on another thread leaves its descriptor
-        // open until the wait returns.
-        let wants: Vec<(M::SourcePtr, Want)> = self
-            .sources
-            .lock()
-            .states
-            .iter()
-            .filter_map(|(&key, state)| {
-                let want = Want {
-                    key,
-                    descriptor: state.descriptor,
-                    readable: state.wakers.readable.any(),
-                    writable: state.wakers.writable.any(),
-                };
-
-                (want.readable || want.writable).then(|| (state.source.clone(), want))
-            })
-            .collect();
+        {
+            let mut sources = self.sources.lock();
+            sources.reconcile(&self.remote.poller)?;
+            // A poller that copies its list as a wait starts watches, until the wait returns,
+            // descriptors whose registrations may go in the meantime: those are kept open until
+            // then, which `Registration::drop` reads this for.
+            sources.waiting = !Poller::LIVE;
+        }
         let timeout = self.timeout(at_most);
 
-        let ready = match self.remote.poller.wait(&wants, timeout) {
+        let ready = match self.remote.poller.wait(timeout) {
             Ok(ready) => ready,
             Err(e) => {
-                self.release(wants);
+                self.end_wait();
 
                 return Err(e);
             }
@@ -107,27 +106,37 @@ where
         // left in the channel by a wait that ended some other way only ends the next one at once.
         self.remote.wake_pending.store(false, Ordering::Release);
 
-        let (woken, unregistered) = {
+        let (woken, retired) = {
             let mut sources = self.sources.lock();
-            let unregistered = unregistered(&sources, wants);
+            sources.waiting = false;
+            let Sources {
+                states,
+                stale,
+                retired,
+                ..
+            } = &mut *sources;
             let mut woken = Vec::new();
             for event in &ready {
                 // A source let go of while the wait ran has nobody left to wake.
-                let Some(state) = sources.states.get_mut(&event.key) else {
+                let Some(state) = states.get_mut(&event.key) else {
                     continue;
                 };
-                if event.readable {
+                if event.directions.readable {
                     state.wakers.readable.take_into(&mut woken);
                 }
-                if event.writable {
+                if event.directions.writable {
                     state.wakers.writable.take_into(&mut woken);
                 }
+                // Watched still in what it was found ready in, which nobody may wait in any
+                // more: looked at again before the next wait.
+                state.mark_stale(event.key, stale);
             }
 
-            (woken, unregistered)
+            (woken, mem::take(retired))
         };
-        // Clear of every lock, and of every clone of a source still registered: see `release`.
-        drop(unregistered);
+        // Clear of every lock: the last clone of a source whose registration went while the wait
+        // ran closes the source, which runs the destructor of whatever was registered.
+        drop(retired);
         for waker in woken {
             waker.wake();
         }
@@ -166,31 +175,35 @@ where
         timeout.map(|timeout| timeout.min(poll::MAX_TIMEOUT))
     }
 
-    /// Lets go of the clones of the sources a wait was made with.
+    /// Ends a wait that failed: lets go, clear of every lock, of the sources whose registrations
+    /// went while it ran. A wait that succeeds does the same under the lock it takes to wake the
+    /// waiters of what it found ready.
     ///
-    /// A clone of a source that is still registered is not the last of its source: the map holds
-    /// another, which only goes under the map's lock, so those clones go under it, where letting
-    /// go of one runs no code but the count's. The rest may each be the last, of a source whose
-    /// registration went while the wait ran, and the drop of the last clone closes the source,
-    /// which runs the destructor of whatever was registered: those go clear of every lock, and
-    /// once no clone of a registered source is left here. A destructor that takes a source of
-    /// this runtime back, through `Async::into_inner`, waits until nothing else holds that source,
-    /// which would be for good if this thread still held a clone of it.
-    ///
-    /// A wait that succeeds does the same, under the lock it takes to wake the waiters of what it
-    /// found ready.
-    fn release(&self, wants: Vec<(M::SourcePtr, Want)>) {
-        let unregistered = unregistered(&self.sources.lock(), wants);
-        drop(unregistered);
+    /// The drop of the last clone of a source closes it, which runs the destructor of whatever
+    /// was registered: somebody else's code, which may come straight back here.
+    fn end_wait(&self) {
+        let retired = {
+            let mut sources = self.sources.lock();
+            sources.waiting = false;
+
+            mem::take(&mut sources.retired)
+        };
+        drop(retired);
     }
 
     /// Wakes every stored waker, sources and timers alike; what a failed wait falls back on, so
     /// that each waiter retries its operation and sees its own error.
     pub(crate) fn wake_everything(&self) {
         let mut woken = Vec::new();
-        for state in self.sources.lock().states.values_mut() {
-            state.wakers.readable.take_into(&mut woken);
-            state.wakers.writable.take_into(&mut woken);
+        {
+            let mut sources = self.sources.lock();
+            let Sources { states, stale, .. } = &mut *sources;
+            for (&key, state) in states.iter_mut() {
+                state.wakers.readable.take_into(&mut woken);
+                state.wakers.writable.take_into(&mut woken);
+                // Watched still for the waiters just woken, who may not wait again.
+                state.mark_stale(key, stale);
+            }
         }
         woken.extend(mem::take(&mut self.timers.lock().pending).into_values());
 
@@ -224,15 +237,6 @@ where
     let descriptor = std::os::windows::io::AsRawSocket::as_raw_socket(&M::as_source(&source));
     let key = {
         let mut sources = core.reactor.sources.lock();
-        // One `select` takes a fixed number of sockets, one place of which is spoken for by the
-        // channel that breaks the wait.
-        #[cfg(windows)]
-        if sources.states.len() >= crate::poll::MAX_SOURCES {
-            return Err(io::Error::other(format!(
-                "this runtime watches at most {} sockets",
-                crate::poll::MAX_SOURCES
-            )));
-        }
         // One descriptor under two keys is more than some of the systems' pollers take: epoll
         // turns the second away, and kqueue would have it take the place of the first. A runtime
         // turns it away on every platform, so that a program does on each what it does on any.
@@ -243,6 +247,11 @@ where
             ));
         }
         let key = sources.next_key;
+        if let Err(e) = core.remote.poller.add(key, descriptor) {
+            sources.descriptors.remove(&descriptor);
+
+            return Err(e);
+        }
         sources.next_key += 1;
         sources.states.insert(
             key,
@@ -250,6 +259,8 @@ where
                 source,
                 descriptor,
                 wakers: Wakers::default(),
+                armed: Directions::NONE,
+                stale: false,
             },
         );
 
@@ -306,7 +317,9 @@ where
     /// The first success `operation` returns, a partial write included, and the first error
     /// other than [`WouldBlock`](io::ErrorKind::WouldBlock) are each what this call resolves to.
     /// A `WouldBlock` means the source was not ready after all: `cx`'s waker is arranged to be
-    /// woken once it is, and [`Poll::Pending`] is returned.
+    /// woken once it is, and [`Poll::Pending`] is returned. Where the runtime fails to start
+    /// watching the source for `interest` then, which the system's poller may refuse to, the call
+    /// resolves to that error instead.
     ///
     /// A registration keeps one waker per interest for this, so only one operation at a time may
     /// be waiting on each: a second one waiting to read, say, takes the first one's place, which
@@ -332,20 +345,38 @@ where
         // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
         // to run with a lock of this runtime's held.
         let waker = cx.waker().clone();
-        let replaced = {
+        let stored = {
             let mut sources = self.core.reactor.sources.lock();
             let Some(state) = sources.states.get_mut(&self.key) else {
                 unreachable!("a source stays in the map for as long as its registration lives");
             };
-
-            state.wakers.get_mut(interest).operation.replace(waker)
+            match state.arm(self.key, interest, &self.core.remote.poller) {
+                Ok(told) => Ok((
+                    told,
+                    state.wakers.get_mut(interest).operation.replace(waker),
+                )),
+                Err(e) => Err((e, waker)),
+            }
         };
         // Clear of the lock: dropping a waker can drop a task, and the future of that task may
         // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
-        drop(replaced);
-        // The wait under way was built before this waker was stored, so it is broken here and
-        // the one that follows it watches this source.
-        self.core.remote.notify();
+        let told = match stored {
+            Ok((told, replaced)) => {
+                drop(replaced);
+
+                told
+            }
+            Err((e, waker)) => {
+                drop(waker);
+
+                return Poll::Ready(Err(e));
+            }
+        };
+        // A poller that sees a change only in the wait after the one under way has that wait
+        // broken here, so that the one after it watches this direction.
+        if told && !Poller::LIVE {
+            self.core.remote.notify();
+        }
 
         Poll::Pending
     }
@@ -391,25 +422,43 @@ where
     M: Mode,
 {
     fn drop(&mut self) {
-        // The entry goes with this registration, and with it the reactor's clone of the source;
-        // a wait holding a clone of that source keeps the descriptor open until it returns, so
-        // the watch is over before the descriptor can close.
-        let removed = {
+        // The entry goes with this registration, and with it the reactor's clone of the source.
+        let (removed, deleted) = {
             let mut sources = self.core.reactor.sources.lock();
             let removed = sources.states.remove(&self.key);
-            if let Some(state) = &removed {
-                sources.descriptors.remove(&state.descriptor);
-            }
+            let deleted = match &removed {
+                Some(state) => {
+                    sources.descriptors.remove(&state.descriptor);
+                    // A poller that copied its list as the wait under way started watches the
+                    // descriptor until that wait returns, and the source is kept until then, so
+                    // that the descriptor stays open for it.
+                    if sources.waiting {
+                        sources.retired.push(state.source.clone());
+                    }
+                    // While the entry still holds the source, so that the poller lets go of the
+                    // descriptor before it can close, and under the lock, so that no change to
+                    // what the source is watched for reaches the poller after this.
+                    self.core
+                        .remote
+                        .poller
+                        .delete(self.key, state.descriptor, state.armed)
+                }
+                None => Ok(()),
+            };
 
-            removed
+            (removed, deleted)
         };
         // Clear of the lock: the entry that came out of the map may hold a waker, and dropping a
         // waker can drop a task whose future holds a registration or a timer of this reactor,
         // each of which takes a lock as it goes. The source itself may be the last clone of
         // what was registered, whose destructor is somebody else's code.
         drop(removed);
-        // Clear of the lock as well: the wait built from a source that has gone is broken, so
-        // that the wait after it leaves that source out.
+        if let Err(e) = deleted {
+            error!("The runtime failed to stop watching a source: {}", e);
+        }
+        // Clear of the lock as well: a wait that copied the source in is broken, so that the
+        // source it keeps open goes, and a helper waiting with nothing else left to watch hears
+        // that it has nothing left to wait for.
         self.core.remote.notify();
     }
 }
@@ -453,27 +502,39 @@ where
         // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
         // to run with a lock of this runtime's held.
         let waker = cx.waker().clone();
-        let (ready, stored, unused) = {
+        let (ready, told, unused) = {
             let mut sources = this.registration.core.reactor.sources.lock();
             let Sources {
                 states,
                 next_waiter,
                 ..
             } = &mut *sources;
-            let Some(state) = states.get_mut(&this.registration.key) else {
+            let key = this.registration.key;
+            let Some(state) = states.get_mut(&key) else {
                 unreachable!("a source stays in the map for as long as its registration lives");
             };
-            let waiting = &mut state.wakers.get_mut(this.interest).readiness;
             match this.id {
                 None => {
-                    let id = *next_waiter;
-                    *next_waiter += 1;
-                    waiting.insert(id, waker);
-                    this.id = Some(id);
+                    match state.arm(key, this.interest, &this.registration.core.remote.poller) {
+                        Ok(told) => {
+                            let id = *next_waiter;
+                            *next_waiter += 1;
+                            state
+                                .wakers
+                                .get_mut(this.interest)
+                                .readiness
+                                .insert(id, waker);
+                            this.id = Some(id);
 
-                    (false, true, None)
+                            (false, told, None)
+                        }
+                        // The runtime cannot watch the source for this, which ends the wait as a
+                        // failed wait of the runtime does: the caller tries its operation, and sees
+                        // the outcome for itself.
+                        Err(_) => (true, false, Some(waker)),
+                    }
                 }
-                Some(id) => match waiting.get_mut(&id) {
+                Some(id) => match state.wakers.get_mut(this.interest).readiness.get_mut(&id) {
                     // Still there, so the reactor has not found the source ready since: this
                     // poll came from somewhere else, and the wait goes on with its waker.
                     Some(stored) => (false, false, Some(mem::replace(stored, waker))),
@@ -490,9 +551,10 @@ where
 
             return Poll::Ready(());
         }
-        // The wait under way was built before this waiter was stored, so it is broken here and
-        // the one that follows it watches the source. A waiter already stored is in that wait.
-        if stored {
+        // A poller that sees a change only in the wait after the one under way has that wait
+        // broken here, so that the one after it watches this direction. A waiter already stored
+        // is watched for already.
+        if told && !Poller::LIVE {
             this.registration.core.remote.notify();
         }
 
@@ -511,17 +573,22 @@ where
         };
         let removed = {
             let mut sources = self.registration.core.reactor.sources.lock();
-            let Some(state) = sources.states.get_mut(&self.registration.key) else {
+            let Sources { states, stale, .. } = &mut *sources;
+            let key = self.registration.key;
+            let Some(state) = states.get_mut(&key) else {
                 unreachable!("a source stays in the map for as long as its registration lives");
             };
+            // Watched still for this waiter, who may have been the last in its direction: looked
+            // at again before the next wait.
+            state.mark_stale(key, stale);
 
             state.wakers.get_mut(self.interest).readiness.remove(&id)
         };
         // Clear of the lock: dropping a waker can drop a task, and the future of that task may
         // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
         // No wake-up for the wait under way, which may still watch the source for this waiter:
-        // it costs that wait no more than one early return, and the wait after it leaves the
-        // source out unless somebody else waits on it.
+        // it costs that wait no more than one early return, and the source is let go of before
+        // the wait after it unless somebody else waits on it by then.
         drop(removed);
     }
 }
@@ -693,21 +760,6 @@ where
     }
 }
 
-/// The clones in `wants` of the sources `sources` no longer holds, having let go of the others:
-/// what [`Reactor::release`] keeps to let go of clear of the map's lock, which the caller holds.
-fn unregistered<M>(
-    sources: &Sources<M>,
-    wants: Vec<(M::SourcePtr, Want)>,
-) -> Vec<(M::SourcePtr, Want)>
-where
-    M: Mode,
-{
-    wants
-        .into_iter()
-        .filter(|(_, want)| !sources.states.contains_key(&want.key))
-        .collect()
-}
-
 /// The sources the reactor watches, under the keys it reports them by.
 struct Sources<M>
 where
@@ -719,9 +771,56 @@ where
     next_key: usize,
     /// The id the next [`Readiness`] to store itself takes.
     next_waiter: u64,
+    /// The keys of the sources that may be watched in a direction nobody waits in any more, each
+    /// once: those a wait found ready, and those a waiter gave up on, to be looked at before the
+    /// next wait.
+    stale: Vec<usize>,
+    /// Whether a wait is under way on a poller that copied its list as it started, which watches
+    /// every descriptor it copied until it returns.
+    waiting: bool,
+    /// The sources whose registrations went while such a wait ran, kept so that their
+    /// descriptors stay open until it returns.
+    retired: Vec<M::SourcePtr>,
 }
 
-/// One watched source: the descriptor, and who to wake for each direction of it.
+impl<M> Sources<M>
+where
+    M: Mode,
+{
+    /// Has `poller` stop watching each stale source in the directions nobody waits in any more.
+    ///
+    /// A source that fails to be told keeps being watched as it was, and is looked at again once a
+    /// wait reports it; the first failure is what this returns, once every source has been looked
+    /// at.
+    fn reconcile(&mut self, poller: &Poller) -> io::Result<()> {
+        let Self { states, stale, .. } = self;
+        let mut result = Ok(());
+        for key in stale.drain(..) {
+            // A source let go of since has been let go of by the poller as well.
+            let Some(state) = states.get_mut(&key) else {
+                continue;
+            };
+            state.stale = false;
+            let wanted = state.wakers.directions();
+            if wanted == state.armed {
+                continue;
+            }
+            match poller.modify(key, state.descriptor, state.armed, wanted) {
+                Ok(()) => state.armed = wanted,
+                Err(e) => {
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+}
+
+/// One watched source: the descriptor, who to wake for each direction of it, and what the poller
+/// watches it for.
 struct SourceState<M>
 where
     M: Mode,
@@ -730,6 +829,41 @@ where
     /// The descriptor the source lent when it was registered, which is what a wait watches.
     descriptor: RawSource,
     wakers: Wakers,
+    /// The directions the poller was last told to watch the source in: every direction somebody
+    /// waits in, and maybe more, until the source is next looked at.
+    armed: Directions,
+    /// Whether the source's key is in [`Sources::stale`].
+    stale: bool,
+}
+
+impl<M> SourceState<M>
+where
+    M: Mode,
+{
+    /// Has `poller` watch this source, whose key is `key`, in `interest` as well, unless it does
+    /// already: what a waiter in `interest` is stored after. Whether the poller had to be told.
+    fn arm(&mut self, key: usize, interest: Interest, poller: &Poller) -> io::Result<bool> {
+        let mut wanted = self.armed;
+        match interest {
+            Interest::Readable => wanted.readable = true,
+            Interest::Writable => wanted.writable = true,
+        }
+        if wanted == self.armed {
+            return Ok(false);
+        }
+        poller.modify(key, self.descriptor, self.armed, wanted)?;
+        self.armed = wanted;
+
+        Ok(true)
+    }
+
+    /// Lists this source, whose key is `key`, in `stale`, unless it is there already.
+    fn mark_stale(&mut self, key: usize, stale: &mut Vec<usize>) {
+        if !self.stale {
+            self.stale = true;
+            stale.push(key);
+        }
+    }
 }
 
 /// Who waits for each direction of one source.
@@ -747,6 +881,14 @@ impl Wakers {
             Interest::Writable => &mut self.writable,
         }
     }
+
+    /// The directions somebody waits in.
+    fn directions(&self) -> Directions {
+        Directions {
+            readable: self.readable.any(),
+            writable: self.writable.any(),
+        }
+    }
 }
 
 /// Who waits for one direction of one source.
@@ -762,7 +904,7 @@ struct Waiters {
 }
 
 impl Waiters {
-    /// Whether anybody waits in this direction, which is what has a wait watch for it.
+    /// Whether anybody waits in this direction, which is what has the poller watch for it.
     fn any(&self) -> bool {
         self.operation.is_some() || !self.readiness.is_empty()
     }
@@ -784,7 +926,13 @@ struct Timers {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, pin::pin, sync::atomic::AtomicUsize, task::Wake, thread};
+    use std::{
+        io::Write,
+        pin::pin,
+        sync::{Mutex, atomic::AtomicUsize},
+        task::Wake,
+        thread,
+    };
 
     #[cfg(unix)]
     use std::os::fd::OwnedFd;
@@ -1487,9 +1635,10 @@ mod tests {
         assert!(!runtime.core.remote.wake_pending());
     }
 
-    /// Only the poll that stores a wait for readiness writes a wake-up, which breaks the wait
-    /// under way, built before there was anything to watch for it. A later poll finds the wait
-    /// stored, and so already in whichever wait follows.
+    /// Only the poll that stores a wait for readiness writes a wake-up, and only where the
+    /// platform's poller sees the change it makes in the wait after the one under way alone:
+    /// that wait is broken, so that the next one watches the source. A later poll finds the
+    /// wait stored, and so watched for already.
     #[test]
     #[timeout(15000)]
     fn only_the_first_poll_of_a_readiness_wait_writes_a_wake_up() {
@@ -1503,7 +1652,7 @@ mod tests {
         assert!(!remote.wake_pending());
 
         assert!(poll_with(&mut ready, &waker).is_pending());
-        assert!(remote.wake_pending());
+        assert_eq!(remote.wake_pending(), !Poller::LIVE);
         // The wake-up taken out of the channel, and the flag down with it.
         reactor.wait(Some(Duration::ZERO)).unwrap();
         assert!(!remote.wake_pending());
@@ -1636,6 +1785,132 @@ mod tests {
         assert_eq!(Arc::strong_count(&second), 2);
     }
 
+    /// A direction the poller watches for a waiter is watched still once a wait has woken that
+    /// waiter, and let go of before the next wait, where nobody waits in it again by then.
+    #[test]
+    #[timeout(15000)]
+    fn a_direction_nobody_waits_in_again_is_let_go_of_before_the_next_wait() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source.clone()).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(armed(&registration), Directions::NONE);
+        assert!(read_one(&registration, &source, &mut cx).is_pending());
+        assert_eq!(armed(&registration), READABLE);
+
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(counter.count(), 1);
+        assert_eq!(armed(&registration), READABLE);
+
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A waiter that comes back to a direction before the next wait, as a task woken to read does
+    /// once it has read all there was, keeps the direction watched, and the poller is told
+    /// nothing.
+    #[test]
+    #[timeout(15000)]
+    fn a_waiter_back_before_the_next_wait_keeps_its_direction_watched() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source.clone()).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(read_one(&registration, &source, &mut cx).is_pending());
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(counter.count(), 1);
+
+        assert!(matches!(
+            read_one(&registration, &source, &mut cx),
+            Poll::Ready(Ok(1))
+        ));
+        assert!(read_one(&registration, &source, &mut cx).is_pending());
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+
+        assert_eq!(armed(&registration), READABLE);
+        assert_eq!(counter.count(), 1);
+    }
+
+    /// A wait for readiness given up leaves its direction watched until the next wait, which lets
+    /// it go where nobody else waits in it.
+    #[test]
+    #[timeout(15000)]
+    fn a_dropped_readiness_wait_lets_its_direction_go_before_the_next_wait() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let (_counter, waker) = counting_waker();
+        let mut first = registration.ready(Interest::Readable);
+        let mut second = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut first, &waker).is_pending());
+        assert!(poll_with(&mut second, &waker).is_pending());
+
+        drop(first);
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(armed(&registration), READABLE);
+
+        drop(second);
+        assert_eq!(armed(&registration), READABLE);
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A source whose peer has hung up, and that nobody waits on, keeps no wait from blocking:
+    /// the poller does not report it, or reports it once, and a wait after that sits out its
+    /// timeout.
+    #[test]
+    #[timeout(15000)]
+    fn a_hung_up_source_nobody_waits_on_lets_the_wait_block() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, peer) = pair();
+        let _registration = runtime.register(source).unwrap();
+        drop(peer);
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+
+        let started = Instant::now();
+        reactor.wait(Some(Duration::from_millis(100))).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(90));
+    }
+
+    /// The source of a registration dropped while a wait is under way is kept until that wait
+    /// returns, which is what a wait on a poller that copied the source's descriptor in as it
+    /// started has a registration's drop do; and the wait lets go of it as it returns.
+    ///
+    /// The wait under way is one this test marks as such itself, so that the drop path is tested
+    /// on every poller and with no race against a wait on another thread.
+    #[test]
+    #[timeout(15000)]
+    fn a_source_let_go_of_during_a_wait_is_kept_until_the_wait_returns() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, _peer) = pair();
+        let dropped = Arc::new(Mutex::new(false));
+        let tracked = Tracked {
+            source,
+            dropped: dropped.clone(),
+        };
+        let registration = runtime.register(tracked).unwrap();
+        Lock::lock(&reactor.sources).waiting = true;
+
+        drop(registration);
+        assert!(!*dropped.lock().unwrap());
+        assert_eq!(Lock::lock(&reactor.sources).retired.len(), 1);
+
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert!(*dropped.lock().unwrap());
+        assert!(Lock::lock(&reactor.sources).retired.is_empty());
+    }
+
     /// A runtime of the test's own, whose reactor the test waits on as the thread driving it
     /// would. Shared, so that a test can hand it to a thread of its own.
     fn runtime() -> SharedRuntime {
@@ -1750,6 +2025,48 @@ mod tests {
         };
 
         read(state.wakers.get_mut(interest))
+    }
+
+    /// What the poller watches `registration`'s source for.
+    fn armed(registration: &Registration<Shared>) -> Directions {
+        let sources = Lock::lock(&registration.core.reactor.sources);
+        let Some(state) = sources.states.get(&registration.key) else {
+            unreachable!("a source stays in the map for as long as its registration lives");
+        };
+
+        state.armed
+    }
+
+    /// The readable direction alone.
+    const READABLE: Directions = Directions {
+        readable: true,
+        writable: false,
+    };
+
+    /// A source that records that it has been dropped.
+    struct Tracked {
+        source: TestSource,
+        dropped: Arc<Mutex<bool>>,
+    }
+
+    #[cfg(unix)]
+    impl std::os::fd::AsFd for Tracked {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.source.as_fd()
+        }
+    }
+
+    #[cfg(windows)]
+    impl std::os::windows::io::AsSocket for Tracked {
+        fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+            self.source.as_socket()
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            *self.dropped.lock().unwrap() = true;
+        }
     }
 
     /// A waker that counts how often it has been woken.

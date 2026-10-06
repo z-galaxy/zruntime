@@ -241,13 +241,25 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 `Registration` whose `poll_io` drives an arbitrary operation against
 `Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`, and whose `ready` hands out a
 `Readiness` future that waits for readiness alone. The source's descriptor is read once, at
-registration, and kept beside it in the map: a wait watches that and calls no `as_fd` or
-`as_socket`, so it runs no code of a source's while it holds the clones of the sources. A runtime
-watches a descriptor through one registration at a time, and turns a second away with
-`AlreadyExists`. Each direction of a source keeps one waker for `poll_io`, which the next operation
-to wait takes the place of, and a map of `Readiness` waits under ids of their own, any number of
-which may wait at once: readiness wakes them all and takes them out of the map, which is how a
-`Readiness` tells readiness from a poll anything else caused.
+registration, and kept beside it in the map: the poller watches that and calls no `as_fd` or
+`as_socket`, so it runs no code of a source's. A runtime watches a descriptor through one
+registration at a time, and turns a second away with `AlreadyExists`. Each direction of a source
+keeps one waker for `poll_io`, which the next operation to wait takes the place of, and a map of
+`Readiness` waits under ids of their own, any number of which may wait at once: readiness wakes
+them all and takes them out of the map, which is how a `Readiness` tells readiness from a poll
+anything else caused.
+
+**Telling the poller what changes**: the reactor tells the poller (`src/poll/`) of each change to
+what a source is watched for, under the map's lock, rather than handing it every source on each
+wait: `add` as a source is registered, `modify` as the directions it is watched in change, and
+`delete` as its registration goes. A direction is armed as soon as a waiter is stored in it, and
+disarmed lazily: a source a wait found ready, or a `Readiness` gave up on, is listed in
+`Sources::stale` and looked at before the next wait, so that a task that stores its waker again
+before then costs the poller nothing. `Poller::LIVE` says whether a change reaches a wait under
+way (a poller that keeps what it watches in the kernel) or only the next one (one that keeps a
+`poll/list.rs` list and copies it as a wait starts). For the latter, arming breaks the wait under
+way, and a source whose registration goes while a wait runs is kept in `Sources::retired`, so
+that its descriptor stays open, until that wait returns.
 
 **`Async`, the handle of a source**: `Async<T, M>` is a `Registration` and the mode's `Ptr<T>`
 (`Rc`/`Arc`) of the source, of which the reactor holds a clone through the sealed
@@ -261,10 +273,8 @@ reactor sharing the pointer, so the I/O traits are there only where `&T` impleme
 wait through `Readiness`, any number of tasks at once; `poll_read_with`, `poll_write_with` and the
 traits keep one waiting task per direction, through `poll_io`. `into_inner` ends the watch and
 takes the source out of the pointer: on `Local` nothing else holds it by then, and on `Shared` it
-yields until a wait under way on another thread lets go of its clone. A wait lets go of its clones
-of registered sources under the map's lock, before the others, whose drop may be the last and run
-a destructor (`Reactor::release`): a destructor that takes another source back on the driving
-thread would otherwise yield for good on a clone that thread holds.
+yields until a wait under way on another thread returns and the reactor lets go of the source it
+kept for that wait, which it does clear of every lock and before it wakes anyone.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.

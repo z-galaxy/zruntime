@@ -21,7 +21,7 @@ use windows_sys::Win32::Networking::WinSock::{
     FD_SET, SOCKET, SOCKET_ERROR, TIMEVAL, WSAGetLastError, select,
 };
 
-use super::{Ready, Want};
+use super::{Directions, RawSource, Ready, list::List};
 
 pub(crate) struct Poller {
     /// The half a wait watches, and drains whenever it holds anything.
@@ -32,9 +32,14 @@ pub(crate) struct Poller {
     wake_read: TcpStream,
     /// The half a `notify` writes one byte to.
     wake_write: TcpStream,
+    list: List,
 }
 
 impl Poller {
+    /// Whether a change reaches a wait under way: it does not, as each wait copies the list as it
+    /// starts.
+    pub(crate) const LIVE: bool = false;
+
     pub(crate) fn new() -> io::Result<Self> {
         // Winsock has no socket pair, so the pair is a connection a listener of our own accepts
         // from the loopback address and then has no further use for.
@@ -58,6 +63,7 @@ impl Poller {
         Ok(Self {
             wake_read,
             wake_write,
+            list: List::new(),
         })
     }
 
@@ -71,9 +77,47 @@ impl Poller {
         }
     }
 
-    /// Waits until a wanted source is ready, `notify` is called or `timeout` passes; `None`
-    /// waits without limit. The sources are held for the whole call, so no socket in the set
-    /// can close under it.
+    /// Takes the source `key` in, watched for nothing yet; turned away where the runtime watches
+    /// as many sockets as one `select` takes in already.
+    pub(crate) fn add(&self, key: usize, _descriptor: RawSource) -> io::Result<()> {
+        if self.list.add() > MAX_SOURCES {
+            self.list.delete(key);
+
+            return Err(io::Error::other(format!(
+                "this runtime watches at most {MAX_SOURCES} sockets"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Watches the source `key` for `to` rather than for `from`, from the next wait on.
+    pub(crate) fn modify(
+        &self,
+        key: usize,
+        descriptor: RawSource,
+        _from: Directions,
+        to: Directions,
+    ) -> io::Result<()> {
+        self.list.modify(key, descriptor, to);
+
+        Ok(())
+    }
+
+    /// Lets go of the source `key`, watched for `from`, from the next wait on.
+    pub(crate) fn delete(
+        &self,
+        key: usize,
+        _descriptor: RawSource,
+        _from: Directions,
+    ) -> io::Result<()> {
+        self.list.delete(key);
+
+        Ok(())
+    }
+
+    /// Waits until a watched source is ready, `notify` is called or `timeout` passes; `None`
+    /// waits without limit.
     ///
     /// What Winsock undertakes to report is narrow. The read set comes back holding a socket
     /// with data to read or one whose connection was closed, reset or terminated; the write set
@@ -82,12 +126,9 @@ impl Poller {
     /// except set is left open, which is why every source is offered for that set and a source
     /// found there is reported readable and writable both: whichever of the two a waiter parked
     /// for, it then retries its own operation and reads the error off that.
-    pub(crate) fn wait<S>(
-        &self,
-        sources: &[(S, Want)],
-        timeout: Option<Duration>,
-    ) -> io::Result<Vec<Ready>> {
-        debug_assert!(sources.len() <= MAX_SOURCES);
+    pub(crate) fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<Ready>> {
+        let watched = self.list.snapshot();
+        debug_assert!(watched.len() <= MAX_SOURCES);
         let mut readable = FdSet::new();
         let mut writable = FdSet::new();
         // Winsock reports a connect that failed here rather than in the write set, and this is
@@ -95,12 +136,12 @@ impl Poller {
         let mut excepted = FdSet::new();
         let wake = self.wake_read.as_raw_socket() as SOCKET;
         push(&mut readable, wake);
-        for (_source, want) in sources {
-            let socket = want.descriptor as SOCKET;
-            if want.readable {
+        for &(_key, descriptor, directions) in &watched {
+            let socket = descriptor as SOCKET;
+            if directions.readable {
                 push(&mut readable, socket);
             }
-            if want.writable {
+            if directions.writable {
                 push(&mut writable, socket);
             }
             push(&mut excepted, socket);
@@ -110,16 +151,17 @@ impl Poller {
         // SAFETY: `select` reads and writes the three sets for the length of the call and no
         // longer, and each of them is a live local of this frame across it, in the shape
         // `select` expects: a count of the entries `push` wrote against those entries, and no
-        // more entries than `SET_SIZE`, which is what `MAX_SOURCES` holds the caller to. Each
-        // set is an `FdSet`: `repr(C)`, a `u32` count followed by an array of `SOCKET`, the
-        // layout `FD_SET` has, and `select` reads and writes only the entries the count names,
-        // which lie within the array. Every socket in them is held open across the call: the
-        // wake socket by `self`, which outlives the call, and each of the others by the source the
-        // caller lends in `sources`, a shared pointer it holds until the call returns, which
-        // keeps the socket it lent when it was registered open for as long as it lives. The timeout
-        // is a live local of this frame as well, or a null pointer, which is how a wait
-        // without limit is asked for. The first argument is ignored on Winsock, and zero is
-        // passed for it.
+        // more entries than `SET_SIZE`, which is what `MAX_SOURCES` holds the list to, as `add`
+        // takes in no more sources than that. Each set is an `FdSet`: `repr(C)`, a `u32` count
+        // followed by an array of `SOCKET`, the layout `FD_SET` has, and `select` reads and
+        // writes only the entries the count names, which lie within the array. Every socket in
+        // them is held open across the call: the wake socket by `self`, which outlives the call,
+        // and each of the others by the source that lent it when it was registered, which keeps
+        // it open for as long as it lives and which the reactor holds while it is in the list,
+        // and past its registration until this wait returns, where the registration goes while
+        // this wait runs. The timeout is a live local of this frame as well, or a null pointer,
+        // which is how a wait without limit is asked for. The first argument is ignored on
+        // Winsock, and zero is passed for it.
         let ready = unsafe {
             select(
                 0,
@@ -141,19 +183,17 @@ impl Poller {
             {}
         }
 
-        Ok(sources
+        Ok(watched
             .iter()
-            .filter_map(|(_source, want)| {
-                let socket = want.descriptor as SOCKET;
+            .filter_map(|&(key, descriptor, _)| {
+                let socket = descriptor as SOCKET;
                 let is_excepted = holds(&excepted, socket);
-                let is_readable = holds(&readable, socket) || is_excepted;
-                let is_writable = holds(&writable, socket) || is_excepted;
+                let directions = Directions {
+                    readable: holds(&readable, socket) || is_excepted,
+                    writable: holds(&writable, socket) || is_excepted,
+                };
 
-                (is_readable || is_writable).then_some(Ready {
-                    key: want.key,
-                    readable: is_readable,
-                    writable: is_writable,
-                })
+                (!directions.is_empty()).then_some(Ready { key, directions })
             })
             .collect())
     }
@@ -162,7 +202,7 @@ impl Poller {
 /// Adds `socket` to `set`.
 ///
 /// A set is a counted array, and the macro that fills one in C is not among what `windows-sys`
-/// offers, so the entry is written by hand. A caller never offers more than `MAX_SOURCES`
+/// offers, so the entry is written by hand. The list never holds more than `MAX_SOURCES`
 /// sources, which is what keeps every set within its length.
 fn push(set: &mut FdSet, socket: SOCKET) {
     set.fd_array[set.fd_count as usize] = socket;
@@ -232,7 +272,7 @@ impl FdSet {
 ///
 /// A set holds `SET_SIZE` sockets, and the read set keeps one of those places for the socket a
 /// `notify` writes to.
-pub(crate) const MAX_SOURCES: usize = SET_SIZE - 1;
+const MAX_SOURCES: usize = SET_SIZE - 1;
 
 /// How many sockets one set holds.
 ///

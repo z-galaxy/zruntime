@@ -753,16 +753,17 @@ in_both_modes! {
 }
 
 /// `into_inner` on a shared runtime returns while another thread is inside `block_on` on that
-/// runtime, in a wait that holds a clone of the source: the end of the watch breaks that wait,
-/// and the source comes back whole.
+/// runtime, in a wait that watches the source: the end of the watch breaks that wait, and the
+/// source comes back whole. Where the platform's poller copied the source's descriptor in as the
+/// wait started, the runtime keeps the source until the wait returns, which this waits for.
 ///
 /// A read of the handle that found nothing to read leaves its waker with the runtime, which has
-/// every wait that thread makes include the source. The thread is made to wait for a byte on a
+/// every wait that thread makes watch the source. The thread is made to wait for a byte on a
 /// source of its own, and is let go of once the source is back.
 ///
 /// That the thread is inside its wait by the time the source is asked for is what the pause
-/// before it is for, and the test does not depend on it: a wait the thread has yet to reach is
-/// one that holds no clone, and the source comes back in either case.
+/// before it is for, and the test does not depend on it: a source whose watch ends outside a
+/// wait is kept by nothing, and comes back in either case.
 #[test]
 #[timeout(15000)]
 fn into_inner_returns_while_another_thread_waits_on_the_source() {
@@ -805,14 +806,14 @@ fn into_inner_returns_while_another_thread_waits_on_the_source() {
 }
 
 /// A source whose destructor takes other handles' sources back, dropped while the thread driving
-/// a shared runtime is in a wait that watches them all, has its destructor return: the wait lets
-/// go of its clones of the sources still watched before the last clone of the dropped one goes,
-/// which is what runs the destructor, on that thread.
+/// a shared runtime is in a wait that watches them all, has its destructor return. Where the
+/// platform's poller copied the descriptors in as the wait started, the runtime keeps the dropped
+/// source until the wait returns, and its destructor runs on that thread then, clear of every
+/// lock and with no other source kept there; elsewhere it runs on the thread that drops it.
 ///
-/// The handles each leave a waker with the runtime, so that the wait the thread makes includes
-/// them all. The order of its clones is the map's, and a destructor only takes back what that
-/// wait still holds a clone of where the dropped handle's clone comes before one of the others:
-/// with many inner handles, an order that hides the hang is rare.
+/// The handles each leave a waker with the runtime, so that the wait the thread makes watches
+/// them all, and many of them, so that a source kept for a wait would be likely to come before
+/// one the destructor takes back in whatever order the runtime let go of them in.
 ///
 /// That the thread is inside its wait when the handle is dropped is what the pause before it is
 /// for, and the test does not depend on it: a destructor run anywhere else returns as well.
@@ -879,10 +880,9 @@ in_both_modes! {
     /// A runtime runs no code of a source's while it waits: it reads the descriptor once, as it
     /// takes the source under its watch, and watches that one from then on.
     ///
-    /// The source here takes another handle's source back each time it is asked for its
-    /// descriptor once armed, which a wait that asked would have to wait on the clone of that
-    /// source the wait itself holds. A read of each handle that found nothing to read has every
-    /// wait watch both.
+    /// The source here counts each time it is asked for its descriptor once armed, and takes
+    /// another handle's source back then, as a source whose `as_fd` runs code of its own might.
+    /// A read of each handle that found nothing to read has every wait watch both.
     fn a_wait_runs_no_code_of_a_source<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (inner, _inner_far) = tcp_pair();

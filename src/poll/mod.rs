@@ -1,29 +1,58 @@
 //! The wait a platform is asked for, and what it is told to watch.
 //!
-//! Each implementation watches a list of sources for the length of one wait and reports which of
-//! them were found ready, and each keeps a channel of its own that a `notify` writes to, so that
-//! a wait can be broken from another thread. The sources are lent to the wait as shared pointers
-//! the caller cloned for it and holds for the whole call, so no descriptor in the set can be
-//! closed while the platform is looking at it. What the wait watches is the descriptor each
-//! source lent when it was registered, which the caller hands over beside it: the wait asks no
-//! source for anything, and so runs no code of one.
+//! A poller watches each source in the directions it was last told to, and a wait on it reports
+//! which of them it found ready. Each poller keeps a channel of its own that a `notify` writes to,
+//! so that a wait can be broken from another thread.
+//!
+//! What a source is watched for is told to the poller as it changes, rather than on every wait: a
+//! source is added once, as it is registered, its directions are changed from then on, and it is
+//! deleted as its registration goes. Every call names the source by the key the reactor reports it
+//! by, and by the descriptor it lent when it was registered, which the caller holds open across the
+//! call: a poller asks no source for anything, and so runs no code of one.
+//!
+//! There are two kinds of poller, and [`Poller::LIVE`] says which kind a platform has. One keeps
+//! what it watches in the kernel, which sees a change at once, a wait under way included, and lets
+//! go of a descriptor deleted from it there and then. The other takes what to watch as a list on
+//! every wait, which it keeps for itself and copies as a wait starts: a change reaches only the
+//! waits that start after it, and a descriptor a wait under way copied has to stay open until that
+//! wait returns.
 
 #[cfg(unix)]
-mod unix;
+mod generic;
+mod list;
 #[cfg(unix)]
-pub(super) use unix::Poller;
+mod pipe;
+#[cfg(unix)]
+pub(super) use generic::Poller;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(super) use windows::{MAX_SOURCES, Poller};
+pub(super) use windows::Poller;
 
-/// What to watch a source for.
-pub(super) struct Want {
-    pub(super) key: usize,
-    /// The source's descriptor, as the source lent it when it was registered.
-    pub(super) descriptor: RawSource,
+/// Which directions of a source are watched, or were found ready.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Directions {
     pub(super) readable: bool,
     pub(super) writable: bool,
+}
+
+impl Directions {
+    /// Neither direction.
+    pub(super) const NONE: Self = Self {
+        readable: false,
+        writable: false,
+    };
+
+    /// Whether this names neither direction.
+    pub(super) fn is_empty(self) -> bool {
+        !self.readable && !self.writable
+    }
+}
+
+/// A source a wait found ready, and the directions it was found ready in.
+pub(super) struct Ready {
+    pub(super) key: usize,
+    pub(super) directions: Directions,
 }
 
 /// The descriptor of a source, as the platform's wait takes it: a file descriptor on unix, and a
@@ -32,13 +61,6 @@ pub(super) struct Want {
 pub(super) type RawSource = std::os::fd::RawFd;
 #[cfg(windows)]
 pub(super) type RawSource = std::os::windows::io::RawSocket;
-
-/// What a source was found ready for; `Want`'s shape.
-pub(super) struct Ready {
-    pub(super) key: usize,
-    pub(super) readable: bool,
-    pub(super) writable: bool,
-}
 
 /// The longest a wait is asked to last.
 ///

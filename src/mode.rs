@@ -144,8 +144,9 @@ pub(crate) mod sealed {
         /// The value `ptr` points to, taken back out of it.
         ///
         /// Called on what is left of a source's pointer once its registration is gone, so that
-        /// the one other holder there can be is a wait of the reactor that was under way when the
-        /// registration was dropped.
+        /// the one other holder there can be is the reactor, which keeps the source of a
+        /// registration dropped while a wait was under way until that wait returns, where the
+        /// platform's poller copied the source's descriptor in as the wait started.
         fn into_inner<T>(ptr: Self::Ptr<T>) -> T;
 
         /// A pointer to what `ptr` points to, which does not keep it alive.
@@ -281,14 +282,15 @@ pub(crate) mod sealed {
         }
 
         fn into_inner<T>(ptr: Rc<T>) -> T {
-            // The reactor holds a clone of a source only while a wait runs, and a local runtime's
-            // wait runs on the thread that drives it, never across a call into user code: it lets
-            // go of its clones before it wakes anyone. So no wait is under way where this is
-            // called, and the registration's end left this the only holder.
+            // The reactor keeps a source past its registration only while a wait runs, and a local
+            // runtime's wait runs on the thread that drives it, never across a call into user
+            // code: it lets go of what it kept before it wakes anyone. So no wait is under way
+            // where this is called, and the registration's end left this the only holder.
             Rc::try_unwrap(ptr).unwrap_or_else(|_| {
                 unreachable!(
-                    "the reactor holds a clone of a source only while a wait runs, and the wait of \
-                     a local runtime runs on this thread, never across a call into user code"
+                    "the reactor keeps a source past its registration only while a wait runs, and \
+                     the wait of a local runtime runs on this thread, never across a call into \
+                     user code"
                 )
             })
         }
@@ -352,12 +354,11 @@ pub(crate) mod sealed {
         }
 
         fn into_inner<T>(mut ptr: Arc<T>) -> T {
-            // Once the registration is gone, the one other holder there can be is a wait of the
-            // reactor, which a thread driving the runtime built while the source was watched, and
-            // which runs on another thread: a wait lets go of its clones of registered sources
-            // before it runs any code of somebody else's, so none of its own is here. The drop of
-            // the registration broke that wait, and it lets go of its clones as soon as it
-            // returns, so this waits for that thread and no longer.
+            // Once the registration is gone, the one other holder there can be is the reactor,
+            // which keeps the source for a wait under way on another thread whose poller copied
+            // the source's descriptor in as it started. The drop of the registration broke that
+            // wait, and the reactor lets go of the source as soon as the wait returns, before it
+            // runs any code of somebody else's, so this waits for that thread and no longer.
             loop {
                 match Arc::try_unwrap(ptr) {
                     Ok(value) => return value,
