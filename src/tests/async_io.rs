@@ -389,7 +389,7 @@ in_both_modes! {
                     // Each task goes on from here to its wait without yielding, so that a task
                     // counted is a task that waits.
                     waiting.fetch_add(1, Ordering::SeqCst);
-                    reader.readable().await;
+                    reader.readable().await.unwrap();
                 })
             })
             .collect();
@@ -408,7 +408,7 @@ in_both_modes! {
                 task.await.unwrap();
             }
             // Nothing took the byte, so the source is still ready.
-            reader.readable().await;
+            reader.readable().await.unwrap();
         });
     }
 }
@@ -420,7 +420,7 @@ in_both_modes! {
         let (near, _far) = tcp_pair();
         let near = Async::new(&runtime, near).unwrap();
 
-        runtime.block_on(near.writable());
+        runtime.block_on(near.writable()).unwrap();
     }
 }
 
@@ -456,7 +456,7 @@ in_both_modes! {
             // Read from a plain socket with the bytes on their way, which does not wait for the
             // runtime.
             far.read_exact(&mut vec![0; filled]).unwrap();
-            writable.await;
+            writable.await.unwrap();
         });
     }
 }
@@ -753,16 +753,17 @@ in_both_modes! {
 }
 
 /// `into_inner` on a shared runtime returns while another thread is inside `block_on` on that
-/// runtime, in a wait that holds a clone of the source: the end of the watch breaks that wait,
-/// and the source comes back whole.
+/// runtime, in a wait that watches the source: the end of the watch breaks that wait, and the
+/// source comes back whole. Where the platform's poller copied the source's descriptor in as the
+/// wait started, the runtime keeps the source until the wait returns, which this waits for.
 ///
 /// A read of the handle that found nothing to read leaves its waker with the runtime, which has
-/// every wait that thread makes include the source. The thread is made to wait for a byte on a
+/// every wait that thread makes watch the source. The thread is made to wait for a byte on a
 /// source of its own, and is let go of once the source is back.
 ///
 /// That the thread is inside its wait by the time the source is asked for is what the pause
-/// before it is for, and the test does not depend on it: a wait the thread has yet to reach is
-/// one that holds no clone, and the source comes back in either case.
+/// before it is for, and the test does not depend on it: a source whose watch ends outside a
+/// wait is kept by nothing, and comes back in either case.
 #[test]
 #[timeout(15000)]
 fn into_inner_returns_while_another_thread_waits_on_the_source() {
@@ -805,14 +806,14 @@ fn into_inner_returns_while_another_thread_waits_on_the_source() {
 }
 
 /// A source whose destructor takes other handles' sources back, dropped while the thread driving
-/// a shared runtime is in a wait that watches them all, has its destructor return: the wait lets
-/// go of its clones of the sources still watched before the last clone of the dropped one goes,
-/// which is what runs the destructor, on that thread.
+/// a shared runtime is in a wait that watches them all, has its destructor return. Where the
+/// platform's poller copied the descriptors in as the wait started, the runtime keeps the dropped
+/// source until the wait returns, and its destructor runs on that thread then, clear of every
+/// lock and with no other source kept there; elsewhere it runs on the thread that drops it.
 ///
-/// The handles each leave a waker with the runtime, so that the wait the thread makes includes
-/// them all. The order of its clones is the map's, and a destructor only takes back what that
-/// wait still holds a clone of where the dropped handle's clone comes before one of the others:
-/// with many inner handles, an order that hides the hang is rare.
+/// The handles each leave a waker with the runtime, so that the wait the thread makes watches
+/// them all, and many of them, so that a source kept for a wait would be likely to come before
+/// one the destructor takes back in whatever order the runtime let go of them in.
 ///
 /// That the thread is inside its wait when the handle is dropped is what the pause before it is
 /// for, and the test does not depend on it: a destructor run anywhere else returns as well.
@@ -879,10 +880,9 @@ in_both_modes! {
     /// A runtime runs no code of a source's while it waits: it reads the descriptor once, as it
     /// takes the source under its watch, and watches that one from then on.
     ///
-    /// The source here takes another handle's source back each time it is asked for its
-    /// descriptor once armed, which a wait that asked would have to wait on the clone of that
-    /// source the wait itself holds. A read of each handle that found nothing to read has every
-    /// wait watch both.
+    /// The source here counts each time it is asked for its descriptor once armed, and takes
+    /// another handle's source back then, as a source whose `as_fd` runs code of its own might.
+    /// A read of each handle that found nothing to read has every wait watch both.
     fn a_wait_runs_no_code_of_a_source<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (inner, _inner_far) = tcp_pair();
@@ -918,6 +918,21 @@ in_both_modes! {
 
         assert_eq!(outer.get_ref().asked.load(Ordering::SeqCst), 0);
         assert!(outer.get_ref().inner.lock().unwrap().is_some());
+    }
+}
+
+in_both_modes! {
+    /// Linux and Android cannot watch a regular file, and a wait on one fails, where the caller
+    /// hears of it, rather than waits for readiness that nothing would report.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)))]
+    fn a_wait_on_a_regular_file_fails<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let file = Async::new(&runtime, file).unwrap();
+
+        let refused = runtime.block_on(file.readable()).unwrap_err();
+
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
     }
 }
 
@@ -974,6 +989,35 @@ in_both_modes! {
         assert_eq!(read.unwrap(), 5);
         written.unwrap();
         assert_eq!(received, b"hello");
+    }
+}
+
+in_both_modes! {
+    /// A wait for room in a pipe whose reader closed completes, and so does the next one, made at
+    /// once after it. FreeBSD lets go of the pipe's write filter as it reports the first, and then
+    /// refuses to watch the pipe (`EPIPE`), which is what the second ends with there; anywhere
+    /// else the pipe is reported ready again.
+    #[cfg(unix)]
+    fn a_pipe_whose_reader_closed_is_waited_on_twice<M>() {
+        use std::pin::pin;
+
+        use futures_lite::future::poll_once;
+
+        let runtime = Runtime::<M>::new().unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let writer = Async::new(&runtime, writer).unwrap();
+
+        runtime.block_on(async {
+            let mut writable = pin!(writer.writable());
+            // The first poll has the runtime watch the pipe for room while the reader is open.
+            assert!(poll_once(writable.as_mut()).await.is_none());
+            drop(reader);
+            writable.await.unwrap();
+
+            if let Err(refused) = writer.writable().await {
+                assert_eq!(refused.kind(), io::ErrorKind::BrokenPipe);
+            }
+        });
     }
 }
 

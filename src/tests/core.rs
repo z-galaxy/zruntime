@@ -684,6 +684,28 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A sleep shorter than a millisecond ends well before a millisecond has passed: the wait
+    /// does not round its timeout up to whole milliseconds, as epoll's own timeout would, which
+    /// would have every one of these sleeps take a millisecond at least. The bound leaves several
+    /// times the sleep's length for a busy machine to wake the thread late.
+    ///
+    /// Written for Linux and Android, whose epoll takes a timeout in milliseconds; other kernels
+    /// may let timers that close together go off at once, a millisecond late.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_short_sleep_does_not_wait_a_whole_millisecond<M>() {
+        const ROUNDS: u32 = 20;
+        let runtime = Runtime::<M>::new().unwrap();
+        let started = Instant::now();
+
+        for _ in 0..ROUNDS {
+            runtime.block_on(runtime.sleep(Duration::from_micros(100)));
+        }
+
+        assert!(started.elapsed() < Duration::from_millis(1) * ROUNDS);
+    }
+}
+
+in_both_modes! {
     fn sleep_until_resolves_once_the_deadline_has_passed<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let started = Instant::now();
@@ -1123,6 +1145,22 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A runtime watches a descriptor through one registration at a time: a second one is turned
+    /// away while the first lives, and made once it is gone.
+    fn a_descriptor_is_registered_once_at_a_time<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (source, _peer) = pair();
+        let registration = M::register(&runtime, source.clone()).unwrap();
+
+        let again = M::register(&runtime, source.clone()).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+
+        drop(registration);
+        M::register(&runtime, source).unwrap();
+    }
+}
+
+in_both_modes! {
     /// A wait for readiness completes once another thread has written to the peer, and the read
     /// that follows it finds the byte at once, with no retry of its own.
     fn a_registration_waits_for_readiness<M>() {
@@ -1136,7 +1174,7 @@ in_both_modes! {
             peer.write_all(&[7]).unwrap();
         });
 
-        runtime.block_on(registration.ready(Interest::Readable));
+        runtime.block_on(registration.ready(Interest::Readable)).unwrap();
 
         assert_eq!(read_ready_byte(&source), 7);
         writer.join().unwrap();
@@ -1155,7 +1193,7 @@ fn four_local_tasks_wait_for_one_readiness_together() {
         .map(|_| {
             let registration = registration.clone();
             runtime.spawn("a task waiting for readiness", async move {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
             })
         })
         .collect();
@@ -1189,7 +1227,7 @@ fn four_shared_tasks_wait_for_one_readiness_together() {
         .map(|_| {
             let registration = registration.clone();
             runtime.spawn("a task waiting for readiness", async move {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
             })
         })
         .collect();
@@ -1225,7 +1263,7 @@ in_both_modes! {
 
         let winner = runtime.block_on(or(
             async {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
                 "ready"
             },
             async {
@@ -1254,7 +1292,7 @@ in_both_modes! {
         // Dropped by the race it lost, when the timer won.
         let winner = runtime.block_on(or(
             async {
-                registration.ready(Interest::Readable).await;
+                registration.ready(Interest::Readable).await.unwrap();
                 "ready"
             },
             async {
@@ -1269,7 +1307,7 @@ in_both_modes! {
             peer.write_all(&[7]).unwrap();
         });
 
-        runtime.block_on(registration.ready(Interest::Readable));
+        runtime.block_on(registration.ready(Interest::Readable)).unwrap();
 
         assert_eq!(read_ready_byte(&source), 7);
         writer.join().unwrap();

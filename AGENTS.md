@@ -8,8 +8,9 @@ more — follow the guidelines in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Project Overview
 
 zruntime is a simple, single-threaded Rust async runtime: an owned `Runtime<M: Mode = Local>`, a
-scheduler that holds tasks and hands them out to be polled, a `poll(2)`/`select` reactor that
-watches registered I/O sources and keeps timers, and `Runtime::block_on` to drive a future to
+scheduler that holds tasks and hands them out to be polled, a reactor that watches registered I/O
+sources (on epoll, kqueue, `select` or `poll(2)`, whichever the platform waits best on) and keeps
+timers, and `Runtime::block_on` to drive a future to
 completion on the calling thread. It comes in two flavours: `Local` (the default, aliased
 `LocalRuntime`), which stays on the thread it was made on and holds its state in `Rc`/`RefCell`,
 and `Shared` (aliased `SharedRuntime`), which may be reached from and driven on any thread and
@@ -89,6 +90,11 @@ cargo test --no-default-features --features runtime
 
 # Run a single test
 cargo test --all-features some_test_name
+
+# The tests on the pollers no CI runner waits on by default, as CI runs them: `poll(2)` on any unix
+# (on Linux, say), and kqueue on macOS, where the BSDs' poller runs as well
+RUSTFLAGS="--cfg zruntime_poll" cargo test --all-features
+RUSTFLAGS="--cfg zruntime_kqueue" cargo test --all-features
 ```
 
 ### Code Quality
@@ -98,6 +104,11 @@ cargo +nightly fmt --all
 
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
+
+# Lint the pollers no CI runner waits on by default, as CI does
+RUSTFLAGS="--cfg zruntime_poll" cargo clippy --all-targets --all-features -- -D warnings
+RUSTFLAGS="--cfg zruntime_kqueue" cargo clippy --all-targets --all-features \
+    --target x86_64-apple-darwin -- -D warnings
 
 # Check the runtime, Event, the two channels, the locks, unblock, fs and each family of socket
 # built alone: `--all-features` cannot show that each builds without the others, and leaves out
@@ -114,8 +125,8 @@ cargo check --no-default-features --features udp
 cargo check --no-default-features --features unix
 
 # Run what needs no runtime (Event, the locks, the two channels, unblock) under Miri, as CI does;
-# the runtime polls with `ppoll`, which Miri cannot run, and fs reaches the filesystem, which
-# Miri's isolation keeps it from
+# the runtime's poller on Linux keeps a timerfd, which Miri does not run, and fs reaches the
+# filesystem, which Miri's isolation keeps it from
 cargo +nightly miri test --no-default-features --features lock,broadcast,mpmc,unblock
 
 # Run the locks' waiting paths on `wasm32-unknown-unknown`, which has no clock, in Node, as CI
@@ -193,7 +204,10 @@ src/
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
 ├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, Timeout and Interval
-├── poll/         # [runtime feature] The OS polling primitive (poll(2) on unix, select on Windows)
+├── poll/         # [runtime feature] The OS pollers: epoll.rs (Linux, Android), kqueue.rs (the
+│                 # BSDs), select.rs (Apple), generic.rs (poll(2), any other unix), windows.rs
+│                 # (Winsock's select); list.rs, the list the last three keep; pipe.rs, the
+│                 # channel that breaks a unix wait
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
 │                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime
@@ -241,11 +255,25 @@ AsFd>` / `Arc<dyn AsFd + Send + Sync>` on unix, `AsSocket` on Windows) and retur
 `Registration` whose `poll_io` drives an arbitrary operation against
 `Interest::Readable`/`Writable` readiness, retrying on `WouldBlock`, and whose `ready` hands out a
 `Readiness` future that waits for readiness alone. The source's descriptor is read once, at
-registration, and kept beside it in the map: a wait watches that and calls no `as_fd` or
-`as_socket`, so it runs no code of a source's while it holds the clones of the sources. Each direction of a source keeps one waker for
-`poll_io`, which the next operation to wait takes the place of, and a map of `Readiness` waits
-under ids of their own, any number of which may wait at once: readiness wakes them all and takes
-them out of the map, which is how a `Readiness` tells readiness from a poll anything else caused.
+registration, and kept beside it in the map: the poller watches that and calls no `as_fd` or
+`as_socket`, so it runs no code of a source's. A runtime watches a descriptor through one
+registration at a time, and turns a second away with `AlreadyExists`. Each direction of a source
+keeps one waker for `poll_io`, which the next operation to wait takes the place of, and a map of
+`Readiness` waits under ids of their own, any number of which may wait at once: readiness wakes
+them all and takes them out of the map, which is how a `Readiness` tells readiness from a poll
+anything else caused.
+
+**Telling the poller what changes**: the reactor tells the poller (`src/poll/`) of each change to
+what a source is watched for, under the map's lock, rather than handing it every source on each
+wait: `add` as a source is registered, `modify` as the directions it is watched in change, and
+`delete` as its registration goes. A direction is armed as soon as a waiter is stored in it, and
+disarmed lazily: a source a wait found ready, or a `Readiness` gave up on, is listed in
+`Sources::stale` and looked at before the next wait, so that a task that stores its waker again
+before then costs the poller nothing. `Poller::LIVE` says whether a change reaches a wait under
+way (a poller that keeps what it watches in the kernel) or only the next one (one that keeps a
+`poll/list.rs` list and copies it as a wait starts). For the latter, arming breaks the wait under
+way, and a source whose registration goes while a wait runs is kept in `Sources::retired`, so
+that its descriptor stays open, until that wait returns.
 
 **`Async`, the handle of a source**: `Async<T, M>` is a `Registration` and the mode's `Ptr<T>`
 (`Rc`/`Arc`) of the source, of which the reactor holds a clone through the sealed
@@ -259,10 +287,8 @@ reactor sharing the pointer, so the I/O traits are there only where `&T` impleme
 wait through `Readiness`, any number of tasks at once; `poll_read_with`, `poll_write_with` and the
 traits keep one waiting task per direction, through `poll_io`. `into_inner` ends the watch and
 takes the source out of the pointer: on `Local` nothing else holds it by then, and on `Shared` it
-yields until a wait under way on another thread lets go of its clone. A wait lets go of its clones
-of registered sources under the map's lock, before the others, whose drop may be the last and run
-a destructor (`Reactor::release`): a destructor that takes another source back on the driving
-thread would otherwise yield for good on a clone that thread holds.
+yields until a wait under way on another thread returns and the reactor lets go of the source it
+kept for that wait, which it does clear of every lock and before it wakes anyone.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.

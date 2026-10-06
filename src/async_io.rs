@@ -64,22 +64,18 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// extension traits of [`futures-lite`] or [`futures-util`] read from and write to it. So does a
 /// shared reference to it, `&Async<T, M>`, which lets a reader and a writer share one handle. Both
 /// are there wherever `&T` implements `Read`, for the first trait, and `Write`, for the second,
-/// as it does for a `File`, for `std::io::PipeReader` and `PipeWriter`, and for std's stream
-/// sockets, `TcpStream` and `UnixStream`: a listener or a datagram socket implements neither.
+/// as it does for `std::io::PipeReader` and `PipeWriter`, and for std's stream sockets,
+/// `TcpStream` and `UnixStream`: a listener or a datagram socket implements neither.
 ///
 /// The source sits behind a pointer that the runtime's reactor shares, so no `&mut T` is ever
 /// handed out. A type that implements `Read` or `Write` only for `&mut self`, such as
 /// `std::process::ChildStdout` and `ChildStdin`, has to be converted first. On unix that is
 /// through `OwnedFd`: a `ChildStdout` becomes a `PipeReader`, and a `ChildStdin` a `PipeWriter`.
 ///
-/// A regular file is always reported ready by the system's poll, so a read of one blocks the thread
-/// whatever the mode it is in. A regular file is not what this is for: `zruntime::Unblock` and
-/// `zruntime::fs` run each operation on a thread of their own instead.
-///
-/// On Apple's platforms, the system's poll cannot watch some devices, `/dev/tty` and `/dev/null`
-/// among them, and reports them ready on every wait, so a wait for one of them never blocks. A
-/// terminal is watched there through the pseudo-terminal device it runs on, such as the standard
-/// input of a program started in it.
+/// A regular file is not what this is for. Linux and Android cannot watch one, and a wait on one
+/// fails there; elsewhere one is reported ready whether or not the disk has its data at hand, and
+/// a read of it blocks the thread whatever the mode it is in. `zruntime::Unblock`
+/// and `zruntime::fs` run each operation on a thread of their own instead.
 ///
 /// # Example
 ///
@@ -140,8 +136,10 @@ where
     /// the handle with [`new_nonblocking`](Async::new_nonblocking).
     ///
     /// What can fail is the switch to non-blocking mode, and the runtime taking the source under
-    /// its watch, which on Windows it does for a limited number of sockets: a runtime watches at
-    /// most 1023 sockets at a time, which its reactor waits on in a single `select` call.
+    /// its watch. A runtime watches a descriptor through one handle at a time, and turns away a
+    /// source whose descriptor it watches already with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists). On Windows it watches a limited number of
+    /// sockets: at most 1023 at a time, which its reactor waits on in a single `select` call.
     pub fn new(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: Source<M>,
@@ -158,9 +156,11 @@ where
     /// [`WouldBlock`](io::ErrorKind::WouldBlock), so an operation on a blocking source with nothing
     /// ready would hold up the thread it runs on, and every other task with it.
     ///
-    /// What can fail is the runtime taking the source under its watch, which on Windows it does
-    /// for a limited number of sockets: a runtime watches at most 1023 sockets at a time, which
-    /// its reactor waits on in a single `select` call.
+    /// What can fail is the runtime taking the source under its watch. A runtime watches a
+    /// descriptor through one handle at a time, and turns away a source whose descriptor it
+    /// watches already with [`AlreadyExists`](io::ErrorKind::AlreadyExists). On Windows it watches
+    /// a limited number of sockets: at most 1023 at a time, which its reactor waits on in a single
+    /// `select` call.
     pub fn new_nonblocking(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: Source<M>,
@@ -201,8 +201,9 @@ where
     /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
     /// task may take the bytes before this one gets to them, so an operation run after the wait
     /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`read_with`](Async::read_with) does. See [`Registration::ready`] for what
-    /// the wait is.
+    /// gets one, as [`read_with`](Async::read_with) does. The wait fails where the runtime cannot
+    /// start to watch the source, which the system's poller may refuse to. See
+    /// [`Registration::ready`] for what the wait is.
     pub fn readable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Readable)
     }
@@ -213,8 +214,9 @@ where
     /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
     /// task may take the room before this one gets to it, so an operation run after the wait
     /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`write_with`](Async::write_with) does. See [`Registration::ready`] for what
-    /// the wait is.
+    /// gets one, as [`write_with`](Async::write_with) does. The wait fails where the runtime cannot
+    /// start to watch the source, which the system's poller may refuse to. See
+    /// [`Registration::ready`] for what the wait is.
     pub fn writable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Writable)
     }
@@ -224,7 +226,8 @@ where
     /// between.
     ///
     /// Resolves to the first success `operation` returns, and to the first error other than
-    /// `WouldBlock`. A call the kernel interrupted is made again straight away.
+    /// `WouldBlock`, or to the error of a wait for readiness, as [`readable`](Async::readable)
+    /// says. A call the kernel interrupted is made again straight away.
     ///
     /// `operation` must not block: the source is in non-blocking mode so that a call on it
     /// returns at once, and `operation` runs on the thread that every task of the runtime shares.
@@ -244,7 +247,7 @@ where
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
-            self.readable().await;
+            self.readable().await?;
         }
     }
 
@@ -253,7 +256,8 @@ where
     /// between.
     ///
     /// Resolves to the first success `operation` returns, a partial write included, and to the
-    /// first error other than `WouldBlock`. A call the kernel interrupted is made again straight
+    /// first error other than `WouldBlock`, or to the error of a wait for readiness, as
+    /// [`writable`](Async::writable) says. A call the kernel interrupted is made again straight
     /// away.
     ///
     /// `operation` must not block: the source is in non-blocking mode so that a call on it
@@ -274,7 +278,7 @@ where
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
-            self.writable().await;
+            self.writable().await?;
         }
     }
 

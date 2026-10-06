@@ -549,6 +549,11 @@ impl Runtime<Local> {
     /// itself is kept by the registration, so the I/O is done through another handle on the
     /// same socket: an `Rc` of it, say, or a clone of its descriptor.
     ///
+    /// A runtime watches a descriptor through one registration at a time: a source whose
+    /// descriptor it watches already is turned away with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), until the registration that watches it is
+    /// dropped. A clone of a descriptor, such as `try_clone` makes, is a descriptor of its own.
+    ///
     /// [`Async`] is the handle that registers a source, keeps it and does the I/O for the caller;
     /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
     /// other way.
@@ -703,6 +708,11 @@ impl Runtime<Shared> {
     /// becomes a wait for the readiness that would clear it rather than a busy loop. `source`
     /// itself is kept by the registration, so the I/O is done through another handle on the
     /// same socket: an `Arc` of it, say, or a clone of its descriptor.
+    ///
+    /// A runtime watches a descriptor through one registration at a time: a source whose
+    /// descriptor it watches already is turned away with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), until the registration that watches it is
+    /// dropped. A clone of a descriptor, such as `try_clone` makes, is a descriptor of its own.
     ///
     /// [`Async`] is the handle that registers a source, keeps it and does the I/O for the caller;
     /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some

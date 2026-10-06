@@ -8,7 +8,9 @@
 A simple, single-threaded Rust async runtime. A [`Runtime`] is an owned value made of:
 
 * a scheduler that holds tasks and hands them out to be polled,
-* a `poll(2)`/`select` reactor that watches registered I/O sources and keeps timers, and
+* a reactor that watches registered I/O sources and keeps timers, waiting on epoll on Linux and
+  Android, kqueue on the BSDs, `select` on Apple's platforms and Windows, and `poll(2)` on any other
+  unix, and
 * [`Runtime::block_on`] to drive a future to completion on the calling thread.
 
 It comes in two flavours. [`LocalRuntime`] is the default one: it stays on the thread it was made on, runs any

@@ -1,12 +1,13 @@
 //! Async access to the filesystem, as blocking work on the pool of threads that [`unblock()`] hands
 //! its work to.
 //!
-//! A file cannot be waited on for readiness the way a socket can. The OS reports a regular file as
-//! ready to read and to write at every moment, and the call that follows blocks the thread for as
-//! long as the disk takes. Made from the thread that polls a task, such a call holds up every other
-//! task that thread has to poll, so each operation of this module is blocking work instead: it is
-//! handed to the pool through [`unblock()`], and the task that awaits it is woken once it is over.
-//! The module needs no runtime, and works under any executor, as [`unblock()`] does.
+//! A file cannot be waited on for readiness the way a socket can. An OS either cannot watch a
+//! regular file at all, as Linux cannot, or reports it ready whether or not the disk has its data
+//! at hand, and the call that follows blocks the thread for as long as the disk takes. Made from
+//! the thread that polls a task, such a call holds up every other task that thread has to poll, so
+//! each operation of this module is blocking work instead: it is handed to the pool through
+//! [`unblock()`], and the task that awaits it is woken once it is over. The module needs no
+//! runtime, and works under any executor, as [`unblock()`] does.
 //!
 //! It has the shape of [`std::fs`]. The functions of the same names, from [`read`] to [`write()`],
 //! take their paths by `AsRef<Path>` and fail with the errors of the function of std they run; the

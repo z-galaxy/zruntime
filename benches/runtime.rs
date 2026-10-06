@@ -12,6 +12,10 @@
 //! inside the timed `block_on`; a `SharedRuntime` handle kept alive this way is also what a later
 //! `block_on` on the same thread resolves to, rather than a fresh runtime.
 //!
+//! `io/roundtrip-among-256-idle` is `io/roundtrip` again, while the runtime watches 256 sockets
+//! nothing is sent on, each with a task waiting to read from it: what a wait costs per watched
+//! socket, which a poller that keeps what it watches in the kernel leaves out.
+//!
 //! The `timer` ids need nothing but the reactor's timers, so they run on every platform. The `io`
 //! and `cross-thread` ids need a unix socket pair to give the reactor's readiness path something to
 //! watch, so they are unix-only.
@@ -101,6 +105,9 @@ mod unix {
     const CHUNK: usize = 64 * 1024;
     /// How many socket pairs `io/register-and-drop` makes ahead of each batch of iterations.
     const REGISTER_BATCH: u64 = 64;
+    /// How many idle sockets `io/roundtrip-among-256-idle` watches beside the round trip: a pair
+    /// each, which keeps all of them within a default limit of 1024 open descriptors.
+    const IDLE: usize = 256;
 
     pub(super) fn io_benches(c: &mut Criterion) {
         let runtime = runtime_handle();
@@ -127,6 +134,35 @@ mod unix {
             let far_registration = register(&runtime, &far);
             let _echo = runtime.spawn("bench echo", echo_forever(far_registration, far));
             group.bench_function("roundtrip", |b| {
+                b.to_async(ZruntimeExecutor).iter(|| async {
+                    write_all(&registration, &local, &[7]).await;
+                    let mut response = [0u8; 1];
+                    read_exact(&registration, &local, &mut response).await;
+                    black_box(response);
+                });
+            });
+        }
+        {
+            // The round trip above, while the runtime watches as many sockets that nothing is
+            // sent on: a server's idle connections, each with a task waiting to read from it.
+            // A wait on a poller that keeps what it watches in the kernel costs what the ready
+            // sockets cost, and one on `poll(2)` a look at every watched socket.
+            let _idle: Vec<_> = (0..IDLE)
+                .map(|_| {
+                    let (near, far) = pair();
+                    let registration = runtime.register(near).unwrap();
+                    let waiting = runtime.spawn("bench idle", async move {
+                        registration.ready(Interest::Readable).await.unwrap();
+                    });
+
+                    (waiting, far)
+                })
+                .collect();
+            let (local, far) = pair();
+            let registration = register(&runtime, &local);
+            let far_registration = register(&runtime, &far);
+            let _echo = runtime.spawn("bench echo", echo_forever(far_registration, far));
+            group.bench_function("roundtrip-among-256-idle", |b| {
                 b.to_async(ZruntimeExecutor).iter(|| async {
                     write_all(&registration, &local, &[7]).await;
                     let mut response = [0u8; 1];
