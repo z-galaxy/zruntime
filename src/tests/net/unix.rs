@@ -9,13 +9,14 @@
 //! The first tests are of making a connection: that a connection carries bytes both ways, that one
 //! to a path with no socket behind it reports why, and that one the listener has no room for yet
 //! is waited for. Then come the tests of the mode the sockets are in: that the stream a listener
-//! accepts, the streams of a pair, and the sockets made from std's, never block the thread.
-//! Closing and shutting down follow, with a write to a peer that has gone, then the ways of
-//! sharing a stream and what a call that has to wait does: a write waits for room and a read for
-//! bytes, without spinning, and giving up an `accept` loses no connection. After the tests of
-//! `incoming` come those of the datagram sockets, a `send_to` that finds the receiver's queue full
-//! among them, of a shared runtime's sockets crossing threads, serving tasks and having several of
-//! them wait at once, and last, of the sockets' `Debug`, descriptors and auto traits.
+//! accepts, the streams of a pair, and the sockets made from std's, never block the thread, and
+//! those of a stream handed back to std, which is the same connection, in the same mode, and
+//! watched by nobody. Closing and shutting down follow, with a write to a peer that has gone, then
+//! the ways of sharing a stream and what a call that has to wait does: a write waits for room and
+//! a read for bytes, without spinning, and giving up an `accept` loses no connection. After the
+//! tests of `incoming` come those of the datagram sockets, a `send_to` that finds the receiver's
+//! queue full among them, of a shared runtime's sockets crossing threads, serving tasks and having
+//! several of them wait at once, and last, of the sockets' `Debug`, descriptors and auto traits.
 
 use std::{
     cell::Cell,
@@ -356,6 +357,101 @@ in_both_modes! {
             assert_eq!(sent.unwrap(), 4);
             let len = len.unwrap();
             assert_eq!(&received[..len], b"late");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A stream handed back by `into_std` is the same connection, still in non-blocking mode: the
+    /// std stream names the same two ends, a read with nothing to read yet fails with `WouldBlock`
+    /// instead of waiting, what the peer sends is read from it, and what it writes is read by the
+    /// peer.
+    ///
+    /// The mode is looked at before anything else is done to the std stream, by that first read: a
+    /// blocking stream would hold the thread in it for good, and the test's timeout would fail it.
+    /// The std stream is switched to blocking mode only after that, to read the bytes the peer has
+    /// sent by then.
+    fn into_std_hands_back_the_same_connection_in_non_blocking_mode<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("into-std");
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime, &directory).await;
+
+            let mut std_client = client.into_std();
+            assert!(std_client.local_addr().unwrap().is_unnamed());
+            assert_eq!(
+                std_client.peer_addr().unwrap().as_pathname(),
+                Some(directory.socket("connected").as_path()),
+            );
+
+            let error = std_client.read(&mut [0; 1]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+            server.write_all(b"ping").await.unwrap();
+            std_client.set_nonblocking(false).unwrap();
+            let mut received = [0; 4];
+            std_client.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"ping");
+
+            std_client.write_all(b"pong").unwrap();
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"pong");
+        });
+    }
+}
+
+in_both_modes! {
+    /// What the peer sent before the stream was handed back is left in the socket for the std
+    /// stream to read: handing the socket back takes nothing off it.
+    ///
+    /// The peer's bytes have arrived by the time the stream goes, since a unix socket is written
+    /// straight into the queue of the one it is connected to, and the std stream finds them at
+    /// once, in the non-blocking mode it is handed back in.
+    fn into_std_leaves_the_bytes_that_arrived_for_the_std_stream<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+
+        runtime.block_on(async {
+            server.write_all(b"early").await.unwrap();
+
+            let mut std_client = client.into_std();
+            let mut received = [0; 5];
+            std_client.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"early");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A socket handed back by `into_std` is watched by nobody: the runtime takes it up again
+    /// with `from_std`, which it turns away with `AlreadyExists` for a socket it watches still,
+    /// and the new stream is served by the reactor like any other, a read that has to wait
+    /// included.
+    fn a_socket_handed_back_by_into_std_can_be_taken_up_again<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("into-std-again");
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime, &directory).await;
+
+            let std_client = client.into_std();
+            let mut client = UnixStream::from_std(&runtime, std_client).unwrap();
+
+            let mut received = [0; 4];
+            let (written, read) = zip(
+                after(&runtime, server.write_all(b"late")),
+                client.read_exact(&mut received),
+            )
+            .await;
+
+            written.unwrap();
+            read.unwrap();
+            assert_eq!(&received, b"late");
+
+            client.write_all(b"back").await.unwrap();
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"back");
         });
     }
 }

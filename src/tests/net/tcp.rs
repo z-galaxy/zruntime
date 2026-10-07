@@ -9,12 +9,13 @@
 //! refused one reports why, that one the listener has no room for yet is waited for, and that one
 //! which is waited for and then fails reports why. Then come the tests of the mode the sockets are
 //! in: that the stream a listener accepts, and the sockets made from std's, never block the
-//! thread. Closing and shutting down follow, closing twice included, then the ways of sharing a
-//! stream, and then what a call that has to wait does: a write waits for room and a read for
-//! bytes, without spinning, and giving up an `accept` loses no connection. After them come the
-//! tests of `incoming`, `peek` and the socket options, of a shared runtime's sockets crossing
-//! threads, serving tasks and having several of them wait at once, and last, of the sockets'
-//! `Debug`, descriptors and auto traits.
+//! thread, and those of a stream handed back to std, which is the same connection, in the same
+//! mode, and watched by nobody. Closing and shutting down follow, closing twice included, then the
+//! ways of sharing a stream, and then what a call that has to wait does: a write waits for room
+//! and a read for bytes, without spinning, and giving up an `accept` loses no connection. After
+//! them come the tests of `incoming`, `peek` and the socket options, of a shared runtime's sockets
+//! crossing threads, serving tasks and having several of them wait at once, and last, of the
+//! sockets' `Debug`, descriptors and auto traits.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -241,6 +242,103 @@ in_both_modes! {
             written.unwrap();
             read.unwrap();
             assert_eq!(&received, b"late");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A stream handed back by `into_std` is the same connection, still in non-blocking mode: the
+    /// std stream names the same two ends, a read with nothing to read yet fails with `WouldBlock`
+    /// instead of waiting, what the peer sends is read from it, and what it writes is read by the
+    /// peer.
+    ///
+    /// The mode is looked at before anything else is done to the std stream, by that first read: a
+    /// blocking stream would hold the thread in it for good, and the test's timeout would fail it.
+    /// The std stream is switched to blocking mode only after that, to read the bytes the peer has
+    /// sent by then.
+    fn into_std_hands_back_the_same_connection_in_non_blocking_mode<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime).await;
+            let local = client.local_addr().unwrap();
+            let peer = client.peer_addr().unwrap();
+
+            let mut std_client = client.into_std();
+            assert_eq!(std_client.local_addr().unwrap(), local);
+            assert_eq!(std_client.peer_addr().unwrap(), peer);
+            assert_eq!(server.peer_addr().unwrap(), local);
+
+            let error = std_client.read(&mut [0; 1]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+            server.write_all(b"ping").await.unwrap();
+            std_client.set_nonblocking(false).unwrap();
+            let mut received = [0; 4];
+            std_client.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"ping");
+
+            std_client.write_all(b"pong").unwrap();
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"pong");
+        });
+    }
+}
+
+in_both_modes! {
+    /// What the peer sent before the stream was handed back is left in the socket for the std
+    /// stream to read: handing the socket back takes nothing off it.
+    ///
+    /// The bytes are waited for with `peek`, which leaves them on the stream, so that they have
+    /// arrived by the time the stream goes, and the std stream finds them at once, in the
+    /// non-blocking mode it is handed back in.
+    fn into_std_leaves_the_bytes_that_arrived_for_the_std_stream<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime).await;
+
+            server.write_all(b"early").await.unwrap();
+            let mut peeked = [0; 5];
+            let peeked_len = client.peek(&mut peeked).await.unwrap();
+            assert!(peeked_len > 0);
+
+            let mut std_client = client.into_std();
+            let mut received = vec![0; peeked_len];
+            std_client.read_exact(&mut received).unwrap();
+            assert_eq!(received[..], b"early"[..peeked_len]);
+        });
+    }
+}
+
+in_both_modes! {
+    /// A socket handed back by `into_std` is watched by nobody: the runtime takes it up again
+    /// with `from_std`, which it turns away with `AlreadyExists` for a socket it watches still,
+    /// and the new stream is served by the reactor like any other, a read that has to wait
+    /// included.
+    fn a_socket_handed_back_by_into_std_can_be_taken_up_again<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime).await;
+
+            let std_client = client.into_std();
+            let mut client = TcpStream::from_std(&runtime, std_client).unwrap();
+
+            let mut received = [0; 4];
+            let (written, read) = zip(
+                after(&runtime, server.write_all(b"late")),
+                client.read_exact(&mut received),
+            )
+            .await;
+
+            written.unwrap();
+            read.unwrap();
+            assert_eq!(&received, b"late");
+
+            client.write_all(b"back").await.unwrap();
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"back");
         });
     }
 }

@@ -399,6 +399,23 @@ where
         self.io.get_ref().peer_addr()
     }
 
+    /// Stops watching the stream, and hands the socket back as a std stream, still in non-blocking
+    /// mode.
+    ///
+    /// The runtime lets go of the socket, and the connection is left as it was: the std stream
+    /// reads the bytes that arrived and were not read yet. The socket stays in non-blocking mode,
+    /// as every stream of this type is, so a read or a write on the std stream fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock) where it would have waited, until
+    /// [`set_nonblocking`](std::os::unix::net::UnixStream::set_nonblocking) switches the mode
+    /// back. Handing the socket to [`from_std`](UnixStream::from_std) takes it up again, on this
+    /// runtime or on another.
+    ///
+    /// On a shared runtime this may wait for a moment, while a thread driving the runtime returns
+    /// from a wait that watched the socket.
+    pub fn into_std(self) -> std::os::unix::net::UnixStream {
+        self.io.into_inner()
+    }
+
     /// Shuts down the read half, the write half or both halves of the connection, as `how` says.
     ///
     /// Shutting down the write half makes the peer read the end of the stream, once it has read
