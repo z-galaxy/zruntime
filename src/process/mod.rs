@@ -128,8 +128,15 @@ pub use std::process::{ExitStatus, Output, Stdio};
 /// directory, and what the standard streams of the process are connected to. A command built
 /// with `Command::new` starts from the environment and working directory of this process, and
 /// [`as_std`](Command::as_std) gives the std command inside for what only that has: the getters
-/// that tell what was configured, and, through [`as_std_mut`](Command::as_std_mut), the extension
-/// traits of the platform, such as std's `CommandExt` of unix.
+/// of the program, the arguments, the environment and the working directory, and, through
+/// [`as_std_mut`](Command::as_std_mut), the extension traits of the platform, such as std's
+/// `CommandExt` of unix.
+///
+/// What becomes of the process when its [`Child`] is dropped is this builder's own, which std's
+/// command knows nothing of: [`kill_on_drop`](Command::kill_on_drop) and
+/// [`reap_on_drop`](Command::reap_on_drop) set it, and its own getters,
+/// [`get_kill_on_drop`](Command::get_kill_on_drop) and
+/// [`get_reap_on_drop`](Command::get_reap_on_drop), read it back.
 ///
 /// A command may be spawned any number of times. The standard streams that this builder was not
 /// told about are decided by the method that runs the command, afresh each time:
@@ -317,8 +324,28 @@ impl Command {
         self
     }
 
+    /// Whether the process is killed when its [`Child`] is dropped, which it is not by default.
+    ///
+    /// [`kill_on_drop`](Command::kill_on_drop) sets it.
+    pub fn get_kill_on_drop(&self) -> bool {
+        self.kill_on_drop
+    }
+
+    /// Whether the status of the process is collected for the [`Child`], once it exits, when the
+    /// `Child` is dropped while the process runs, which it is by default.
+    ///
+    /// [`reap_on_drop`](Command::reap_on_drop) sets it. It makes no difference on Windows, where a
+    /// process that exits leaves nothing to collect.
+    pub fn get_reap_on_drop(&self) -> bool {
+        self.reap_on_drop
+    }
+
     /// The std command inside this one, for what it has getters for: the program, the arguments,
     /// the environment and the working directory.
+    ///
+    /// Whether the process is killed or has its status collected when its [`Child`] is dropped is
+    /// not std's to tell, and is read through [`get_kill_on_drop`](Command::get_kill_on_drop) and
+    /// [`get_reap_on_drop`](Command::get_reap_on_drop) instead.
     pub fn as_std(&self) -> &std::process::Command {
         &self.inner
     }
