@@ -7,14 +7,15 @@
 //! holds on to its process ID, so that a `kill` of the child cannot reach another process that has
 //! been given the ID since.
 //!
-//! Where the runtime can watch for the exit, it does, and the wait holds no thread: on Apple's
-//! platforms and the BSDs through a kqueue of the child's own with a filter on the process, a
-//! descriptor that turns readable once the process has exited. Where it cannot, which is
-//! everywhere else, the wait runs as blocking work on a thread of the pool of
+//! Where the runtime can watch for the exit, it does, and the wait holds no thread: on Linux
+//! through a pidfd of the process, and on Apple's platforms and the BSDs through a kqueue of the
+//! child's own with a filter on the process, each a descriptor that turns readable once the process
+//! has exited. Where it cannot, which is on Android, on Windows, on the other unix systems, and on
+//! a Linux that has no pidfd to give, the wait runs as blocking work on a thread of the pool of
 //! [`unblock()`](crate::unblock()).
 
 // A kqueue of the child's own on Apple's platforms and the BSDs, which have no wait on the pool to
-// fall back on, and the pool elsewhere.
+// fall back on, and the pool elsewhere, with a pidfd in front of it on Linux.
 #[cfg(any(
     target_vendor = "apple",
     target_os = "freebsd",
