@@ -7,8 +7,9 @@
 //! thread that is done with a job takes up the next rather than the pool starting one for it, that
 //! jobs that can only finish together each get a thread, that past its cap the pool has a job wait
 //! for a thread to be done with the one it runs, that a thread goes once it has waited for a job
-//! for the idle timeout, and that a job that panics leaves its thread to the jobs after it, even
-//! where the payload of its panic panics in turn as it drops.
+//! for the idle timeout, that a job that panics leaves its thread to the jobs after it, even where
+//! the payload of its panic panics in turn as it drops, and that the threads of a pool have the
+//! name the pool was given.
 //!
 //! The pool settles whether to start a thread for a job before handing the job over returns, so a
 //! test can count the threads right after. Where a test waits for a thread to go back to waiting
@@ -196,12 +197,25 @@ fn a_panic_whose_payload_panics_as_it_drops_leaves_the_thread_to_the_jobs_after_
     wind_down(&pool);
 }
 
-/// A pool of up to `threads` threads, each of which goes once it has waited for a job for
-/// `idle_timeout`.
+/// A thread of a pool has the name the pool was given, so that the threads of one pool can be told
+/// from those of another.
+#[test]
+#[timeout(15000)]
+fn the_threads_of_a_pool_have_its_name() {
+    let pool = pool(1, SHORT_IDLE_TIMEOUT);
+
+    let name = run(&pool, || thread::current().name().map(ToOwned::to_owned));
+
+    assert_eq!(name.as_deref(), Some(POOL_NAME));
+    wind_down(&pool);
+}
+
+/// A pool of up to `threads` threads, each named `POOL_NAME` and each of which goes once it has
+/// waited for a job for `idle_timeout`.
 fn pool(threads: usize, idle_timeout: Duration) -> Arc<Pool> {
     let cap = NonZeroUsize::new(threads).expect("a pool has room for a thread");
 
-    Arc::new(Pool::new(cap, idle_timeout))
+    Arc::new(Pool::new(POOL_NAME, cap, idle_timeout))
 }
 
 /// Runs `job` on `pool`, and waits for what it returns.
@@ -242,6 +256,9 @@ const LONG_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// An idle timeout for a pool whose threads only wait for a job once the test is done with them,
 /// short so that the test does not wait long for them to go.
 const SHORT_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// The name of every thread of the pools that the tests build.
+const POOL_NAME: &str = "zruntime test pool";
 
 /// A panic payload whose `Drop` panics in turn.
 struct PanicsOnDrop;

@@ -91,25 +91,7 @@ pub fn unblock<T>(work: impl FnOnce() -> T + Send + 'static) -> BlockingWork<T>
 where
     T: Send + 'static,
 {
-    let state = Arc::new(Mutex::new(State {
-        outcome: None,
-        waker: None,
-    }));
-
-    let job_state = state.clone();
-    Pool::submit(
-        &POOL,
-        Box::new(move || {
-            // Constructed before `work` runs and dropped only once this closure returns, so it
-            // covers every way out of the work, storing the outcome of it included.
-            let _finish = Finish(&job_state);
-
-            let outcome = panic::catch_unwind(AssertUnwindSafe(work));
-            lock(&job_state).outcome = Some(outcome);
-        }),
-    );
-
-    BlockingWork(state)
+    unblock_on(&POOL, work)
 }
 
 /// The future of the work that [`unblock()`] hands to its pool of threads: it resolves to the
@@ -182,25 +164,67 @@ impl<T> fmt::Debug for BlockingWork<T> {
     }
 }
 
-/// The pool that [`unblock()`] hands work to.
-static POOL: Pool = Pool::new(MAX_THREADS, IDLE_TIMEOUT);
+/// Runs `work` as [`unblock()`] does, but on a thread of `pool` rather than of the pool that
+/// `unblock()` hands its work to, and hands back a future of what it returns.
+///
+/// All that `unblock()` says of the work and of its future holds here with `pool` in place of that
+/// pool: the work is handed to `pool` before this returns, and waits its turn there once `pool` has
+/// as many threads as its cap allows.
+///
+/// # Panics
+///
+/// Panics if `pool` has no thread at all and cannot start one for the work, as [`unblock()`] does.
+pub(crate) fn unblock_on<T>(
+    pool: &'static Pool,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> BlockingWork<T>
+where
+    T: Send + 'static,
+{
+    let state = Arc::new(Mutex::new(State {
+        outcome: None,
+        waker: None,
+    }));
 
-/// The most threads [`POOL`] has at once: as many as the pool of smol's `blocking` crate has by
-/// default. That is room for a burst of slow lookups or file reads to run side by side, while a
-/// flood of work that blocks for good queues up rather than starting threads without end.
-const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(500).unwrap();
+    let job_state = state.clone();
+    Pool::submit(
+        pool,
+        Box::new(move || {
+            // Constructed before `work` runs and dropped only once this closure returns, so it
+            // covers every way out of the work, storing the outcome of it included.
+            let _finish = Finish(&job_state);
 
-/// How long a thread of [`POOL`] waits for more work before it ends: as long as tokio keeps an
-/// idle thread of its own pool for blocking work. That spans the gaps in a steady stream of work,
-/// and lets the threads that a burst of it started go soon after the burst is over.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(work));
+            lock(&job_state).outcome = Some(outcome);
+        }),
+    );
+
+    BlockingWork(state)
+}
+
+/// The pool that [`unblock()`] hands work to. Its threads are named `zruntime blocking work`, as
+/// the documentation of `unblock()` says.
+static POOL: Pool = Pool::new("zruntime blocking work", MAX_THREADS, IDLE_TIMEOUT);
+
+/// The most threads a pool has at once, [`POOL`] and the pool that the waits for child processes
+/// run on alike: as many as the pool of smol's `blocking` crate has by default. That is room for a
+/// burst of slow lookups or file reads to run side by side, or for a burst of children to be waited
+/// for at once, while a flood of work that blocks for good queues up rather than starting threads
+/// without end.
+pub(crate) const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(500).unwrap();
+
+/// How long a thread of a pool waits for more work before it ends, whichever pool it is: as long
+/// as tokio keeps an idle thread of its own pool for blocking work. That spans the gaps in a
+/// steady stream of work, and lets the threads that a burst of it started go soon after the burst
+/// is over.
 #[cfg(not(miri))]
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Under Miri, a thread of [`POOL`] ends as soon as it finds no work to run. Miri ends a program
+/// Under Miri, a thread of a pool ends as soon as it finds no work to run. Miri ends a program
 /// with an error if a thread other than the main one is still running as the main one returns, and
 /// a thread that waited for more work would be.
 #[cfg(miri)]
-const IDLE_TIMEOUT: Duration = Duration::ZERO;
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::ZERO;
 
 /// Where the thread leaves the outcome of the work, and the waker it hands back to.
 ///

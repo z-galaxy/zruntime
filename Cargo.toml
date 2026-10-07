@@ -54,8 +54,8 @@ udp = ["runtime"]
 # unix only.
 unix = ["runtime", "dep:socket2", "rustix?/net"]
 # The `process` module: async child processes, as `Command`, `Child` and the pipes to a child; it
-# needs `unblock` for the pipes on Windows, to collect a child that is dropped while it runs on
-# unix, and to wait for a child where the runtime cannot watch for its exit.
+# needs `unblock` for the pipes on Windows, and for the pool of threads that waits for a child where
+# the runtime cannot watch for its exit and collects one that is dropped while it runs on unix.
 process = [
     "runtime",
     "unblock",

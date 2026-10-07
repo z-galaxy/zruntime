@@ -20,8 +20,9 @@
 //! the exit of the process as well, and a wait for it makes progress in the same way. On Windows,
 //! where the reactor cannot watch a pipe, each read from and write to one runs as blocking work on
 //! a thread of the pool of [`unblock()`](crate::unblock()), and makes progress with no thread
-//! inside `block_on` at all, as does a wait for a process to exit where the reactor does not watch
-//! for that: see [waiting for a child](self#waiting-for-a-child).
+//! inside `block_on` at all. So does a wait for a process to exit where the reactor does not watch
+//! for that, which runs as blocking work on a pool of its own: see
+//! [waiting for a child](self#waiting-for-a-child).
 //!
 //! The types carry the flavour of the runtime, on every platform. A child spawned on a
 //! [`LocalRuntime`] is a `Child<Local>`, `Local` being the default, and stays on the thread it was
@@ -48,27 +49,33 @@
 //!
 //! Where the runtime cannot watch for the exit, which is on Android, on Windows, on the other unix
 //! systems, and on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose
-//! sandbox turns the call away, the wait runs as blocking work on a thread of the pool of
-//! [`unblock()`](crate::unblock()), which is held until the process has exited. It is started by
-//! the first wait that finds the process still running, rather than by spawning, so a child that
-//! nobody waits for holds none. Dropping the future of a wait gives up the wait but not that
-//! thread: the next wait for the same child takes it up where it was, so that waits given up on do
-//! not pile up threads.
+//! sandbox turns the call away, the wait runs as blocking work on a thread of a pool kept for the
+//! waits for children, which is held until the process has exited. It is started by the first wait
+//! that finds the process still running, rather than by spawning, so a child that nobody waits for
+//! holds none. Dropping the future of a wait gives up the wait but not that thread: the next wait
+//! for the same child takes it up where it was, so that waits given up on do not pile up threads.
+//!
+//! That pool is the one that a dropped child is [reaped](self#dropping-a-child) on as well, and not
+//! the one of [`unblock()`](crate::unblock()), which a program that waits for many long-running
+//! children at once would otherwise fill, for all its other blocking work to wait behind.
 //!
 //! # Dropping a child
 //!
 //! Dropping a [`Child`] closes its pipes, and leaves the process running, as dropping a std `Child`
 //! does. [`Command::kill_on_drop`] has the process killed instead. A process that exits with
 //! nobody to collect its status stays a zombie, and std's `Child` leaves it so. On unix, a `Child`
-//! dropped while its process runs hands the process over to a thread of the pool of
-//! [`unblock()`](crate::unblock()) instead, which collects its status once it has exited, unless
+//! dropped while its process runs hands the process over to a thread of a pool kept for the waits
+//! for children instead, which collects its status once it has exited, unless
 //! [`Command::reap_on_drop`] says not to. That thread is held until the process exits, so a
-//! program that lets go of many processes that run for long holds as many threads. The pool is the
-//! one every piece of blocking work of the process shares, that of `unblock` and of the `fs`
-//! module among them, so once such processes hold all of its threads, the rest of that work waits
-//! its turn behind them, for as long as they run. Killing them, waiting for them, or turning
-//! `reap_on_drop` off, avoids that. Windows leaves no zombie, so there is nothing to collect there,
-//! and `reap_on_drop` does nothing.
+//! program that lets go of many processes that run for long holds as many threads. The pool has
+//! room for 500, past which a process that is let go of waits its turn behind the others, and stays
+//! a zombie should it exit before a thread is free to collect it. Its threads are named
+//! `zruntime child wait`, and it is apart from the pool of [`unblock()`](crate::unblock()), which
+//! every other piece of blocking work of the process shares, that of the `fs` module among it:
+//! however many processes are let go of, and however long they run, that work never waits behind
+//! them. Killing them, waiting for them, or turning `reap_on_drop` off keeps the threads from being
+//! held for long. Windows leaves no zombie, so there is nothing to collect there, and
+//! `reap_on_drop` does nothing.
 //!
 //! # Example
 //!
@@ -116,9 +123,10 @@ use futures_io::AsyncRead;
 
 use self::exit::Exit;
 pub use self::stdio::{ChildStderr, ChildStdin, ChildStdout};
-#[cfg(unix)]
-use crate::unblock;
-use crate::{Local, Mode, Runtime};
+use crate::{
+    Local, Mode, Runtime,
+    unblock::{IDLE_TIMEOUT, MAX_THREADS, pool::Pool},
+};
 pub use std::process::{ExitStatus, Output, Stdio};
 
 /// A builder of a process to spawn, as [`std::process::Command`] is, whose methods that spawn it
@@ -128,8 +136,15 @@ pub use std::process::{ExitStatus, Output, Stdio};
 /// directory, and what the standard streams of the process are connected to. A command built
 /// with `Command::new` starts from the environment and working directory of this process, and
 /// [`as_std`](Command::as_std) gives the std command inside for what only that has: the getters
-/// that tell what was configured, and, through [`as_std_mut`](Command::as_std_mut), the extension
-/// traits of the platform, such as std's `CommandExt` of unix.
+/// of the program, the arguments, the environment and the working directory, and, through
+/// [`as_std_mut`](Command::as_std_mut), the extension traits of the platform, such as std's
+/// `CommandExt` of unix.
+///
+/// What becomes of the process when its [`Child`] is dropped is this builder's own, which std's
+/// command knows nothing of: [`kill_on_drop`](Command::kill_on_drop) and
+/// [`reap_on_drop`](Command::reap_on_drop) set it, and its own getters,
+/// [`get_kill_on_drop`](Command::get_kill_on_drop) and
+/// [`get_reap_on_drop`](Command::get_reap_on_drop), read it back.
 ///
 /// A command may be spawned any number of times. The standard streams that this builder was not
 /// told about are decided by the method that runs the command, afresh each time:
@@ -306,10 +321,10 @@ impl Command {
     ///
     /// A process that exits with nobody to collect its status stays a zombie, which holds on to its
     /// process ID, until something collects it. With this on, dropping a `Child` on unix hands a
-    /// process that is still running to a thread of the pool of [`unblock()`](crate::unblock()),
-    /// which waits for it to exit and collects the status. That is a thread held until the process
-    /// exits, which the rest of the pool's blocking work goes without, and which turning this off
-    /// spares, at the price of the zombie: see the [module documentation](self#dropping-a-child).
+    /// process that is still running to a thread of a pool kept for the waits for children, which
+    /// waits for it to exit and collects the status. That is a thread held until the process exits,
+    /// which turning this off spares, at the price of the zombie: see the
+    /// [module documentation](self#dropping-a-child).
     ///
     /// This does nothing on Windows, where a process that exits leaves nothing to collect.
     pub fn reap_on_drop(&mut self, reap_on_drop: bool) -> &mut Self {
@@ -317,8 +332,28 @@ impl Command {
         self
     }
 
+    /// Whether the process is killed when its [`Child`] is dropped, which it is not by default.
+    ///
+    /// [`kill_on_drop`](Command::kill_on_drop) sets it.
+    pub fn get_kill_on_drop(&self) -> bool {
+        self.kill_on_drop
+    }
+
+    /// Whether the status of the process is collected for the [`Child`], once it exits, when the
+    /// `Child` is dropped while the process runs, which it is by default.
+    ///
+    /// [`reap_on_drop`](Command::reap_on_drop) sets it. It makes no difference on Windows, where a
+    /// process that exits leaves nothing to collect.
+    pub fn get_reap_on_drop(&self) -> bool {
+        self.reap_on_drop
+    }
+
     /// The std command inside this one, for what it has getters for: the program, the arguments,
     /// the environment and the working directory.
+    ///
+    /// Whether the process is killed or has its status collected when its [`Child`] is dropped is
+    /// not std's to tell, and is read through [`get_kill_on_drop`](Command::get_kill_on_drop) and
+    /// [`get_reap_on_drop`](Command::get_reap_on_drop) instead.
     pub fn as_std(&self) -> &std::process::Command {
         &self.inner
     }
@@ -755,12 +790,17 @@ impl Drop for Guard {
 /// Sees to it that the status of `child`'s process is collected, once it has exited.
 ///
 /// A process that has exited already is collected by the look at it. One that is still running is
-/// handed to blocking work that waits for it, and the work runs to its end whether or not anything
-/// waits for it.
+/// handed to a thread of [`WAITS`], which waits for it to exit, and nothing awaits the outcome: the
+/// thread collects the status and that is all.
 #[cfg(unix)]
 fn reap(mut child: std::process::Child) {
     if matches!(child.try_wait(), Ok(None)) {
-        drop(unblock(move || child.wait()));
+        Pool::submit(
+            &WAITS,
+            Box::new(move || {
+                let _ = child.wait();
+            }),
+        );
     }
 }
 
@@ -769,6 +809,21 @@ fn reap(mut child: std::process::Child) {
 fn reap(child: std::process::Child) {
     drop(child);
 }
+
+/// The pool that the waits for children run on, apart from that of
+/// [`unblock()`](crate::unblock()): the waits that reap a child that is dropped while its process
+/// runs, and, where the runtime cannot watch for the exit of a child, the waits for it.
+///
+/// A wait for a child holds its thread for as long as the child runs, which may be as long as the
+/// program does. Such waits are not the work the pool of `unblock()` is for, which ends of its own
+/// accord, and a program that lets go of enough children, or waits for enough of them at once,
+/// would hold every thread of that pool with them, for every other piece of blocking work to wait
+/// behind. So they have a pool of their own, whose threads hold nothing else: it holds a thread for
+/// each wait that runs, up to [`MAX_THREADS`], and past that a wait waits its turn behind the other
+/// waits for children, never behind other blocking work. Its threads are named
+/// `zruntime child wait`. A child that is dropped after a wait for its exit was given up on holds
+/// two of them until its process exits: that of the wait, which runs on, and that of the reap.
+static WAITS: Pool = Pool::new("zruntime child wait", MAX_THREADS, IDLE_TIMEOUT);
 
 /// What [`Child::output`] reads one of the child's pipes into.
 struct Capture<R> {

@@ -9,16 +9,16 @@
 //! need a task are written for a shared runtime.
 //!
 //! The first tests are of the builder: that it forwards what it is given to the std command, that
-//! it turns a std command into its own, and that what it was not told about a standard stream is
-//! decided afresh each time the command runs. Then come the tests of the futures of a command, its
-//! output, its status and its failure to spawn, and of the pipes: that a child's input, output
-//! and error go through them, that a read that has to wait leaves the thread to the other tasks,
-//! that a write that has to wait does, and that the output is read from both pipes at once. After
-//! them come the tests of waiting for a child: its status closes the child's input, a status that
-//! is given up on can be asked for again, and `try_status` and `kill` agree with it. Then come
-//! the pipes handed to another child, what happens to a child that is dropped, whichever way its
-//! command said, a child on a task of a shared runtime, and last, the `Debug` of what the module
-//! hands out.
+//! it reads back whether it kills and whether it reaps a child that is dropped, that it turns a std
+//! command into its own, and that what it was not told about a standard stream is decided afresh
+//! each time the command runs. Then come the tests of the futures of a command, its output, its
+//! status and its failure to spawn, and of the pipes: that a child's input, output and error go
+//! through them, that a read that has to wait leaves the thread to the other tasks, that a write
+//! that has to wait does, and that the output is read from both pipes at once. After them come the
+//! tests of waiting for a child: its status closes the child's input, a status that is given up on
+//! can be asked for again, and `try_status` and `kill` agree with it. Then come the pipes handed to
+//! another child, what happens to a child that is dropped, whichever way its command said, a child
+//! on a task of a shared runtime, and last, the `Debug` of what the module hands out.
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -105,6 +105,33 @@ fn the_builder_forwards_to_the_std_command() {
 
     command.env_clear();
     assert_eq!(command.as_std().get_envs().count(), 0);
+}
+
+/// The getters tell what the setters were given: a command starts out not killing the process of a
+/// child that is dropped and collecting its status, as one made from a std command does, and each
+/// flag follows its own setter and not the other's.
+#[test]
+#[timeout(15000)]
+fn the_getters_read_back_the_kill_and_reap_settings() {
+    let mut command = Command::new("program");
+    assert!(!command.get_kill_on_drop());
+    assert!(command.get_reap_on_drop());
+
+    command.kill_on_drop(true);
+    assert!(command.get_kill_on_drop());
+    assert!(command.get_reap_on_drop());
+
+    command.reap_on_drop(false);
+    assert!(command.get_kill_on_drop());
+    assert!(!command.get_reap_on_drop());
+
+    command.kill_on_drop(false).reap_on_drop(true);
+    assert!(!command.get_kill_on_drop());
+    assert!(command.get_reap_on_drop());
+
+    let converted = Command::from(std::process::Command::new("program"));
+    assert!(!converted.get_kill_on_drop());
+    assert!(converted.get_reap_on_drop());
 }
 
 in_both_modes! {
