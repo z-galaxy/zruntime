@@ -7,13 +7,19 @@
 //! socket that made it is gone, and binding to a path that has a file already fails with
 //! [`AddrInUse`](std::io::ErrorKind::AddrInUse), so whoever owns a path removes its file when done
 //! with it. The system limits how long a path may be, to about a hundred bytes, and a longer one
-//! fails with [`InvalidInput`](std::io::ErrorKind::InvalidInput).
+//! fails with [`InvalidInput`](std::io::ErrorKind::InvalidInput). On Linux and Android a socket
+//! can instead be named in the abstract namespace, by a string of bytes that has no file behind it,
+//! which std's `SocketAddrExt` makes and reads: [`UnixStream::connect_addr`] connects to one.
 //!
 //! The sockets run on a runtime, as the sockets of the [parent module](super) do, and what its
 //! documentation says of those holds for these: which threads drive a socket's operations, how a
 //! socket's type carries the flavour of its runtime, and how many tasks may wait on one socket at
 //! once.
 
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
 use std::{
     fmt,
     io::{self, Read},
@@ -228,9 +234,10 @@ where
 /// A unix-domain connection, to read from and write to.
 ///
 /// A stream is made by connecting to the path a [`UnixListener`] is bound to with
-/// [`UnixStream::connect`], by a listener accepting a connection, or as one of a connected pair
-/// with [`UnixStream::pair`]. It is the async counterpart of [`std::os::unix::net::UnixStream`]: a
-/// read or a write that has to wait leaves the thread to the other tasks instead of blocking it.
+/// [`UnixStream::connect`], or to its address with [`UnixStream::connect_addr`], by a listener
+/// accepting a connection, or as one of a connected pair with [`UnixStream::pair`]. It is the async
+/// counterpart of [`std::os::unix::net::UnixStream`]: a read or a write that has to wait leaves the
+/// thread to the other tasks instead of blocking it.
 ///
 /// The stream implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
 /// extension traits of [`futures-lite`] or [`futures-util`] read from and write to it. So does a
@@ -323,24 +330,45 @@ where
     /// wait, with a timeout of its own or by dropping the future, which gives up the attempt.
     /// Other platforms refuse a connection to a listener whose backlog is full, which fails with
     /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) at once.
+    ///
+    /// To connect to a socket by its address as std gives it rather than by a path, which on
+    /// Linux and Android is the only way to reach one in the abstract namespace, see
+    /// [`connect_addr`](UnixStream::connect_addr).
     pub async fn connect<P>(runtime: &Runtime<M>, path: P) -> io::Result<Self>
     where
         P: AsRef<Path>,
     {
-        let path = path.as_ref();
-        // `SockAddr::unix` takes a zero byte as it comes: one that leads the path names a socket
-        // in Linux's abstract namespace instead, and one inside it cuts the path short. Neither is
-        // what a path means anywhere else.
-        if path.as_os_str().as_bytes().contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "paths must not contain interior null bytes",
-            ));
-        }
-        let address = SockAddr::unix(path)?;
-        let io = connect::connect_unix(runtime, &address).await?;
+        Self::connect_sockaddr(runtime, &pathname_sockaddr(path.as_ref())?).await
+    }
 
-        Ok(Self { io })
+    /// A stream connected to the socket at `address`, on `runtime`.
+    ///
+    /// `address` is a socket address as std gives it, such as the
+    /// [`local_addr`](UnixListener::local_addr) of a listener. It names a socket by the path it is
+    /// bound to, which [`connect`](UnixStream::connect) takes as it is, or, on Linux and Android,
+    /// by a name in the abstract namespace. Such a socket has no file behind it, and its name is a
+    /// string of bytes, any of them a zero byte: std's [`SocketAddrExt`] makes an address of a
+    /// name, and tells the name an address holds. An unnamed address, which is that of a socket
+    /// bound to nothing, such as either end of a [pair](UnixStream::pair), names no socket to
+    /// connect to, and this fails with [`InvalidInput`](io::ErrorKind::InvalidInput).
+    ///
+    /// The connection does not block the thread. For a path it fails as
+    /// [`connect`](UnixStream::connect) does: with [`NotFound`](io::ErrorKind::NotFound) where
+    /// there is no file at it, and with [`ConnectionRefused`](io::ErrorKind::ConnectionRefused)
+    /// where the file is that of a socket nothing listens at any more. A name in the abstract
+    /// namespace has no file to be missing, so a name nothing listens at fails with
+    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused).
+    ///
+    /// On Linux and Android, a listener whose backlog is full has no room for another connection,
+    /// and a connect waits for room to open up, without blocking the thread: it tries again every
+    /// 20 milliseconds for as long as the caller awaits it. Nothing but the caller bounds that
+    /// wait, with a timeout of its own or by dropping the future, which gives up the attempt.
+    /// Other platforms refuse a connection to a listener whose backlog is full, which fails with
+    /// [`ConnectionRefused`](io::ErrorKind::ConnectionRefused) at once.
+    ///
+    /// [`SocketAddrExt`]: https://doc.rust-lang.org/std/os/linux/net/trait.SocketAddrExt.html
+    pub async fn connect_addr(runtime: &Runtime<M>, address: &SocketAddr) -> io::Result<Self> {
+        Self::connect_sockaddr(runtime, &named_sockaddr(address)?).await
     }
 
     /// A connected pair of streams, on `runtime`.
@@ -911,6 +939,63 @@ where
         // sets right.
         UnixStream::from_std(&self.io.runtime(), stream).map(|stream| (stream, address))
     }
+}
+
+impl<M> UnixStream<M>
+where
+    M: Mode,
+{
+    /// A stream connected to the socket at `address`, on `runtime`.
+    ///
+    /// What `connect` and `connect_addr` both end in, so that the wait for room in a full backlog
+    /// is the same for either.
+    async fn connect_sockaddr(runtime: &Runtime<M>, address: &SockAddr) -> io::Result<Self> {
+        let io = connect::connect_unix(runtime, address).await?;
+
+        Ok(Self { io })
+    }
+}
+
+/// The address of the socket that `address` names, as the system takes it to connect to.
+///
+/// A path is taken as `connect` takes one. A name in the abstract namespace, which only Linux and
+/// Android have, is taken without the checks of a path, and `SockAddr::unix` takes it for what it
+/// is by the zero byte it leads with. An unnamed address names nothing to connect to.
+fn named_sockaddr(address: &SocketAddr) -> io::Result<SockAddr> {
+    if let Some(path) = address.as_pathname() {
+        return pathname_sockaddr(path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(name) = address.as_abstract_name() {
+        // The zero byte in front is what makes the name abstract, and the name follows it as it
+        // is, a zero byte inside included: socket2 counts the whole of it into the address's
+        // length, with no terminator after it, as an abstract name has none.
+        let path = [&[0u8][..], name].concat();
+
+        return SockAddr::unix(std::ffi::OsStr::from_bytes(&path));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "an unnamed address names no socket to connect to",
+    ))
+}
+
+/// The address of the socket file at `path`, as the system takes it to connect to.
+///
+/// `SockAddr::unix` takes a zero byte as it comes: one that leads the path names a socket in
+/// Linux's abstract namespace instead, and one inside it cuts the path short. Neither is what a
+/// path means anywhere else, so a path with a zero byte in it is refused, as std refuses it.
+fn pathname_sockaddr(path: &Path) -> io::Result<SockAddr> {
+    if path.as_os_str().as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paths must not contain interior null bytes",
+        ));
+    }
+
+    SockAddr::unix(path)
 }
 
 /// The flags every write to a stream carries.
