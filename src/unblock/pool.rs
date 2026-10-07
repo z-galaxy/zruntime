@@ -24,11 +24,16 @@ use super::dispose;
 /// A pool is handed jobs through a handle to it, of which every thread it starts keeps a copy for
 /// as long as it runs: a `&'static Pool` for a pool that is a `static`, which needs no allocation
 /// and can be built in a `const`, and an `Arc<Pool>` for one that is not.
+///
+/// Every thread of a pool has the name the pool was given, so that the threads of one pool can be
+/// told from those of another in a list of threads, in a debugger or a profiler, say.
 pub(crate) struct Pool {
     /// The jobs that wait for a thread, and the tally of the threads.
     queue: Mutex<Queue>,
     /// What a thread with no job to run waits on for one to come.
     job_queued: Condvar,
+    /// The name of every thread of the pool.
+    name: &'static str,
     /// The most threads the pool has at once.
     cap: NonZeroUsize,
     /// How long a thread waits for a job before it goes.
@@ -39,9 +44,9 @@ pub(crate) struct Pool {
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
 impl Pool {
-    /// A pool with no thread yet, which starts up to `cap` of them as jobs come, each of which goes
-    /// once it has waited for a job for `idle_timeout` and found none.
-    pub(crate) const fn new(cap: NonZeroUsize, idle_timeout: Duration) -> Self {
+    /// A pool with no thread yet, which starts up to `cap` of them as jobs come, each named `name`
+    /// and each of which goes once it has waited for a job for `idle_timeout` and found none.
+    pub(crate) const fn new(name: &'static str, cap: NonZeroUsize, idle_timeout: Duration) -> Self {
         Self {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
@@ -49,6 +54,7 @@ impl Pool {
                 idle: 0,
             }),
             job_queued: Condvar::new(),
+            name,
             cap,
             idle_timeout,
         }
@@ -76,7 +82,7 @@ impl Pool {
         while queue.jobs.len() > queue.idle && queue.threads < pool.cap.get() {
             let handle = pool.clone();
             let spawned = thread::Builder::new()
-                .name(THREAD_NAME.into())
+                .name(pool.name.into())
                 .spawn(move || serve(handle));
             match spawned {
                 Ok(_) => {
@@ -174,6 +180,3 @@ struct Queue {
     /// it, so that a job handed over in between finds it counted, and no thread started for it.
     idle: usize,
 }
-
-/// The name of every thread of a pool.
-const THREAD_NAME: &str = "zruntime blocking work";

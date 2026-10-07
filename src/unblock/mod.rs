@@ -182,8 +182,9 @@ impl<T> fmt::Debug for BlockingWork<T> {
     }
 }
 
-/// The pool that [`unblock()`] hands work to.
-static POOL: Pool = Pool::new(MAX_THREADS, IDLE_TIMEOUT);
+/// The pool that [`unblock()`] hands work to. Its threads are named `zruntime blocking work`, as
+/// the documentation of `unblock()` says.
+static POOL: Pool = Pool::new("zruntime blocking work", MAX_THREADS, IDLE_TIMEOUT);
 
 /// The most threads [`POOL`] has at once: as many as the pool of smol's `blocking` crate has by
 /// default. That is room for a burst of slow lookups or file reads to run side by side, while a
