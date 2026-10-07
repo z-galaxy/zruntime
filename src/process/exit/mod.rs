@@ -11,8 +11,8 @@
 //! through a pidfd of the process, and on Apple's platforms and the BSDs through a kqueue of the
 //! child's own with a filter on the process, each a descriptor that turns readable once the process
 //! has exited. Where it cannot, which is on Android, on Windows, on the other unix systems, and on
-//! a Linux that has no pidfd to give, the wait runs as blocking work on a thread of the pool of
-//! [`unblock()`](crate::unblock()).
+//! a Linux that has no pidfd to give, the wait runs as blocking work on a thread of the pool kept
+//! for the waits for children, apart from that of [`unblock()`](crate::unblock()).
 
 // A kqueue of the child's own on Apple's platforms and the BSDs, which have no wait on the pool to
 // fall back on, and the pool elsewhere, with a pidfd in front of it on Linux.

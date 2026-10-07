@@ -91,25 +91,7 @@ pub fn unblock<T>(work: impl FnOnce() -> T + Send + 'static) -> BlockingWork<T>
 where
     T: Send + 'static,
 {
-    let state = Arc::new(Mutex::new(State {
-        outcome: None,
-        waker: None,
-    }));
-
-    let job_state = state.clone();
-    Pool::submit(
-        &POOL,
-        Box::new(move || {
-            // Constructed before `work` runs and dropped only once this closure returns, so it
-            // covers every way out of the work, storing the outcome of it included.
-            let _finish = Finish(&job_state);
-
-            let outcome = panic::catch_unwind(AssertUnwindSafe(work));
-            lock(&job_state).outcome = Some(outcome);
-        }),
-    );
-
-    BlockingWork(state)
+    unblock_on(&POOL, work)
 }
 
 /// The future of the work that [`unblock()`] hands to its pool of threads: it resolves to the
@@ -180,6 +162,44 @@ impl<T> fmt::Debug for BlockingWork<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BlockingWork").finish_non_exhaustive()
     }
+}
+
+/// Runs `work` as [`unblock()`] does, but on a thread of `pool` rather than of the pool that
+/// `unblock()` hands its work to, and hands back a future of what it returns.
+///
+/// All that `unblock()` says of the work and of its future holds here with `pool` in place of that
+/// pool: the work is handed to `pool` before this returns, and waits its turn there once `pool` has
+/// as many threads as its cap allows.
+///
+/// # Panics
+///
+/// Panics if `pool` has no thread at all and cannot start one for the work, as [`unblock()`] does.
+pub(crate) fn unblock_on<T>(
+    pool: &'static Pool,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> BlockingWork<T>
+where
+    T: Send + 'static,
+{
+    let state = Arc::new(Mutex::new(State {
+        outcome: None,
+        waker: None,
+    }));
+
+    let job_state = state.clone();
+    Pool::submit(
+        pool,
+        Box::new(move || {
+            // Constructed before `work` runs and dropped only once this closure returns, so it
+            // covers every way out of the work, storing the outcome of it included.
+            let _finish = Finish(&job_state);
+
+            let outcome = panic::catch_unwind(AssertUnwindSafe(work));
+            lock(&job_state).outcome = Some(outcome);
+        }),
+    );
+
+    BlockingWork(state)
 }
 
 /// The pool that [`unblock()`] hands work to. Its threads are named `zruntime blocking work`, as

@@ -1,9 +1,12 @@
 //! The wait everywhere but on Apple's platforms and the BSDs: blocking work on a thread of the pool
-//! of [`unblock()`](crate::unblock()), and, on Linux where the system gives one, a pidfd that the
+//! kept for the waits for children, and, on Linux where the system gives one, a pidfd that the
 //! runtime watches instead.
 //!
 //! The work is a thread held for as long as the child runs, so it is started by the first wait for
-//! the exit rather than by the child's creation, and a child that nobody waits for holds none.
+//! the exit rather than by the child's creation, and a child that nobody waits for holds none. It
+//! runs on the pool that a dropped child is reaped on as well, and not on that of
+//! [`unblock()`](crate::unblock()), which a program that waits for many long-running children at
+//! once would otherwise fill, for all its other blocking work to wait behind.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
@@ -26,7 +29,7 @@ use windows_sys::Win32::{
 
 #[cfg(target_os = "linux")]
 use crate::Async;
-use crate::{BlockingWork, Mode, Runtime, unblock};
+use crate::{BlockingWork, Mode, Runtime, process::WAITS, unblock::unblock_on};
 
 /// What tells a [`Child`](crate::process::Child) that its process has exited: see the
 /// [module documentation](super) of what every platform's does.
@@ -47,7 +50,7 @@ where
     /// cannot be collected, goes on on the pool, whose `waitid` waits for it without spinning.
     #[cfg(target_os = "linux")]
     Watched(Async<OwnedFd, M>),
-    /// Blocking work on a thread of the pool of [`unblock()`](crate::unblock()).
+    /// Blocking work on a thread of the pool kept for the waits for children.
     Pool {
         /// The blocking work that waits, from the first wait until it has resolved.
         ///
@@ -149,7 +152,7 @@ where
 fn start(child: &std::process::Child) -> io::Result<BlockingWork<io::Result<()>>> {
     let pid = Pid::from_child(child);
 
-    Ok(unblock(move || {
+    Ok(unblock_on(&WAITS, move || {
         loop {
             match waitid(
                 WaitId::Pid(pid),
@@ -173,7 +176,7 @@ fn start(child: &std::process::Child) -> io::Result<BlockingWork<io::Result<()>>
 fn start(child: &std::process::Child) -> io::Result<BlockingWork<io::Result<()>>> {
     let handle = child.as_handle().try_clone_to_owned()?;
 
-    Ok(unblock(move || {
+    Ok(unblock_on(&WAITS, move || {
         // SAFETY: `WaitForSingleObject` is given a handle that `handle`, which this closure owns,
         // keeps open for the call, and a timeout that has it wait for as long as it takes. It
         // reads and writes nothing else.

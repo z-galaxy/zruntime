@@ -20,8 +20,9 @@
 //! the exit of the process as well, and a wait for it makes progress in the same way. On Windows,
 //! where the reactor cannot watch a pipe, each read from and write to one runs as blocking work on
 //! a thread of the pool of [`unblock()`](crate::unblock()), and makes progress with no thread
-//! inside `block_on` at all, as does a wait for a process to exit where the reactor does not watch
-//! for that: see [waiting for a child](self#waiting-for-a-child).
+//! inside `block_on` at all. So does a wait for a process to exit where the reactor does not watch
+//! for that, which runs as blocking work on a pool of its own: see
+//! [waiting for a child](self#waiting-for-a-child).
 //!
 //! The types carry the flavour of the runtime, on every platform. A child spawned on a
 //! [`LocalRuntime`] is a `Child<Local>`, `Local` being the default, and stays on the thread it was
@@ -48,12 +49,15 @@
 //!
 //! Where the runtime cannot watch for the exit, which is on Android, on Windows, on the other unix
 //! systems, and on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose
-//! sandbox turns the call away, the wait runs as blocking work on a thread of the pool of
-//! [`unblock()`](crate::unblock()), which is held until the process has exited. It is started by
-//! the first wait that finds the process still running, rather than by spawning, so a child that
-//! nobody waits for holds none. Dropping the future of a wait gives up the wait but not that
-//! thread: the next wait for the same child takes it up where it was, so that waits given up on do
-//! not pile up threads.
+//! sandbox turns the call away, the wait runs as blocking work on a thread of a pool kept for the
+//! waits for children, which is held until the process has exited. It is started by the first wait
+//! that finds the process still running, rather than by spawning, so a child that nobody waits for
+//! holds none. Dropping the future of a wait gives up the wait but not that thread: the next wait
+//! for the same child takes it up where it was, so that waits given up on do not pile up threads.
+//!
+//! That pool is the one that a dropped child is [reaped](self#dropping-a-child) on as well, and not
+//! the one of [`unblock()`](crate::unblock()), which a program that waits for many long-running
+//! children at once would otherwise fill, for all its other blocking work to wait behind.
 //!
 //! # Dropping a child
 //!
@@ -119,9 +123,10 @@ use futures_io::AsyncRead;
 
 use self::exit::Exit;
 pub use self::stdio::{ChildStderr, ChildStdin, ChildStdout};
-#[cfg(unix)]
-use crate::unblock::{IDLE_TIMEOUT, MAX_THREADS, pool::Pool};
-use crate::{Local, Mode, Runtime};
+use crate::{
+    Local, Mode, Runtime,
+    unblock::{IDLE_TIMEOUT, MAX_THREADS, pool::Pool},
+};
 pub use std::process::{ExitStatus, Output, Stdio};
 
 /// A builder of a process to spawn, as [`std::process::Command`] is, whose methods that spawn it
@@ -806,16 +811,18 @@ fn reap(child: std::process::Child) {
 }
 
 /// The pool that the waits for children run on, apart from that of
-/// [`unblock()`](crate::unblock()).
+/// [`unblock()`](crate::unblock()): the waits that reap a child that is dropped while its process
+/// runs, and, where the runtime cannot watch for the exit of a child, the waits for it.
 ///
 /// A wait for a child holds its thread for as long as the child runs, which may be as long as the
 /// program does. Such waits are not the work the pool of `unblock()` is for, which ends of its own
-/// accord, and a program that lets go of enough children would hold every thread of that pool with
-/// them, for every other piece of blocking work to wait behind. So they have a pool of their own,
-/// whose threads hold nothing else: it holds a thread for each wait that runs, up to
-/// [`MAX_THREADS`], and past that a wait waits its turn behind the other waits for children, never
-/// behind other blocking work. Its threads are named `zruntime child wait`.
-#[cfg(unix)]
+/// accord, and a program that lets go of enough children, or waits for enough of them at once,
+/// would hold every thread of that pool with them, for every other piece of blocking work to wait
+/// behind. So they have a pool of their own, whose threads hold nothing else: it holds a thread for
+/// each wait that runs, up to [`MAX_THREADS`], and past that a wait waits its turn behind the other
+/// waits for children, never behind other blocking work. Its threads are named
+/// `zruntime child wait`. A child that is dropped after a wait for its exit was given up on holds
+/// two of them until its process exits: that of the wait, which runs on, and that of the reap.
 static WAITS: Pool = Pool::new("zruntime child wait", MAX_THREADS, IDLE_TIMEOUT);
 
 /// What [`Child::output`] reads one of the child's pipes into.

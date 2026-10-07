@@ -85,15 +85,15 @@ through `Unblock`. Waiting for a child to exit is watched by the runtime's react
 which it can through a pidfd on Linux and through a kqueue of the child's own on Apple's platforms
 and the BSDs, which have no wait on the pool to fall back on; elsewhere, on Android, on Windows, on
 the other unix systems, and on a Linux with no pidfd to give (before 5.3, or in a sandbox that turns
-the call away), it runs on a thread of `unblock`'s pool, through a `waitid` that leaves the child
-unreaped on unix. Either way only std's `Child` ever reaps the child, through `try_wait` while the
-`Child` is held and through `try_wait` and `wait` once it is dropped, so that a `kill` never
-reaches a reused process ID. Dropping a `Child` leaves the process running unless
-`kill_on_drop(true)`; on unix, a still-running child that is let go of is reaped from a thread of a
-pool of its own (`WAITS` in `src/process/mod.rs`, its threads named `zruntime child wait`, with the
-cap and the idle timeout of `unblock`'s pool) unless `reap_on_drop(false)`, so that the reaps of a
-program that lets go of many long-running children never fill the pool that the rest of the
-blocking work shares.
+the call away), it runs on a thread of a pool of its own (`WAITS` in `src/process/mod.rs`, its
+threads named `zruntime child wait`, with the cap and the idle timeout of `unblock`'s pool),
+through a `waitid` that leaves the child unreaped on unix. Either way only std's `Child` ever
+reaps the child, through `try_wait` while the `Child` is held and through `try_wait` and `wait`
+once it is dropped, so that a `kill` never reaches a reused process ID. Dropping a `Child` leaves
+the process running unless `kill_on_drop(true)`; on unix, a still-running child that is let go of
+is reaped from a thread of that same pool unless `reap_on_drop(false)`, so that the waits of a
+program that lets go of, or waits for, many long-running children never fill the pool that the
+rest of the blocking work shares.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -223,7 +223,7 @@ src/
 │                 # connect.rs, the non-blocking connect; tcp.rs; udp.rs; unix.rs, the
 │                 # `net::unix` module (unix only)
 ├── process/      # [process feature] Async child processes: mod.rs, Command and Child, and the
-│                 # pool that dropped children are reaped on; stdio.rs, the pipes; exit/, the wait
+│                 # pool that the waits for children run on; stdio.rs, the pipes; exit/, the wait
 │                 # for a child's exit: kqueue.rs (Apple, the BSDs), pool.rs (elsewhere, behind a
 │                 # pidfd on Linux)
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
@@ -402,7 +402,7 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   (`options.rs`), and the platform extension traits (`unix.rs`, `windows.rs`)
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one
 - `src/process/`: [process feature] Async child processes: `Command` and `Child`, and the `WAITS`
-  pool that a dropped child is reaped on (`mod.rs`), the pipes to a child (`stdio.rs`), and the
+  pool that the waits for children run on (`mod.rs`), the pipes to a child (`stdio.rs`), and the
   wait for a child's exit (`exit/`), which the reactor watches through a kqueue of the child's own
-  on Apple's platforms and the BSDs (`kqueue.rs`) and a pidfd on Linux, and a thread of `unblock`'s
+  on Apple's platforms and the BSDs (`kqueue.rs`) and a pidfd on Linux, and a thread of the `WAITS`
   pool runs elsewhere (`pool.rs`)
