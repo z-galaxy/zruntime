@@ -32,8 +32,9 @@ jobs:
       # it but the no-op `error!` that `log.rs` builds in place of `tracing`'s where that feature
       # is off, and the panic of a `spawn` that finds no runtime to go on where `helper` is off,
       # and cannot show that `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `fs`,
-      # `tcp`, `udp` and `unix` each build without the others: checking each alone covers them, and
-      # `unix`, which builds nothing on Windows, is checked to build nothing there with no warning.
+      # `tcp`, `udp`, `unix` and `process` each build without the others: checking each alone covers
+      # them. `unix`, which builds nothing on Windows, is checked to build nothing there with no
+      # warning, and `process`, which builds code of its own there, to build that alone as well.
       - name: Check build with each feature alone
         run: |
           cargo --locked check --no-default-features --features runtime
@@ -46,7 +47,9 @@ jobs:
           cargo --locked check --no-default-features --features tcp
           cargo --locked check --no-default-features --features udp
           cargo --locked check --no-default-features --features unix
+          cargo --locked check --no-default-features --features process
           cargo --locked check --no-default-features --features unix --target x86_64-pc-windows-gnu
+          cargo --locked check --no-default-features --features process --target x86_64-pc-windows-gnu
 
   fmt:
     runs-on: ubuntu-latest

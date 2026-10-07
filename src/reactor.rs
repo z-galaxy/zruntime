@@ -414,7 +414,20 @@ where
     }
 
     /// A handle on the runtime this registration's source is watched by.
-    #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+    #[cfg(any(
+        feature = "tcp",
+        all(feature = "unix", unix),
+        all(
+            feature = "process",
+            any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            )
+        )
+    ))]
     pub(crate) fn runtime(&self) -> crate::Runtime<M> {
         crate::Runtime {
             core: self.core.clone(),

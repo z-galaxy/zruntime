@@ -1,7 +1,15 @@
 //! [`Async`]: a non-blocking I/O handle that waits for its readiness on a runtime, and the I/O
 //! traits it implements.
 
-#[cfg(all(unix, any(feature = "tcp", feature = "udp", feature = "unix")))]
+#[cfg(all(
+    unix,
+    any(
+        feature = "tcp",
+        feature = "udp",
+        feature = "unix",
+        feature = "process"
+    )
+))]
 use std::os::fd::AsFd as AsSource;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
@@ -71,6 +79,8 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// handed out. A type that implements `Read` or `Write` only for `&mut self`, such as
 /// `std::process::ChildStdout` and `ChildStdin`, has to be converted first. On unix that is
 /// through `OwnedFd`: a `ChildStdout` becomes a `PipeReader`, and a `ChildStdin` a `PipeWriter`.
+/// With the `process` feature, `zruntime::process` spawns children whose pipes are async already,
+/// so that none of this is needed for them.
 ///
 /// A regular file is not what this is for. Linux and Android cannot watch one, and a wait on one
 /// fails there; elsewhere one is reported ready whether or not the disk has its data at hand, and
@@ -317,13 +327,19 @@ where
     }
 
     /// An `Async` on `runtime` that does its I/O on `io`, as it is: the constructor the sockets of
-    /// the `net` module are built with.
+    /// the `net` module and the pipes and exit descriptors of the `process` module are built with.
     ///
-    /// Those sockets are generic over the flavour, and a [`Source<M>`](Source) bound cannot be met
-    /// for an abstract `M`, so this takes what both flavours need of a source instead, `Send` and
-    /// `Sync` included. `io` must be in non-blocking mode already, as for
-    /// [`new_nonblocking`](Async::new_nonblocking).
-    #[cfg(any(feature = "tcp", feature = "udp", all(feature = "unix", unix)))]
+    /// Those are generic over the flavour, and a [`Source<M>`](Source) bound cannot be met for an
+    /// abstract `M`, so this takes what both flavours need of a source instead, `Send` and `Sync`
+    /// included. `io` must be in non-blocking mode already, as for
+    /// [`new_nonblocking`](Async::new_nonblocking), unless nothing is ever read from it or written
+    /// to it, and only its readiness is waited for, as for the exit descriptors.
+    #[cfg(any(
+        feature = "tcp",
+        feature = "udp",
+        all(feature = "unix", unix),
+        all(feature = "process", unix)
+    ))]
     pub(crate) fn from_nonblocking(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
         T: AsSource + Send + Sync + 'static,
@@ -338,7 +354,20 @@ where
     }
 
     /// A handle on the runtime the source is registered on.
-    #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+    #[cfg(any(
+        feature = "tcp",
+        all(feature = "unix", unix),
+        all(
+            feature = "process",
+            any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            )
+        )
+    ))]
     pub(crate) fn runtime(&self) -> Runtime<M> {
         self.registration.runtime()
     }
