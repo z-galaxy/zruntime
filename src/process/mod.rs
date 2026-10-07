@@ -16,9 +16,12 @@
 //! [`Command::output`] take as an argument. On unix that runtime's reactor watches the pipes to the
 //! child from then on: their operations make progress while some thread is inside
 //! [`Runtime::block_on`] on that runtime, or, on a runtime from `SharedRuntime::current`, while the
-//! helper thread runs it. On Windows, where the reactor cannot watch a pipe, each read from and
-//! write to one runs as blocking work on a thread of the pool of [`unblock()`](crate::unblock()),
-//! and makes progress with no thread inside `block_on` at all.
+//! helper thread runs it. On Linux, on Apple's platforms and on the BSDs the reactor watches for
+//! the exit of the process as well, and a wait for it makes progress in the same way. On Windows,
+//! where the reactor cannot watch a pipe, each read from and write to one runs as blocking work on
+//! a thread of the pool of [`unblock()`](crate::unblock()), and makes progress with no thread
+//! inside `block_on` at all, as does a wait for a process to exit where the reactor does not watch
+//! for that: see [waiting for a child](self#waiting-for-a-child).
 //!
 //! The types carry the flavour of the runtime, on every platform. A child spawned on a
 //! [`LocalRuntime`] is a `Child<Local>`, `Local` being the default, and stays on the thread it was
@@ -31,6 +34,26 @@
 //! A process that has exited stays in the system's process table, as a zombie that holds on to its
 //! process ID, until its status is collected. Resolving a status does that, and so does
 //! [`Child::try_status`], which never waits.
+//!
+//! Where the runtime can watch for a process to exit, it does, and the wait holds no thread. On
+//! Linux that is through a pidfd, a descriptor of the process that turns readable once the process
+//! has exited. On Apple's platforms and the BSDs it is through a kqueue of the child's own, with a
+//! filter on the process, whose descriptor turns readable in the same way. The reactor watches
+//! the descriptor as it does a pipe, from the spawn of the process until the descriptor has
+//! reported the exit. A wait that is given up on leaves nothing running. A kqueue that cannot be
+//! made, for want of descriptors, say, fails the spawn with the error on Apple's platforms and the
+//! BSDs, as a pipe that cannot be made does: there is no wait on the pool to fall back on. On
+//! Linux, a process that another process traces is held back by its tracer after its exit, for as
+//! long as the tracer takes to let it go: a wait that finds it so goes on on the pool.
+//!
+//! Where the runtime cannot watch for the exit, which is on Android, on Windows, on the other unix
+//! systems, and on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose
+//! sandbox turns the call away, the wait runs as blocking work on a thread of the pool of
+//! [`unblock()`](crate::unblock()), which is held until the process has exited. It is started by
+//! the first wait that finds the process still running, rather than by spawning, so a child that
+//! nobody waits for holds none. Dropping the future of a wait gives up the wait but not that
+//! thread: the next wait for the same child takes it up where it was, so that waits given up on do
+//! not pile up threads.
 //!
 //! # Dropping a child
 //!
@@ -550,7 +573,8 @@ where
     ///
     /// A process that has exited resolves at once, and so does a call after the status was
     /// collected, to the same status again. The future may be dropped, which loses nothing: the
-    /// next call takes up the wait, and a process that exited meanwhile is found as it is.
+    /// next call takes up the wait, and a process that exited meanwhile is found as it is. See the
+    /// [module documentation](self#waiting-for-a-child) for what the wait is made of.
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
 

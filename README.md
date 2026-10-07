@@ -190,6 +190,30 @@ number of tasks may wait at once through these four. The `AsyncRead` and `AsyncW
 waiting task per direction instead. [`Runtime::register`] and [`Registration`] are the lower level
 it is built on.
 
+## Child processes
+
+The non-default `process` feature adds async child processes, in the shape of `std::process` and of
+smol's `smol::process`: the [`process`] module's `Command` is built as `std::process::Command` is,
+and spawns the program on a runtime of either flavour, which it is handed, as a `Child` whose
+`status` and `output` are futures. A child's standard input, output and error come out of it as
+`ChildStdin`, `ChildStdout` and `ChildStderr`, which implement the `AsyncWrite` and `AsyncRead`
+traits of `futures-io`. On unix the runtime watches these pipes itself, so that reading and
+writing them never blocks the thread; on Windows they run as blocking work on [`unblock`]'s pool
+instead. `output` reads the standard output and the standard error together, so that a child
+which fills the one while nobody reads the other does not stall. A pipe can be handed on to
+another child, to run `a | b`, through its `into_stdio`.
+
+Waiting for a child to exit does not block the thread either. Where the runtime can watch for the
+exit, which it can through a pidfd on Linux and through a kqueue of the child's own on Apple's
+platforms and the BSDs, it does; elsewhere, on Android, on Windows, on the other unix systems, and
+on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose sandbox turns the
+call away, the wait runs on a thread of [`unblock`]'s pool, and holds that thread until the child
+has exited. Dropping a `Child` leaves the process running, unless its `Command` was given
+`kill_on_drop(true)`. On unix, a child that is still running when it is let go of is reaped from a
+pool thread once it exits, so that it leaves no zombie behind. That holds a thread of the pool,
+which every piece of blocking work shares, until the child has exited, which awaiting its `status`
+first, or `reap_on_drop(false)`, spares.
+
 ## Events
 
 An [`Event`] is a notification that tasks can wait for. A task takes an [`EventListener`] from it
@@ -232,6 +256,11 @@ is behind the `event` feature, which builds without the runtime: see [Features](
 * `udp`: the [`net`] module's `UdpSocket`; it implies `runtime`.
 * `unix`: the [`net`] module's `unix` module, with unix-domain sockets, on unix only; it implies
   `runtime`, and brings the `socket2` crate and `rustix`'s `net` feature.
+* `process`: the [`process`] module, async child processes in the shape of `std::process` and of
+  smol's `smol::process`, whose pipes the runtime watches on unix and which run as blocking work
+  on [`unblock`]'s pool on Windows; it implies `runtime` and `unblock`, and brings `rustix`'s
+  `process` feature, and, on Windows, the `Win32_Foundation` and `Win32_System_Threading`
+  features of `windows-sys`.
 
 `runtime` and `event` each build without the other. A crate that wants only the `Event` builds
 zruntime with `default-features = false, features = ["event"]`, which builds none of the runtime,
@@ -305,6 +334,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Unblock`]: https://docs.rs/zruntime/latest/zruntime/struct.Unblock.html
 [`fs`]: https://docs.rs/zruntime/latest/zruntime/fs/index.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
+[`process`]: https://docs.rs/zruntime/latest/zruntime/process/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
 [MIT]: (LICENSE)

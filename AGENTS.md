@@ -74,6 +74,24 @@ feature, which implies `runtime` and adds the `socket2` dependency and `rustix`'
 gives the `zruntime::net::unix` module's `UnixListener`, `UnixStream` and `UnixDatagram`, on unix
 only: on Windows it builds nothing.
 
+A non-default `process` feature, which implies `runtime` and `unblock` and adds `rustix`'s
+`process` feature on unix and `windows-sys`'s `Win32_Foundation` and `Win32_System_Threading`
+features on Windows, gives `zruntime::process`: async child processes in the shape of
+`std::process` and of smol's `smol::process` (the async-process crate), a `Command`, a `Child` and
+the pipes to a child, `ChildStdin`, `ChildStdout` and `ChildStderr`, which implement `futures-io`'s
+`AsyncWrite` and `AsyncRead`. They run on a `Runtime` of either flavour, which a child is spawned
+on as an argument. On unix a child's pipes are watched by the runtime's reactor; on Windows they go
+through `Unblock`. Waiting for a child to exit is watched by the runtime's reactor where it can,
+which it can through a pidfd on Linux and through a kqueue of the child's own on Apple's platforms
+and the BSDs, which have no wait on the pool to fall back on; elsewhere, on Android, on Windows, on
+the other unix systems, and on a Linux with no pidfd to give (before 5.3, or in a sandbox that turns
+the call away), it runs on a thread of `unblock`'s pool, through a `waitid` that leaves the child
+unreaped on unix. Either way only std's `Child` ever reaps the child, through `try_wait` while the
+`Child` is held and through `try_wait` and `wait` on the pool once it is dropped, so that a `kill`
+never reaches a reused process ID. Dropping a `Child` leaves the process running unless
+`kill_on_drop(true)`; on unix, a still-running child that is let go of is reaped from a pool thread
+unless `reap_on_drop(false)`.
+
 It is a single crate at the repository root — not a workspace.
 
 ## Common Development Commands
@@ -110,9 +128,9 @@ RUSTFLAGS="--cfg zruntime_poll" cargo clippy --all-targets --all-features -- -D 
 RUSTFLAGS="--cfg zruntime_kqueue" cargo clippy --all-targets --all-features \
     --target x86_64-apple-darwin -- -D warnings
 
-# Check the runtime, Event, the two channels, the locks, unblock, fs and each family of socket
-# built alone: `--all-features` cannot show that each builds without the others, and leaves out
-# the no-op `error!` in `log.rs` that replaces `tracing`'s
+# Check the runtime, Event, the two channels, the locks, unblock, fs, each family of socket and
+# the child processes built alone: `--all-features` cannot show that each builds without the
+# others, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
@@ -123,6 +141,7 @@ cargo check --no-default-features --features fs
 cargo check --no-default-features --features tcp
 cargo check --no-default-features --features udp
 cargo check --no-default-features --features unix
+cargo check --no-default-features --features process
 
 # Run what needs no runtime (Event, the locks, the two channels, unblock) under Miri, as CI does;
 # the runtime's poller on Linux keeps a timerfd, which Miri does not run, and fs reaches the
@@ -200,6 +219,9 @@ src/
 ├── net/          # [tcp, udp, unix features] Async sockets, each built on `Async<T, M>`:
 │                 # connect.rs, the non-blocking connect; tcp.rs; udp.rs; unix.rs, the
 │                 # `net::unix` module (unix only)
+├── process/      # [process feature] Async child processes: mod.rs, Command and Child; stdio.rs,
+│                 # the pipes; exit/, the wait for a child's exit: kqueue.rs (Apple, the BSDs),
+│                 # pool.rs (elsewhere, behind a pidfd on Linux)
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
@@ -215,7 +237,8 @@ src/
                   # broadcast.rs: the broadcast channel, broadcast feature; mpmc.rs: the MPMC
                   # channel, mpmc feature; lock/: the locks, lock feature; helper.rs: helper
                   # feature; unblock/: unblock, its pool and Unblock, unblock feature; fs.rs: fs,
-                  # fs feature; net/: the sockets, each family under its own feature
+                  # fs feature; net/: the sockets, each family under its own feature; process.rs:
+                  # child processes, process feature
 ```
 
 ### Key Design Patterns
@@ -335,10 +358,10 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
   into the runtime; nor may `unblock`, which needs neither, or `fs`, which implies `unblock` and
-  `lock`. `tcp`, `udp` and `unix` imply `runtime`, and `unix` builds nothing on Windows. CI builds
-  and tests everything with every feature on, tests `runtime` alone (for what `spawn` does without
-  `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `fs`, `tcp`,
-  `udp` and `unix` each alone.
+  `lock`. `tcp`, `udp` and `unix` imply `runtime`, and `unix` builds nothing on Windows. `process`
+  implies `runtime` and `unblock`. CI builds and tests everything with every feature on, tests
+  `runtime` alone (for what `spawn` does without `helper`), and checks `runtime`, `event`,
+  `broadcast`, `mpmc`, `lock`, `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
@@ -369,3 +392,7 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   `Unblock` (`file.rs`), `ReadDir`/`DirEntry`/`DirBuilder` (`dir.rs`), `OpenOptions`
   (`options.rs`), and the platform extension traits (`unix.rs`, `windows.rs`)
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one
+- `src/process/`: [process feature] Async child processes: `Command` and `Child` (`mod.rs`), the
+  pipes to a child (`stdio.rs`), and the wait for a child's exit (`exit/`), which the reactor
+  watches through a kqueue of the child's own on Apple's platforms and the BSDs (`kqueue.rs`) and
+  a pidfd on Linux, and a thread of `unblock`'s pool runs elsewhere (`pool.rs`)
