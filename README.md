@@ -209,10 +209,12 @@ platforms and the BSDs, it does; elsewhere, on Android, on Windows, on the other
 on a Linux that has no pidfd to give, as one before 5.3 has none, or one whose sandbox turns the
 call away, the wait runs on a thread of [`unblock`]'s pool, and holds that thread until the child
 has exited. Dropping a `Child` leaves the process running, unless its `Command` was given
-`kill_on_drop(true)`. On unix, a child that is still running when it is let go of is reaped from a
-pool thread once it exits, so that it leaves no zombie behind. That holds a thread of the pool,
-which every piece of blocking work shares, until the child has exited, which awaiting its `status`
-first, or `reap_on_drop(false)`, spares.
+`kill_on_drop(true)`. On unix, a child that is still running when it is let go of is reaped once
+it exits, from a thread of a pool kept for the waits for children, so that it leaves no zombie
+behind; awaiting its `status` first, or `reap_on_drop(false)`, spares that thread. The pool, whose
+threads are named `zruntime child wait`, is apart from [`unblock`]'s, so a program that lets go of
+many long-running children never holds up the rest of its blocking work: it holds a thread for each
+of them, up to 500, past which the reaps queue behind each other.
 
 ## Events
 

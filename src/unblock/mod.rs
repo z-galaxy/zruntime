@@ -186,22 +186,25 @@ impl<T> fmt::Debug for BlockingWork<T> {
 /// the documentation of `unblock()` says.
 static POOL: Pool = Pool::new("zruntime blocking work", MAX_THREADS, IDLE_TIMEOUT);
 
-/// The most threads [`POOL`] has at once: as many as the pool of smol's `blocking` crate has by
-/// default. That is room for a burst of slow lookups or file reads to run side by side, while a
-/// flood of work that blocks for good queues up rather than starting threads without end.
-const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(500).unwrap();
+/// The most threads a pool has at once, [`POOL`] and the pool that the waits for child processes
+/// run on alike: as many as the pool of smol's `blocking` crate has by default. That is room for a
+/// burst of slow lookups or file reads to run side by side, or for a burst of children to be waited
+/// for at once, while a flood of work that blocks for good queues up rather than starting threads
+/// without end.
+pub(crate) const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(500).unwrap();
 
-/// How long a thread of [`POOL`] waits for more work before it ends: as long as tokio keeps an
-/// idle thread of its own pool for blocking work. That spans the gaps in a steady stream of work,
-/// and lets the threads that a burst of it started go soon after the burst is over.
+/// How long a thread of a pool waits for more work before it ends, whichever pool it is: as long
+/// as tokio keeps an idle thread of its own pool for blocking work. That spans the gaps in a
+/// steady stream of work, and lets the threads that a burst of it started go soon after the burst
+/// is over.
 #[cfg(not(miri))]
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Under Miri, a thread of [`POOL`] ends as soon as it finds no work to run. Miri ends a program
+/// Under Miri, a thread of a pool ends as soon as it finds no work to run. Miri ends a program
 /// with an error if a thread other than the main one is still running as the main one returns, and
 /// a thread that waited for more work would be.
 #[cfg(miri)]
-const IDLE_TIMEOUT: Duration = Duration::ZERO;
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::ZERO;
 
 /// Where the thread leaves the outcome of the work, and the waker it hands back to.
 ///

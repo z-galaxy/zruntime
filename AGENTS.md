@@ -87,10 +87,13 @@ and the BSDs, which have no wait on the pool to fall back on; elsewhere, on Andr
 the other unix systems, and on a Linux with no pidfd to give (before 5.3, or in a sandbox that turns
 the call away), it runs on a thread of `unblock`'s pool, through a `waitid` that leaves the child
 unreaped on unix. Either way only std's `Child` ever reaps the child, through `try_wait` while the
-`Child` is held and through `try_wait` and `wait` on the pool once it is dropped, so that a `kill`
-never reaches a reused process ID. Dropping a `Child` leaves the process running unless
-`kill_on_drop(true)`; on unix, a still-running child that is let go of is reaped from a pool thread
-unless `reap_on_drop(false)`.
+`Child` is held and through `try_wait` and `wait` once it is dropped, so that a `kill` never
+reaches a reused process ID. Dropping a `Child` leaves the process running unless
+`kill_on_drop(true)`; on unix, a still-running child that is let go of is reaped from a thread of a
+pool of its own (`WAITS` in `src/process/mod.rs`, its threads named `zruntime child wait`, with the
+cap and the idle timeout of `unblock`'s pool) unless `reap_on_drop(false)`, so that the reaps of a
+program that lets go of many long-running children never fill the pool that the rest of the
+blocking work shares.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -219,9 +222,10 @@ src/
 ├── net/          # [tcp, udp, unix features] Async sockets, each built on `Async<T, M>`:
 │                 # connect.rs, the non-blocking connect; tcp.rs; udp.rs; unix.rs, the
 │                 # `net::unix` module (unix only)
-├── process/      # [process feature] Async child processes: mod.rs, Command and Child; stdio.rs,
-│                 # the pipes; exit/, the wait for a child's exit: kqueue.rs (Apple, the BSDs),
-│                 # pool.rs (elsewhere, behind a pidfd on Linux)
+├── process/      # [process feature] Async child processes: mod.rs, Command and Child, and the
+│                 # pool that dropped children are reaped on; stdio.rs, the pipes; exit/, the wait
+│                 # for a child's exit: kqueue.rs (Apple, the BSDs), pool.rs (elsewhere, behind a
+│                 # pidfd on Linux)
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
@@ -240,6 +244,11 @@ src/
                   # fs feature; net/: the sockets, each family under its own feature; process.rs:
                   # child processes, process feature
 ```
+
+The tests in `src/tests/` are the unit tests of the crate, one binary whose tests run side by side.
+`tests/process.rs`, at the repository root, is an integration test and a binary of its own
+[process feature]: its one test holds every thread of the pool that all blocking work shares, which
+would stall any other test that ran beside it, so no other test goes in that file.
 
 ### Key Design Patterns
 
@@ -392,7 +401,8 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   `Unblock` (`file.rs`), `ReadDir`/`DirEntry`/`DirBuilder` (`dir.rs`), `OpenOptions`
   (`options.rs`), and the platform extension traits (`unix.rs`, `windows.rs`)
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one
-- `src/process/`: [process feature] Async child processes: `Command` and `Child` (`mod.rs`), the
-  pipes to a child (`stdio.rs`), and the wait for a child's exit (`exit/`), which the reactor
-  watches through a kqueue of the child's own on Apple's platforms and the BSDs (`kqueue.rs`) and
-  a pidfd on Linux, and a thread of `unblock`'s pool runs elsewhere (`pool.rs`)
+- `src/process/`: [process feature] Async child processes: `Command` and `Child`, and the `WAITS`
+  pool that a dropped child is reaped on (`mod.rs`), the pipes to a child (`stdio.rs`), and the
+  wait for a child's exit (`exit/`), which the reactor watches through a kqueue of the child's own
+  on Apple's platforms and the BSDs (`kqueue.rs`) and a pidfd on Linux, and a thread of `unblock`'s
+  pool runs elsewhere (`pool.rs`)
