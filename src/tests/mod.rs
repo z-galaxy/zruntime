@@ -1,6 +1,7 @@
 //! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast and MPMC
 //! channels and the locks built on that event, of blocking work run on a pool of threads and the
-//! filesystem access built on it, and of the sockets a runtime watches.
+//! filesystem access built on it, of the sockets a runtime watches, and of the child processes it
+//! spawns.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
 //! the `core` module, in both flavours wherever the test means the same in each. `Async`, the
@@ -16,7 +17,9 @@
 //! `lock` modules. Blocking work, which needs neither the runtime nor the event, is tested in the
 //! `unblock` module, and the filesystem access of the `fs` module, built on it, in the `fs`
 //! module. The sockets of the `net` module are tested in the `net` module, one family of them to a
-//! module there, in both flavours wherever the test means the same in each.
+//! module there, in both flavours wherever the test means the same in each. The child processes of
+//! the `process` module, built on a runtime and on blocking work, are tested in the `process`
+//! module, in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -44,6 +47,8 @@ mod mpmc;
     any(feature = "tcp", feature = "udp", all(feature = "unix", unix))
 ))]
 mod net;
+#[cfg(all(test, feature = "process"))]
+mod process;
 #[cfg(all(test, feature = "unblock"))]
 mod unblock;
 
@@ -1226,3 +1231,102 @@ struct LocalUdpSocketsStayOnTheirThread;
 /// ```
 #[cfg(all(doctest, feature = "unix", unix))]
 struct LocalUnixSocketsStayOnTheirThread;
+
+/// A child process built on a local runtime stays on its thread, as everything built on one does,
+/// pipes included, whatever the platform runs their I/O on: a child is not `Send`...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::process::Child<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::process::Child<zruntime::Local>>();
+/// ```
+///
+/// ...and neither is a pipe to a child's input...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::process::ChildStdin<zruntime::Local>>();
+/// ```
+///
+/// ...a pipe from its output...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::process::ChildStdout<zruntime::Local>>();
+/// ```
+///
+/// ...or one from its error...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::process::ChildStderr<zruntime::Local>>();
+/// ```
+///
+/// ...while the same four built on a shared runtime may go anywhere, and so may the futures that
+/// wait for a child, which is what a task on a shared runtime needs of them: which says the checks
+/// above fail for the reason they were written for and no other.
+///
+/// ```
+/// use zruntime::{
+///     Shared, SharedRuntime,
+///     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+/// };
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// fn sent_future<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// fn futures_of(runtime: &SharedRuntime, mut command: Command, mut child: Child<Shared>) {
+///     sent_future(command.status(runtime));
+///     sent_future(command.output(runtime));
+///     sent_future(child.status());
+///     sent_future(child.output());
+/// }
+///
+/// sent_and_shared::<Child<Shared>>();
+/// sent_and_shared::<ChildStdin<Shared>>();
+/// sent_and_shared::<ChildStdout<Shared>>();
+/// sent_and_shared::<ChildStderr<Shared>>();
+/// sent_and_shared::<Command>();
+/// ```
+#[cfg(all(doctest, feature = "process"))]
+struct LocalChildrenStayOnTheirThread;

@@ -35,6 +35,8 @@ pub mod mpmc;
 pub mod net;
 #[cfg(feature = "runtime")]
 mod poll;
+#[cfg(feature = "process")]
+pub mod process;
 #[cfg(feature = "runtime")]
 mod reactor;
 #[cfg(feature = "runtime")]
