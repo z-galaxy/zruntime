@@ -7,16 +7,23 @@
 //! thread, only mean something on a shared runtime and are written for that.
 //!
 //! The first tests are of making a connection: that a connection carries bytes both ways, that one
-//! to a path with no socket behind it reports why, and that one the listener has no room for yet
-//! is waited for. Then come the tests of the mode the sockets are in: that the stream a listener
-//! accepts, the streams of a pair, and the sockets made from std's, never block the thread.
-//! Closing and shutting down follow, with a write to a peer that has gone, then the ways of
-//! sharing a stream and what a call that has to wait does: a write waits for room and a read for
-//! bytes, without spinning, and giving up an `accept` loses no connection. After the tests of
-//! `incoming` come those of the datagram sockets, a `send_to` that finds the receiver's queue full
-//! among them, of a shared runtime's sockets crossing threads, serving tasks and having several of
-//! them wait at once, and last, of the sockets' `Debug`, descriptors and auto traits.
+//! to a path with no socket behind it reports why, that one to an address, of a path or of a name
+//! in the abstract namespace, does the same and refuses an address with no name, and that one the
+//! listener has no room for yet is waited for. Then come the tests of the mode the sockets are in:
+//! that the stream a listener accepts, the streams of a pair, and the sockets made from std's,
+//! never block the thread, and those of a stream handed back to std, which is the same connection,
+//! in the same mode, and watched by nobody. Closing and shutting down follow, with a write to a
+//! peer that has gone, then the ways of sharing a stream and what a call that has to wait does: a
+//! write waits for room and a read for bytes, without spinning, and giving up an `accept` loses no
+//! connection. After the tests of `incoming` come those of the datagram sockets, a `send_to` that
+//! finds the receiver's queue full among them, of a shared runtime's sockets crossing threads,
+//! serving tasks and having several of them wait at once, and last, of the sockets' `Debug`,
+//! descriptors and auto traits.
 
+#[cfg(target_os = "android")]
+use std::os::android::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
 use std::{
     cell::Cell,
     future::poll_fn,
@@ -156,6 +163,156 @@ in_both_modes! {
         let error = runtime
             .block_on(UnixStream::connect(&runtime, &cut_short))
             .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+in_both_modes! {
+    /// A connection to the address of a listener, as the listener tells it, is a connection to the
+    /// path the listener is bound to: it carries bytes both ways, and the stream is connected to
+    /// that path.
+    fn connect_addr_connects_to_the_address_of_a_listener<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("addr");
+        let path = directory.socket("listener");
+        let listener = UnixListener::bind(&runtime, &path).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        runtime.block_on(async {
+            let mut client = UnixStream::connect_addr(&runtime, &address).await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+
+            client.write_all(b"ping").await.unwrap();
+            let mut received = [0; 4];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"ping");
+
+            server.write_all(b"pong").await.unwrap();
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"pong");
+
+            assert_eq!(client.peer_addr().unwrap().as_pathname(), Some(path.as_path()));
+            assert!(client.local_addr().unwrap().is_unnamed());
+        });
+    }
+}
+
+in_both_modes! {
+    /// A connection to the address of a path fails with the errors a connection to the path does:
+    /// with `ConnectionRefused` where the socket at the path is gone, which leaves its file
+    /// behind, and with `NotFound` where the file is gone too.
+    fn connect_addr_to_a_path_with_no_socket_behind_it_reports_why<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("addr-gone");
+        let path = directory.socket("gone");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(path.exists(), "the listener took its file with it");
+
+        let error = runtime
+            .block_on(UnixStream::connect_addr(&runtime, &address))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+
+        std::fs::remove_file(&path).unwrap();
+        let error = runtime
+            .block_on(UnixStream::connect_addr(&runtime, &address))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+in_both_modes! {
+    /// A connection to a name in the abstract namespace, which has no file behind it, carries
+    /// bytes both ways, and the stream is connected to that name.
+    ///
+    /// The listener is a std one, in blocking mode: the connection is queued by the time the
+    /// connect completes, so its `accept` returns at once.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn connect_addr_connects_to_an_abstract_name<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let name = abstract_name("echo");
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&address).unwrap();
+
+        runtime.block_on(async {
+            let mut client = UnixStream::connect_addr(&runtime, &address).await.unwrap();
+            let (accepted, _) = listener.accept().unwrap();
+            let mut server = UnixStream::from_std(&runtime, accepted).unwrap();
+
+            client.write_all(b"ping").await.unwrap();
+            let mut received = [0; 4];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"ping");
+
+            server.write_all(b"pong").await.unwrap();
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"pong");
+
+            assert_eq!(client.peer_addr().unwrap().as_abstract_name(), Some(&name[..]));
+            assert!(client.peer_addr().unwrap().as_pathname().is_none());
+        });
+    }
+}
+
+in_both_modes! {
+    /// A zero byte inside an abstract name is part of it, unlike one inside a path: the connection
+    /// reaches the socket with the whole name, not the one whose name is the bytes before the
+    /// zero.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn connect_addr_takes_a_zero_byte_inside_an_abstract_name_as_part_of_it<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut name = abstract_name("zero-byte");
+        let cut_short = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
+        let cut_short_listener = std::os::unix::net::UnixListener::bind_addr(&cut_short).unwrap();
+        cut_short_listener.set_nonblocking(true).unwrap();
+        name.extend_from_slice(b"\0and more");
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&address).unwrap();
+
+        runtime.block_on(async {
+            let client = UnixStream::connect_addr(&runtime, &address).await.unwrap();
+
+            assert_eq!(client.peer_addr().unwrap().as_abstract_name(), Some(&name[..]));
+            // The connection is queued at the listener with the whole name, and not at the other.
+            listener.accept().unwrap();
+            let error = cut_short_listener.accept().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        });
+    }
+}
+
+in_both_modes! {
+    /// A connection to a name in the abstract namespace that nobody listens at is refused, which
+    /// the connect reports as it is: there is no file for it to be missing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_connection_to_an_abstract_name_nobody_listens_at_fails_with_connection_refused<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name("gone"))
+            .unwrap();
+
+        let error = runtime
+            .block_on(UnixStream::connect_addr(&runtime, &address))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    }
+}
+
+in_both_modes! {
+    /// An unnamed address names no socket to connect to, so a connection to it is reported as
+    /// invalid input rather than tried. The address of either end of a pair is one.
+    fn connect_addr_with_an_unnamed_address_is_invalid_input<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let unnamed = stream.local_addr().unwrap();
+        assert!(unnamed.is_unnamed());
+
+        let error = runtime
+            .block_on(UnixStream::connect_addr(&runtime, &unnamed))
+            .unwrap_err();
+
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
@@ -356,6 +513,101 @@ in_both_modes! {
             assert_eq!(sent.unwrap(), 4);
             let len = len.unwrap();
             assert_eq!(&received[..len], b"late");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A stream handed back by `into_std` is the same connection, still in non-blocking mode: the
+    /// std stream names the same two ends, a read with nothing to read yet fails with `WouldBlock`
+    /// instead of waiting, what the peer sends is read from it, and what it writes is read by the
+    /// peer.
+    ///
+    /// The mode is looked at before anything else is done to the std stream, by that first read: a
+    /// blocking stream would hold the thread in it for good, and the test's timeout would fail it.
+    /// The std stream is switched to blocking mode only after that, to read the bytes the peer has
+    /// sent by then.
+    fn into_std_hands_back_the_same_connection_in_non_blocking_mode<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("into-std");
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime, &directory).await;
+
+            let mut std_client = client.into_std();
+            assert!(std_client.local_addr().unwrap().is_unnamed());
+            assert_eq!(
+                std_client.peer_addr().unwrap().as_pathname(),
+                Some(directory.socket("connected").as_path()),
+            );
+
+            let error = std_client.read(&mut [0; 1]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+            server.write_all(b"ping").await.unwrap();
+            std_client.set_nonblocking(false).unwrap();
+            let mut received = [0; 4];
+            std_client.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"ping");
+
+            std_client.write_all(b"pong").unwrap();
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"pong");
+        });
+    }
+}
+
+in_both_modes! {
+    /// What the peer sent before the stream was handed back is left in the socket for the std
+    /// stream to read: handing the socket back takes nothing off it.
+    ///
+    /// The peer's bytes have arrived by the time the stream goes, since a unix socket is written
+    /// straight into the queue of the one it is connected to, and the std stream finds them at
+    /// once, in the non-blocking mode it is handed back in.
+    fn into_std_leaves_the_bytes_that_arrived_for_the_std_stream<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+
+        runtime.block_on(async {
+            server.write_all(b"early").await.unwrap();
+
+            let mut std_client = client.into_std();
+            let mut received = [0; 5];
+            std_client.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"early");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A socket handed back by `into_std` is watched by nobody: the runtime takes it up again
+    /// with `from_std`, which it turns away with `AlreadyExists` for a socket it watches still,
+    /// and the new stream is served by the reactor like any other, a read that has to wait
+    /// included.
+    fn a_socket_handed_back_by_into_std_can_be_taken_up_again<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("into-std-again");
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime, &directory).await;
+
+            let std_client = client.into_std();
+            let mut client = UnixStream::from_std(&runtime, std_client).unwrap();
+
+            let mut received = [0; 4];
+            let (written, read) = zip(
+                after(&runtime, server.write_all(b"late")),
+                client.read_exact(&mut received),
+            )
+            .await;
+
+            written.unwrap();
+            read.unwrap();
+            assert_eq!(&received, b"late");
+
+            client.write_all(b"back").await.unwrap();
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"back");
         });
     }
 }
@@ -1285,6 +1537,24 @@ fn fill_the_queue(path: &std::path::Path) {
     }
 
     panic!("the receiver's queue never filled up");
+}
+
+/// A name in the abstract namespace for the test `test`, which no other test, in this run of the
+/// suite or in another, has.
+///
+/// Abstract names have no file to put in a directory of the test's own, and are shared by every
+/// socket of the network namespace, so the name holds the process id, the test's name and a count
+/// of the names the process has made, which tells the two flavours of a test apart.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn abstract_name(test: &str) -> Vec<u8> {
+    static MADE: AtomicUsize = AtomicUsize::new(0);
+
+    format!(
+        "zruntime-unix-{}-{test}-{}",
+        std::process::id(),
+        MADE.fetch_add(1, Ordering::Relaxed),
+    )
+    .into_bytes()
 }
 
 /// A directory of a test's own, for its socket files, which is removed, with whatever is in it,
