@@ -38,7 +38,7 @@ use crate::Event;
 /// A semaphore that lets two tasks in at a time:
 ///
 /// ```
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::Semaphore;
 ///
 /// let semaphore = Semaphore::new(2);
@@ -124,7 +124,7 @@ impl Semaphore {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Semaphore;
     ///
     /// static DOWNLOADS: Semaphore = Semaphore::new(4);
@@ -162,7 +162,7 @@ impl Semaphore {
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Semaphore;
     ///
     /// let semaphore = Arc::new(Semaphore::new(1));
@@ -224,7 +224,7 @@ impl Semaphore {
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Semaphore;
     ///
     /// let semaphore = Arc::new(Semaphore::new(1));
@@ -485,7 +485,7 @@ impl Drop for SemaphoreGuard<'_> {
 /// ```
 /// use std::sync::Arc;
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::{Semaphore, SemaphoreGuardArc};
 ///
 /// /// An open connection, one of as many as the semaphore has permits.

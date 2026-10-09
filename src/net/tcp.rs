@@ -51,7 +51,7 @@ use crate::{Async, Local, Mode, Runtime};
 /// ```
 /// use std::net::Ipv4Addr;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     net::{TcpListener, TcpStream},
@@ -180,7 +180,7 @@ where
     /// ```
     /// use std::net::Ipv4Addr;
     ///
-    /// use futures_lite::StreamExt;
+    /// use futures::StreamExt;
     /// use zruntime::{
     ///     LocalRuntime,
     ///     net::{TcpListener, TcpStream},
@@ -286,11 +286,10 @@ where
 /// a read or a write that has to wait leaves the thread to the other tasks instead of blocking it.
 ///
 /// The stream implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
-/// extension traits of [`futures-lite`] or [`futures-util`] read from and write to it. So does a
-/// shared reference to it, `&TcpStream`, which lets a reader and a writer share one stream, as
-/// std's `Read` and `Write` do for a `&std::net::TcpStream`. A write sends as much as the kernel
-/// takes at once, which may be less than the whole buffer, and nothing is held back, so flushing
-/// has nothing to do.
+/// extension traits of [`futures`] read from and write to it. So does a shared reference to it,
+/// `&TcpStream`, which lets a reader and a writer share one stream, as std's `Read` and `Write` do
+/// for a `&std::net::TcpStream`. A write sends as much as the kernel takes at once, which may be
+/// less than the whole buffer, and nothing is held back, so flushing has nothing to do.
 ///
 /// Closing the stream, as the `close` of `AsyncWriteExt` does, shuts down the write half of the
 /// socket, as [`shutdown`](TcpStream::shutdown) with [`Shutdown::Write`] does: the peer reads the
@@ -325,7 +324,7 @@ where
 /// ```
 /// use std::net::Ipv4Addr;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     net::{TcpListener, TcpStream},
@@ -358,8 +357,7 @@ where
 /// ```
 ///
 /// [`futures-io`]: https://docs.rs/futures-io
-/// [`futures-lite`]: https://docs.rs/futures-lite
-/// [`futures-util`]: https://docs.rs/futures-util
+/// [`futures`]: https://docs.rs/futures
 pub struct TcpStream<M = Local>
 where
     M: Mode,
@@ -677,7 +675,7 @@ where
 /// Each item is the [`TcpStream`] of a connection, on the listener's runtime, or the error of an
 /// accept that failed. The stream never ends: it is pending while no connection waits, and yields
 /// the next one when it comes, for as long as it is polled. It implements the [`Stream`] trait of
-/// [`futures-core`], so the extension traits of [`futures-lite`] or [`futures-util`] drive it.
+/// [`futures-core`], so the extension traits of [`futures`] drive it.
 ///
 /// An error is not the end of the stream either, and it does not leave the stream pending until
 /// the next connection comes in: polled again, the stream accepts again. Where the error left the
@@ -695,8 +693,7 @@ where
 /// them, as [the listener's documentation](TcpListener) says.
 ///
 /// [`futures-core`]: https://docs.rs/futures-core
-/// [`futures-lite`]: https://docs.rs/futures-lite
-/// [`futures-util`]: https://docs.rs/futures-util
+/// [`futures`]: https://docs.rs/futures
 pub struct Incoming<'a, M = Local>
 where
     M: Mode,

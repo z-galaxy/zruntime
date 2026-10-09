@@ -22,8 +22,8 @@ use std::{
     time::Duration,
 };
 
-use futures_lite::future::block_on;
-use futures_util::{
+use futures::{
+    executor::block_on,
     future::join,
     stream::{FusedStream, StreamExt},
 };

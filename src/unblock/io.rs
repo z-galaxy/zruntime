@@ -90,16 +90,16 @@ use super::{BlockingWork, dispose, unblock};
 /// waits for that operation, as it is for [`unblock()`]. The handle goes with the panic, and any
 /// use of the adapter after it panics as well.
 ///
-/// # Example
+/// # Examples
 ///
 /// A [`Cursor`](std::io::Cursor) stands in for a blocking handle to read, and a `Vec` for one to
-/// write. The futures are driven by `block_on` from the `futures-lite` crate, but the `block_on` of
-/// any executor would do, as the adapter needs no runtime:
+/// write. The futures are driven by `block_on` from the `futures` crate, but the `block_on` of any
+/// executor would do, as the adapter needs no runtime:
 ///
 /// ```
 /// use std::io::Cursor;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt, future::block_on};
+/// use futures::{AsyncReadExt, AsyncWriteExt, executor::block_on};
 /// use zruntime::Unblock;
 ///
 /// block_on(async {
@@ -112,6 +112,28 @@ use super::{BlockingWork, dispose, unblock};
 ///     writer.write_all(b"goodbye").await?;
 ///     writer.flush().await?;
 ///     assert_eq!(writer.into_inner().await, b"goodbye");
+///
+///     std::io::Result::Ok(())
+/// })
+/// .unwrap();
+/// ```
+///
+/// The standard input, read line by line as the lines come in, through a `BufReader` of the
+/// `futures` crate and the `lines` of its `AsyncBufReadExt`. A `Cursor` stands in for
+/// `std::io::stdin()` here:
+///
+/// ```
+/// use std::io::Cursor;
+///
+/// use futures::{AsyncBufReadExt, StreamExt, executor::block_on, io::BufReader};
+/// use zruntime::Unblock;
+///
+/// block_on(async {
+///     let stdin = Cursor::new("first line\nsecond line\n");
+///     let mut lines = BufReader::new(Unblock::new(stdin)).lines();
+///     while let Some(line) = lines.next().await {
+///         println!("{}", line?);
+///     }
 ///
 ///     std::io::Result::Ok(())
 /// })
@@ -166,7 +188,7 @@ impl<T> Unblock<T> {
     /// ```
     /// use std::io::Cursor;
     ///
-    /// use futures_lite::{AsyncReadExt, future::block_on};
+    /// use futures::{AsyncReadExt, executor::block_on};
     /// use zruntime::Unblock;
     ///
     /// block_on(async {
@@ -214,7 +236,7 @@ impl<T> Unblock<T> {
     /// ```
     /// use std::io::Cursor;
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::Unblock;
     ///
     /// let mut reader = Unblock::new(Cursor::new(vec![1, 2, 3]));
@@ -255,7 +277,7 @@ impl<T> Unblock<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::{AsyncWriteExt, future::block_on};
+    /// use futures::{AsyncWriteExt, executor::block_on};
     /// use zruntime::Unblock;
     ///
     /// block_on(async {

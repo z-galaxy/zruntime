@@ -69,11 +69,11 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// # The I/O traits
 ///
 /// `Async<T, M>` implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
-/// extension traits of [`futures-lite`] or [`futures-util`] read from and write to it. So does a
-/// shared reference to it, `&Async<T, M>`, which lets a reader and a writer share one handle. Both
-/// are there wherever `&T` implements `Read`, for the first trait, and `Write`, for the second,
-/// as it does for `std::io::PipeReader` and `PipeWriter`, and for std's stream sockets,
-/// `TcpStream` and `UnixStream`: a listener or a datagram socket implements neither.
+/// extension traits of [`futures`] read from and write to it. So does a shared reference to it,
+/// `&Async<T, M>`, which lets a reader and a writer share one handle. Both are there wherever `&T`
+/// implements `Read`, for the first trait, and `Write`, for the second, as it does for
+/// `std::io::PipeReader` and `PipeWriter`, and for std's stream sockets, `TcpStream` and
+/// `UnixStream`: a listener or a datagram socket implements neither.
 ///
 /// The source sits behind a pointer that the runtime's reactor shares, so no `&mut T` is ever
 /// handed out. A type that implements `Read` or `Write` only for `&mut self`, such as
@@ -96,7 +96,7 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// # fn main() -> std::io::Result<()> {
 /// use std::{io::Write, thread};
 ///
-/// use futures_lite::AsyncReadExt;
+/// use futures::AsyncReadExt;
 /// use zruntime::{Async, LocalRuntime};
 ///
 /// let runtime = LocalRuntime::new()?;
@@ -119,8 +119,7 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// ```
 ///
 /// [`futures-io`]: https://docs.rs/futures-io
-/// [`futures-lite`]: https://docs.rs/futures-lite
-/// [`futures-util`]: https://docs.rs/futures-util
+/// [`futures`]: https://docs.rs/futures
 pub struct Async<T, M = Local>
 where
     M: Mode,

@@ -20,7 +20,7 @@ use crate::unblock;
 /// A file opened to append to has every write go to its end, whatever its position is:
 ///
 /// ```
-/// use futures_lite::{AsyncWriteExt, future::block_on};
+/// use futures::{AsyncWriteExt, executor::block_on};
 /// use zruntime::fs::{self, OpenOptions};
 ///
 /// # let pid = std::process::id();

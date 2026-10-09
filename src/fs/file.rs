@@ -72,13 +72,13 @@ use crate::{Unblock, lock::Mutex, unblock};
 /// # Example
 ///
 /// A file written and then read through the same handle, from a position it seeks to. The futures
-/// are driven by `block_on` from the `futures-lite` crate, but the `block_on` of any executor
-/// would do, as the file needs no runtime:
+/// are driven by `block_on` from the `futures` crate, but the `block_on` of any executor would do,
+/// as the file needs no runtime:
 ///
 /// ```
 /// use std::io::SeekFrom;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, future::block_on};
+/// use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, executor::block_on};
 /// use zruntime::fs::OpenOptions;
 ///
 /// # let pid = std::process::id();
@@ -110,7 +110,7 @@ use crate::{Unblock, lock::Mutex, unblock};
 /// A write that follows a read lands where the reads got to, not where the read ahead of them did:
 ///
 /// ```
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt, future::block_on};
+/// use futures::{AsyncReadExt, AsyncWriteExt, executor::block_on};
 /// use zruntime::fs::{self, OpenOptions};
 ///
 /// # let pid = std::process::id();
@@ -186,7 +186,7 @@ impl File {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::{AsyncWriteExt, future::block_on};
+    /// use futures::{AsyncWriteExt, executor::block_on};
     /// use zruntime::fs::File;
     ///
     /// # let pid = std::process::id();

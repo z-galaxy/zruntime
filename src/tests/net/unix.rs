@@ -40,9 +40,10 @@ use std::{
     thread,
 };
 
-use futures_lite::{
+use futures::{
     AsyncReadExt, AsyncWriteExt, StreamExt,
-    future::{block_on, poll_once, zip},
+    executor::block_on,
+    future::{join, poll_immediate},
     io::{AsyncWrite, copy},
 };
 use ntest::timeout;
@@ -350,7 +351,7 @@ in_both_modes! {
 
             let mut pending = pin!(UnixStream::connect(&runtime, &path));
             assert!(
-                poll_once(pending.as_mut()).await.is_none(),
+                poll_immediate(pending.as_mut()).await.is_none(),
                 "the connection was reported before the listener had room for it",
             );
 
@@ -384,7 +385,7 @@ in_both_modes! {
             let (mut server, _) = listener.accept().await.unwrap();
 
             let mut received = [0; 4];
-            let (written, read) = zip(
+            let (written, read) = join(
                 after(&runtime, client.write_all(b"late")),
                 server.read_exact(&mut received),
             )
@@ -416,7 +417,7 @@ in_both_modes! {
             left.read_exact(&mut received).await.unwrap();
             assert_eq!(&received, b"pong");
 
-            let (written, read) = zip(
+            let (written, read) = join(
                 after(&runtime, left.write_all(b"late")),
                 right.read_exact(&mut received),
             )
@@ -425,7 +426,7 @@ in_both_modes! {
             read.unwrap();
             assert_eq!(&received, b"late");
 
-            let (written, read) = zip(
+            let (written, read) = join(
                 after(&runtime, right.write_all(b"back")),
                 left.read_exact(&mut received),
             )
@@ -450,7 +451,7 @@ in_both_modes! {
         let listener = UnixListener::from_std(&runtime, std_listener).unwrap();
 
         runtime.block_on(async {
-            let (accepted, client) = zip(
+            let (accepted, client) = join(
                 listener.accept(),
                 after(&runtime, UnixStream::connect(&runtime, &path)),
             )
@@ -479,7 +480,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 4];
-            let (written, read) = zip(
+            let (written, read) = join(
                 after(&runtime, async { peer.write_all(b"late") }),
                 stream.read_exact(&mut received),
             )
@@ -504,7 +505,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 4];
-            let (sent, len) = zip(
+            let (sent, len) = join(
                 after(&runtime, async { peer.send(b"late") }),
                 socket.recv(&mut received),
             )
@@ -595,7 +596,7 @@ in_both_modes! {
             let mut client = UnixStream::from_std(&runtime, std_client).unwrap();
 
             let mut received = [0; 4];
-            let (written, read) = zip(
+            let (written, read) = join(
                 after(&runtime, server.write_all(b"late")),
                 client.read_exact(&mut received),
             )
@@ -744,11 +745,11 @@ in_both_modes! {
                 echoed
             };
             let echo = async {
-                copy(&server, &server).await.unwrap();
+                copy(&server, &mut &server).await.unwrap();
                 (&server).close().await.unwrap();
             };
 
-            let (((), echoed), ()) = zip(zip(writer, reader), echo).await;
+            let (((), echoed), ()) = join(join(writer, reader), echo).await;
 
             assert_eq!(echoed.len(), data.len());
             // Not `assert_eq!`, which would print a megabyte on a failure.
@@ -805,7 +806,7 @@ in_both_modes! {
     ///
     /// A call that waits is polled when it begins to, and again each time its task is woken
     /// while it waits: by the timer that ends the delay, since the task polls both of the calls
-    /// that are zipped, and by what arrives. A thread that spun would poll it hundreds of times.
+    /// that are joined, and by what arrives. A thread that spun would poll it hundreds of times.
     fn a_read_an_accept_or_a_receive_that_waits_does_not_spin<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let directory = Directory::new("spin");
@@ -818,7 +819,7 @@ in_both_modes! {
             let mut buffer = [0; 1];
 
             let read_polls = Cell::new(0);
-            let (read, written) = zip(
+            let (read, written) = join(
                 counting_polls(&read_polls, server.read_exact(&mut buffer)),
                 after(&runtime, client.write_all(b"1")),
             )
@@ -828,7 +829,7 @@ in_both_modes! {
             assert!(read_polls.get() <= 10, "the read was polled {} times", read_polls.get());
 
             let accept_polls = Cell::new(0);
-            let (accepted, connection) = zip(
+            let (accepted, connection) = join(
                 counting_polls(&accept_polls, listener.accept()),
                 after(&runtime, UnixStream::connect(&runtime, &path)),
             )
@@ -842,7 +843,7 @@ in_both_modes! {
             );
 
             let receive_polls = Cell::new(0);
-            let (received, sent) = zip(
+            let (received, sent) = join(
                 counting_polls(&receive_polls, receiver.recv(&mut buffer)),
                 after(&runtime, sender.send(b"2")),
             )
@@ -856,7 +857,7 @@ in_both_modes! {
             );
 
             let receive_from_polls = Cell::new(0);
-            let (received, sent) = zip(
+            let (received, sent) = join(
                 counting_polls(&receive_from_polls, receiver.recv_from(&mut buffer)),
                 after(&runtime, sender.send(b"3")),
             )
@@ -892,7 +893,7 @@ in_both_modes! {
             // The `accept` is dropped at the end of this block, without being polled again.
             let mut client = {
                 let mut accept = pin!(listener.accept());
-                assert!(poll_once(accept.as_mut()).await.is_none());
+                assert!(poll_immediate(accept.as_mut()).await.is_none());
 
                 let client = UnixStream::connect(&runtime, &path).await.unwrap();
                 runtime.sleep(DELAY).await;
@@ -925,10 +926,10 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut incoming = listener.incoming();
-            assert!(poll_once(incoming.next()).await.is_none());
+            assert!(poll_immediate(incoming.next()).await.is_none());
 
             // The first connection is made after a delay, with the stream already waiting for it.
-            let (first_accepted, first) = zip(
+            let (first_accepted, first) = join(
                 incoming.next(),
                 after(&runtime, UnixStream::connect(&runtime, &path)),
             )
@@ -1113,7 +1114,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 16];
-            let (sent, len) = zip(
+            let (sent, len) = join(
                 after(&runtime, left.send(b"late")),
                 right.recv(&mut received),
             )
@@ -1122,7 +1123,7 @@ in_both_modes! {
             let len = len.unwrap();
             assert_eq!(&received[..len], b"late");
 
-            let (sent, from) = zip(
+            let (sent, from) = join(
                 after(&runtime, left.send(b"later")),
                 right.recv_from(&mut received),
             )
@@ -1174,7 +1175,7 @@ in_both_modes! {
                 made_room.set(true);
             };
 
-            let (sent, ()) = zip(counting_polls(&polls, send), receive).await;
+            let (sent, ()) = join(counting_polls(&polls, send), receive).await;
 
             assert_eq!(sent.unwrap(), 4);
             assert!(polls.get() <= 20, "the `send_to` was polled {} times", polls.get());
@@ -1254,7 +1255,7 @@ fn shared_tasks_use_sockets() {
     runtime.block_on(async {
         let server = runtime.spawn("an echo server", async move {
             let (stream, _) = listener.accept().await.unwrap();
-            copy(&stream, &stream).await.unwrap();
+            copy(&stream, &mut &stream).await.unwrap();
             (&stream).close().await.unwrap();
         });
         let client = runtime.spawn("a client", {
@@ -1463,7 +1464,7 @@ in_both_modes! {
 }
 
 /// A shared runtime's sockets are `Send` and `Sync`, and `Unpin`, which the extension traits of
-/// futures-lite ask of what they read from, write to or iterate over.
+/// futures ask of what they read from, write to or iterate over.
 ///
 /// Only the bounds are checked here, at compile time. That a stream does cross threads, and that
 /// the tasks of a shared runtime use sockets, is shown by `a_shared_stream_crosses_threads` and

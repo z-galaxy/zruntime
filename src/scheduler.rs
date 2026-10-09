@@ -962,13 +962,13 @@ mod tests {
         time::Duration,
     };
 
-    use futures_lite::future::{block_on, yield_now};
+    use futures::executor::block_on;
     use ntest::timeout;
 
     use super::*;
     #[cfg(feature = "event")]
     use crate::Event;
-    use crate::{LocalRuntime, Task};
+    use crate::{LocalRuntime, Task, tests::yield_now};
 
     #[test]
     #[timeout(15000)]

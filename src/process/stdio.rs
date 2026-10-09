@@ -33,7 +33,7 @@ use crate::{Local, Mode, Runtime};
 /// [`stdin`](super::Child::stdin) of the [`Child`](super::Child). It is the async counterpart of
 /// [`std::process::ChildStdin`]: a write that has to wait leaves the thread to the other tasks
 /// instead of blocking it. It implements the `AsyncWrite` trait of [`futures-io`], so the extension
-/// traits of [`futures-lite`] or [`futures-util`] write to it.
+/// traits of [`futures`] write to it.
 ///
 /// Closing it, as the `close` of `AsyncWriteExt` does, flushes it and then closes the pipe, and so
 /// does dropping it, but for the flush: either way, the child reads the end of its input once it
@@ -65,7 +65,7 @@ use crate::{Local, Mode, Runtime};
 /// ```
 /// # #[cfg(unix)]
 /// # fn main() -> std::io::Result<()> {
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     process::{Command, Stdio},
@@ -98,8 +98,7 @@ use crate::{Local, Mode, Runtime};
 /// ```
 ///
 /// [`futures-io`]: https://docs.rs/futures-io
-/// [`futures-lite`]: https://docs.rs/futures-lite
-/// [`futures-util`]: https://docs.rs/futures-util
+/// [`futures`]: https://docs.rs/futures
 pub struct ChildStdin<M = Local>
 where
     M: Mode,
@@ -220,10 +219,10 @@ where
 /// [`stdout`](super::Child::stdout) of the [`Child`](super::Child). It is the async counterpart of
 /// [`std::process::ChildStdout`]: a read that has to wait leaves the thread to the other tasks
 /// instead of blocking it. It implements the `AsyncRead` trait of [`futures-io`], so the extension
-/// traits of [`futures-lite`] or [`futures-util`] read from it. A read finds the end of the pipe,
-/// and returns zero bytes, once every byte the child wrote has been read and no process holds the
-/// other end of the pipe open any more: the child exits or closes its standard output, whichever
-/// comes first, and any process it started that inherited the pipe does the same.
+/// traits of [`futures`] read from it. A read finds the end of the pipe, and returns zero bytes,
+/// once every byte the child wrote has been read and no process holds the other end of the pipe
+/// open any more: the child exits or closes its standard output, whichever comes first, and any
+/// process it started that inherited the pipe does the same.
 ///
 /// Dropping it closes the pipe, and a child that writes to it after that fails to, or is
 /// terminated by the signal that says so.
@@ -250,7 +249,7 @@ where
 /// ```
 /// # #[cfg(unix)]
 /// # fn main() -> std::io::Result<()> {
-/// use futures_lite::{AsyncBufReadExt, StreamExt, io::BufReader};
+/// use futures::{AsyncBufReadExt, StreamExt, io::BufReader};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     process::{Command, Stdio},
@@ -280,8 +279,7 @@ where
 /// ```
 ///
 /// [`futures-io`]: https://docs.rs/futures-io
-/// [`futures-lite`]: https://docs.rs/futures-lite
-/// [`futures-util`]: https://docs.rs/futures-util
+/// [`futures`]: https://docs.rs/futures
 pub struct ChildStdout<M = Local>
 where
     M: Mode,
@@ -322,7 +320,7 @@ where
     /// ```
     /// # #[cfg(unix)]
     /// # fn main() -> std::io::Result<()> {
-    /// use futures_lite::AsyncReadExt;
+    /// use futures::AsyncReadExt;
     /// use zruntime::{
     ///     LocalRuntime,
     ///     process::{Command, Stdio},

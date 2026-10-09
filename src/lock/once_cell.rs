@@ -66,7 +66,9 @@ use crate::Event;
 /// every later task is handed without any more work:
 ///
 /// ```
-/// use futures_lite::future::{block_on, yield_now};
+/// use std::future;
+///
+/// use futures::executor::block_on;
 /// use zruntime::lock::OnceCell;
 ///
 /// let cell = OnceCell::new();
@@ -74,9 +76,8 @@ use crate::Event;
 /// block_on(async {
 ///     let first = cell
 ///         .get_or_init(|| async {
-///             // Where a value that takes a while to make is made.
-///             yield_now().await;
-///             String::from("made")
+///             // Where the value is made, by awaiting whatever its making takes.
+///             future::ready(String::from("made")).await
 ///         })
 ///         .await;
 ///     // The cell holds a value already, so this initialiser has no say.
@@ -109,7 +110,7 @@ impl<T> OnceCell<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::OnceCell;
     ///
     /// static NAME: OnceCell<&str> = OnceCell::new();
@@ -133,7 +134,7 @@ impl<T> OnceCell<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::OnceCell;
     ///
     /// let cell = OnceCell::new();
@@ -215,7 +216,7 @@ impl<T> OnceCell<T> {
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::OnceCell;
     ///
     /// let cell = Arc::new(OnceCell::new());
@@ -260,7 +261,7 @@ impl<T> OnceCell<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::OnceCell;
     ///
     /// let cell = OnceCell::new();
@@ -291,7 +292,7 @@ impl<T> OnceCell<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::OnceCell;
     ///
     /// let cell = OnceCell::<u8>::new();
@@ -342,7 +343,7 @@ impl<T> OnceCell<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::OnceCell;
     ///
     /// let cell = OnceCell::new();

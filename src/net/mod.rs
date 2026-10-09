@@ -28,9 +28,9 @@
 //! such work), and tries the addresses it finds in turn.
 //!
 //! The streams, `TcpStream` and `UnixStream`, implement the `AsyncRead` and `AsyncWrite` traits
-//! of [`futures-io`], so the extension traits of [`futures-lite`] or [`futures-util`] read from
-//! and write to them. So does a shared reference to one, which lets a reader and a writer share a
-//! stream. Closing a stream shuts its write half down, and the peer reads the end of the stream.
+//! of [`futures-io`], so the extension traits of [`futures`] read from and write to them. So does a
+//! shared reference to one, which lets a reader and a writer share a stream. Closing a stream shuts
+//! its write half down, and the peer reads the end of the stream.
 //!
 //! Any number of tasks may wait in the async methods of one socket at once, through shared
 //! references to it: to accept, peek, receive or send, in either direction. Each is woken when the
@@ -47,8 +47,7 @@
 //! listener included.
 //!
 //! [`futures-io`]: https://docs.rs/futures-io
-//! [`futures-lite`]: https://docs.rs/futures-lite
-//! [`futures-util`]: https://docs.rs/futures-util
+//! [`futures`]: https://docs.rs/futures
 //! [`LocalRuntime`]: crate::LocalRuntime
 //! [`Runtime`]: crate::Runtime
 //! [`Runtime::block_on`]: crate::Runtime::block_on

@@ -73,7 +73,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(zruntime_poll)", "cfg(zrun
 futures-core = { version = "0.3.34", default-features = false, optional = true }
 futures-io = { version = "0.3.34", optional = true }
 socket2 = { version = "0.6.5", optional = true }
-tracing = { version = "0.1.44", optional = true }
+# Without its default features: the crate logs through `error!` alone, and the `attributes`
+# feature, for `#[instrument]`, would build a proc-macro and `syn` along with it. `std` stays, so
+# that the events still reach a subscriber that a thread sets as its default.
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 
 [target."cfg(unix)".dependencies.rustix]
 version = "1.1.5"
@@ -95,8 +98,7 @@ rustix = { version = "1.1.5", features = ["thread"] }
 
 [dev-dependencies]
 criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }
-futures-lite = "2.6.1"
-futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+futures = { version = "0.3.34", default-features = false, features = ["std", "executor"] }
 ntest = "0.9.5"
 socket2 = { version = "0.6.5", features = ["all"] }
 

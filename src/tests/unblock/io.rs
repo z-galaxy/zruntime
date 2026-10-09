@@ -1,7 +1,7 @@
 //! Tests of `zruntime::Unblock`, the async adapter for a blocking I/O handle.
 //!
 //! The handles are in memory, cursors, vectors, iterators and small types of the tests' own, so
-//! that the tests run under Miri. Most drive the adapter with the `block_on` of `futures-lite`; the
+//! that the tests run under Miri. Most drive the adapter with the `block_on` of `futures`; the
 //! few that need an operation to be pending poll it by hand, with a handle that waits for the test
 //! to let it go on. They come in the order of what they pin down: that reads hand over every byte,
 //! whatever the buffers, the short reads, the interruptions and the errors; that a read polled
@@ -28,9 +28,9 @@ use std::{
     task::{Context, Wake, Waker},
 };
 
-use futures_lite::{
+use futures::{
     AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt,
-    future::block_on,
+    executor::block_on,
     io::{AsyncRead, AsyncWrite},
 };
 use ntest::timeout;

@@ -2,7 +2,7 @@
 //!
 //! Each test works in a directory of its own under the temporary directory of the OS, which goes
 //! with everything in it when the test ends, and drives the futures with the `block_on` of
-//! `futures-lite`. They come in the order of what they pin down: that each function does what the
+//! `futures`. They come in the order of what they pin down: that each function does what the
 //! function of std it runs does, and takes paths and bytes of any type that converts; that the
 //! stream of a directory lists every entry, and that an entry knows what it is; that the builders
 //! of directories and of files set what they are told to, that their futures do not borrow them and
@@ -22,9 +22,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_lite::{
-    AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt,
-    future::{block_on, poll_once},
+use futures::{
+    AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt, executor::block_on,
+    future::poll_immediate,
 };
 use ntest::timeout;
 
@@ -1094,7 +1094,7 @@ fn a_write_after_a_read_given_up_on_lands_where_the_reads_got_to() {
         let mut file = read_write(dir.join("file")).await;
         let mut buf = [0; 3];
         // Polled once: the read is pending, or the pool was quick and it is over.
-        let read = match poll_once(file.read(&mut buf)).await {
+        let read = match poll_immediate(file.read(&mut buf)).await {
             Some(read) => read.unwrap(),
             None => 0,
         };

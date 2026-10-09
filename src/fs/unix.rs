@@ -23,7 +23,7 @@ pub use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 /// # Example
 ///
 /// ```
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::fs::{self, unix};
 ///
 /// # let pid = std::process::id();
@@ -88,7 +88,7 @@ pub trait OpenOptionsExt: Sealed {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::fs::{self, OpenOptions, unix::{OpenOptionsExt, PermissionsExt}};
     ///
     /// # let pid = std::process::id();

@@ -70,14 +70,13 @@ use pool::Pool;
 ///
 /// # Example
 ///
-/// A sleep stands in for work that blocks. The future is driven by `block_on` from the
-/// `futures-lite` crate, but the `block_on` of any executor would do, as `unblock` needs no
-/// runtime:
+/// A sleep stands in for work that blocks. The future is driven by `block_on` from the `futures`
+/// crate, but the `block_on` of any executor would do, as `unblock` needs no runtime:
 ///
 /// ```
 /// use std::{thread, time::Duration};
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::unblock;
 ///
 /// let answer = unblock(|| {

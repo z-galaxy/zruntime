@@ -1,7 +1,7 @@
 //! What handing a piece of blocking work to `unblock` costs, and awaiting its outcome: the work
 //! itself is a value handed back at once, so that all there is to time is the way there and back.
-//! `unblock` needs no runtime, so every id awaits its futures with futures-lite's `block_on`, which
-//! parks the thread that awaits until the work wakes it.
+//! `unblock` needs no runtime, so every id awaits its futures with the `block_on` of `futures`,
+//! which parks the thread that awaits until the work wakes it.
 //!
 //! `round-trip` times one `unblock` and the `block_on` that awaits it: the cost of a lone file
 //! read or host-name lookup moved off the thread of a task, beyond that of the work. It is mostly
@@ -18,7 +18,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use zruntime::unblock;
 
 /// Times a round trip of one piece of work, and then of a burst of them, in one group.

@@ -24,7 +24,7 @@ use std::{
     future::Future,
     hint::black_box,
     io,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -39,8 +39,7 @@ use criterion::{
     BenchmarkGroup, Criterion, Throughput, async_executor::AsyncExecutor, criterion_group,
     criterion_main, measurement::Measurement,
 };
-use futures_lite::future;
-use futures_util::future::try_join_all;
+use futures::future::{self, try_join_all};
 use zruntime::{Event, Shared, SharedRuntime, Task, lock};
 
 #[path = "common/cpus.rs"]
@@ -103,7 +102,7 @@ async fn echo(connection: &Connection, payload: &[u8]) -> io::Result<Vec<u8>> {
 const CONCURRENT_METHOD_CALLS: usize = 1000;
 
 /// Awaits every one of `CONCURRENT_METHOD_CALLS` `Ping` calls together, through
-/// `futures_util::future::try_join_all`.
+/// `futures::future::try_join_all`.
 async fn call_ping_concurrently(client: &Connection) {
     let replies =
         try_join_all((0..CONCURRENT_METHOD_CALLS as u32).map(|value| ping(client, value)))
@@ -501,12 +500,18 @@ impl Connection {
         // Races the reply against `METHOD_TIMEOUT`, the way `Connection::call_method` races it
         // against `method_timeout` in `zbus/src/connection/mod.rs`: a timer is armed on the
         // reactor for every call and dropped, cancelled, the moment the reply wins.
-        match future::or(async { Outcome::Replied(pending.await) }, async {
-            self.runtime.sleep(METHOD_TIMEOUT).await;
-            Outcome::TimedOut
-        })
+        let outcome = future::select(
+            pin!(async { Outcome::Replied(pending.await) }),
+            pin!(async {
+                self.runtime.sleep(METHOD_TIMEOUT).await;
+                Outcome::TimedOut
+            }),
+        )
         .await
-        {
+        .factor_first()
+        .0;
+
+        match outcome {
             Outcome::Replied(Some(frame)) => Ok(frame),
             Outcome::Replied(None) => Err(io::Error::other(
                 "the connection closed before a reply arrived",
@@ -704,7 +709,7 @@ mod unix {
     };
 
     use criterion::{Criterion, Throughput};
-    use futures_lite::future;
+    use futures::future;
     use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
     use super::{
@@ -793,7 +798,7 @@ mod unix {
                     for _ in 0..iters {
                         let (server, client) = pair(&runtime).await;
                         let started = Instant::now();
-                        future::zip(server.graceful_shutdown(), client.graceful_shutdown()).await;
+                        future::join(server.graceful_shutdown(), client.graceful_shutdown()).await;
                         total += started.elapsed();
                     }
 
@@ -890,7 +895,7 @@ mod unix {
         let server_end = Arc::new(UnixEnd::register(runtime, server_stream));
         let client_end = Arc::new(UnixEnd::register(runtime, client_stream));
 
-        future::zip(server_handshake(&server_end), client_handshake(&client_end)).await;
+        future::join(server_handshake(&server_end), client_handshake(&client_end)).await;
 
         let server = build_connection(
             Box::new(server_end.clone()),

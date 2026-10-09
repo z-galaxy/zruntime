@@ -26,7 +26,7 @@ use std::{io, path::Path, time::Duration};
 #[cfg(unix)]
 use std::{thread, time::Instant};
 
-use futures_lite::{AsyncRead, AsyncReadExt, AsyncWriteExt, future::zip};
+use futures::{AsyncRead, AsyncReadExt, AsyncWriteExt, future::join};
 use ntest::timeout;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::process::{WaitOptions, waitpid};
@@ -305,7 +305,7 @@ in_both_modes! {
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        let (read, ()) = runtime.block_on(zip(read_all(stdout), async {
+        let (read, ()) = runtime.block_on(join(read_all(stdout), async {
             runtime.sleep(Duration::from_millis(50)).await;
             stdin.write_all(b"late\n").await.unwrap();
             drop(stdin);
@@ -363,7 +363,7 @@ in_both_modes! {
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        let (output, ()) = runtime.block_on(zip(read_all(stdout), async {
+        let (output, ()) = runtime.block_on(join(read_all(stdout), async {
             stdin.write_all(&input).await.unwrap();
             drop(stdin);
         }));

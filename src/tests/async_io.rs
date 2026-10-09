@@ -42,13 +42,11 @@ use std::{
     process::{Command, Stdio},
 };
 
-use futures_lite::{
-    AsyncReadExt, AsyncWriteExt,
-    future::{or, yield_now, zip},
-};
+use futures::{AsyncReadExt, AsyncWriteExt, future::join};
 use ntest::timeout;
 use socket2::SockRef;
 
+use super::{or, yield_now};
 use crate::{Async, Local, LocalRuntime, Mode, Readiness, Runtime, Shared, SharedRuntime};
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local` and
@@ -164,7 +162,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             // Written once the read below has had to wait for it.
-            let (received, ()) = zip(read_exactly(&near, 5), async {
+            let (received, ()) = join(read_exactly(&near, 5), async {
                 runtime.sleep(DELAY).await;
                 far.write_all(b"hello").unwrap();
             })
@@ -186,7 +184,7 @@ in_both_modes! {
         let far = Async::new(&runtime, far).unwrap();
 
         runtime.block_on(async {
-            let (received, ()) = zip(read_exactly(&far, 4), async {
+            let (received, ()) = join(read_exactly(&far, 4), async {
                 runtime.sleep(DELAY).await;
                 write_everything(&near, b"ping").await;
             })
@@ -219,7 +217,7 @@ in_both_modes! {
         let bytes = pattern(LEN);
         let blocked = Cell::new(0);
 
-        let (received, ()) = runtime.block_on(zip(read_exactly(&reader, LEN), async {
+        let (received, ()) = runtime.block_on(join(read_exactly(&reader, LEN), async {
             let mut sent = 0;
             while sent < LEN {
                 sent += writer
@@ -437,7 +435,7 @@ in_both_modes! {
     fn writable_waits_while_the_socket_has_no_room<M>() {
         use std::pin::pin;
 
-        use futures_lite::future::poll_once;
+        use futures::future::poll_immediate;
 
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
@@ -449,7 +447,7 @@ in_both_modes! {
         runtime.block_on(async {
             let mut writable = pin!(near.writable());
             for _ in 0..5 {
-                assert!(poll_once(writable.as_mut()).await.is_none());
+                assert!(poll_immediate(writable.as_mut()).await.is_none());
                 yield_now().await;
             }
 
@@ -584,7 +582,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 5];
-            let (read, written) = zip(far.read_exact(&mut received), async {
+            let (read, written) = join(far.read_exact(&mut received), async {
                 runtime.sleep(DELAY).await;
                 near.write_all(b"hello").await
             })
@@ -631,12 +629,12 @@ in_both_modes! {
         let (mut far_reader, mut far_writer) = (&far, &far);
         let (mut at_near, mut at_far) = ([0; 4], [0; 4]);
 
-        let ((near_read, near_written), (far_read, far_written)) = runtime.block_on(zip(
-            zip(near_reader.read_exact(&mut at_near), async {
+        let ((near_read, near_written), (far_read, far_written)) = runtime.block_on(join(
+            join(near_reader.read_exact(&mut at_near), async {
                 runtime.sleep(DELAY).await;
                 near_writer.write_all(b"ping").await
             }),
-            zip(far_reader.read_exact(&mut at_far), async {
+            join(far_reader.read_exact(&mut at_far), async {
                 runtime.sleep(DELAY).await;
                 far_writer.write_all(b"pong").await
             }),
@@ -727,7 +725,7 @@ in_both_modes! {
         // A read that has to wait, so that a wait of the runtime watches the source before the
         // source is asked for.
         runtime.block_on(async {
-            let (read, ()) = zip(read_exactly(&near, 1), async {
+            let (read, ()) = join(read_exactly(&near, 1), async {
                 runtime.sleep(DELAY).await;
                 (&far).write_all(b"!").unwrap();
             })
@@ -977,7 +975,7 @@ in_both_modes! {
         let mut writer = Async::new(&runtime, writer).unwrap();
         let mut received = Vec::new();
 
-        let (read, written) = runtime.block_on(zip(reader.read_to_end(&mut received), async {
+        let (read, written) = runtime.block_on(join(reader.read_to_end(&mut received), async {
             runtime.sleep(DELAY).await;
             let written = writer.write_all(b"hello").await;
             // The pipe closes with its writing end, which is what ends the read.
@@ -1001,7 +999,7 @@ in_both_modes! {
     fn a_pipe_whose_reader_closed_is_waited_on_twice<M>() {
         use std::pin::pin;
 
-        use futures_lite::future::poll_once;
+        use futures::future::poll_immediate;
 
         let runtime = Runtime::<M>::new().unwrap();
         let (reader, writer) = std::io::pipe().unwrap();
@@ -1010,7 +1008,7 @@ in_both_modes! {
         runtime.block_on(async {
             let mut writable = pin!(writer.writable());
             // The first poll has the runtime watch the pipe for room while the reader is open.
-            assert!(poll_once(writable.as_mut()).await.is_none());
+            assert!(poll_immediate(writable.as_mut()).await.is_none());
             drop(reader);
             writable.await.unwrap();
 
@@ -1033,7 +1031,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 4];
-            let (read, written) = zip(far.read_exact(&mut received), async {
+            let (read, written) = join(far.read_exact(&mut received), async {
                 runtime.sleep(DELAY).await;
                 near.write_all(b"ping").await
             })
@@ -1088,7 +1086,7 @@ in_both_modes! {
         let mut stdout = Async::new(&runtime, PipeReader::from(OwnedFd::from(stdout))).unwrap();
         let mut output = Vec::new();
 
-        let (read, written) = runtime.block_on(zip(stdout.read_to_end(&mut output), async {
+        let (read, written) = runtime.block_on(join(stdout.read_to_end(&mut output), async {
             let written = stdin.write_all(b"hello").await;
             // The child ends with its input, which is what ends the read.
             drop(stdin);
@@ -1151,7 +1149,7 @@ in_both_modes! {
 }
 
 /// A shared runtime's handles are `Send` and `Sync`, and `Unpin`, which the extension traits of
-/// futures-lite ask of what they read from and write to.
+/// futures ask of what they read from and write to.
 ///
 /// Only the bounds are checked here, at compile time. That a local runtime's handles are neither
 /// `Send` nor `Sync` is shown by the compile-fail doc tests, since only code that does not

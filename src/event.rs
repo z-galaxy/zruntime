@@ -170,8 +170,7 @@ use std::{
 /// # Example
 ///
 /// A flag that one thread raises and a task waits for. The task is driven by `block_on` from the
-/// `futures-lite` crate, but the `block_on` of any executor would do, as an event needs no
-/// runtime:
+/// `futures` crate, but the `block_on` of any executor would do, as an event needs no runtime:
 ///
 /// ```
 /// use std::{
@@ -182,7 +181,7 @@ use std::{
 ///     thread,
 /// };
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::Event;
 ///
 /// /// A flag, raised once, and the event its raising is announced through.

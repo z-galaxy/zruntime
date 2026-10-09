@@ -1330,3 +1330,35 @@ struct LocalUnixSocketsStayOnTheirThread;
 /// ```
 #[cfg(all(doctest, feature = "process"))]
 struct LocalChildrenStayOnTheirThread;
+
+/// Yields to the executor once: the first poll wakes the task and returns `Pending`, so that the
+/// executor runs whatever else it has to before the task goes on.
+#[cfg(all(test, any(feature = "runtime", feature = "lock", feature = "mpmc")))]
+pub(crate) async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return std::task::Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Runs `a` and `b` together, and resolves to the output of whichever completes first: `a`'s
+/// where both complete on the same poll, as `a` is polled first.
+#[cfg(all(test, any(feature = "runtime", feature = "mpmc")))]
+pub(crate) async fn or<T, A, B>(a: A, b: B) -> T
+where
+    A: Future<Output = T>,
+    B: Future<Output = T>,
+{
+    let (output, _) = futures::future::select(std::pin::pin!(a), std::pin::pin!(b))
+        .await
+        .factor_first();
+
+    output
+}

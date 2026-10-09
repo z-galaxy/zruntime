@@ -25,13 +25,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_lite::{
-    Stream, StreamExt,
-    future::{block_on, or, poll_once, yield_now},
-};
+use futures::{Stream, StreamExt, executor::block_on, future::poll_immediate};
 use ntest::timeout;
 use socket2::{SockRef, Socket};
 
+use super::{or, yield_now};
 #[cfg(feature = "event")]
 use crate::Event;
 use crate::{
@@ -314,7 +312,7 @@ in_both_modes! {
         // A round of the runtime, which comes to the id the task left in its queue and skips it.
         runtime.block_on(yield_now());
         assert!(!polled.load(Ordering::Acquire));
-        assert_eq!(runtime.block_on(poll_once(cancelling)), Some(None));
+        assert_eq!(runtime.block_on(poll_immediate(cancelling)), Some(None));
     }
 }
 
@@ -338,7 +336,7 @@ in_both_modes! {
         let cancelling = task.cancel();
 
         assert!(dropped.load(Ordering::Acquire));
-        assert_eq!(block_on(poll_once(cancelling)), Some(None));
+        assert_eq!(block_on(poll_immediate(cancelling)), Some(None));
     }
 }
 
@@ -351,7 +349,7 @@ in_both_modes! {
         runtime.block_on(yield_now());
         assert!(task.is_finished());
 
-        assert_eq!(block_on(poll_once(task.cancel())), Some(Some(42)));
+        assert_eq!(block_on(poll_immediate(task.cancel())), Some(Some(42)));
     }
 }
 
@@ -365,7 +363,7 @@ in_both_modes! {
         runtime.block_on(yield_now());
         assert!(task.is_finished());
 
-        let resolved = block_on(poll_once(task.cancel()));
+        let resolved = block_on(poll_immediate(task.cancel()));
 
         assert!(resolved.is_some_and(|output| output.is_none()));
     }
@@ -381,7 +379,7 @@ in_both_modes! {
 
         drop(runtime);
 
-        assert_eq!(block_on(poll_once(task.cancel())), Some(None));
+        assert_eq!(block_on(poll_immediate(task.cancel())), Some(None));
     }
 }
 
@@ -393,7 +391,7 @@ in_both_modes! {
         let mut task = M::spawn(&runtime, "an answer", async { 42 });
         assert_eq!(runtime.block_on(&mut task).unwrap(), 42);
 
-        assert_eq!(block_on(poll_once(task.cancel())), Some(None));
+        assert_eq!(block_on(poll_immediate(task.cancel())), Some(None));
     }
 }
 
@@ -517,7 +515,7 @@ fn a_task_cancelled_as_its_runtime_goes_is_waited_for_until_its_future_is_gone()
     assert_eq!(pending_at_once.get(), Some(true));
     // ...and is gone by now.
     let cancelling = cancelling.borrow_mut().take().unwrap();
-    assert_eq!(block_on(poll_once(cancelling)), Some(None));
+    assert_eq!(block_on(poll_immediate(cancelling)), Some(None));
 }
 
 /// A task cancelled while another thread polls it is dropped by that thread once its poll
@@ -536,7 +534,7 @@ fn cancelling_a_task_another_thread_polls_waits_for_that_poll() {
 
     let mut cancelling = pin!(task.cancel());
 
-    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert!(block_on(poll_immediate(cancelling.as_mut())).is_none());
     assert!(!dropped.load(Ordering::Acquire));
     release.send(()).unwrap();
     assert_eq!(block_on(cancelling), None);
@@ -560,7 +558,7 @@ fn cancelling_a_task_another_thread_polls_to_its_end_hands_its_output_back() {
 
     let mut cancelling = pin!(task.cancel());
 
-    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert!(block_on(poll_immediate(cancelling.as_mut())).is_none());
     assert!(!dropped.load(Ordering::Acquire));
     release.send(()).unwrap();
     assert_eq!(block_on(cancelling), Some(42));
@@ -582,7 +580,7 @@ fn cancelling_a_task_whose_destructor_panics_on_another_thread_ends_the_wait() {
 
     let mut cancelling = pin!(task.cancel());
 
-    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert!(block_on(poll_immediate(cancelling.as_mut())).is_none());
     release.send(()).unwrap();
     assert_eq!(block_on(cancelling), None);
     driver.join().unwrap();
@@ -726,7 +724,7 @@ in_both_modes! {
         // The clock has moved on by the time of the poll, however little.
         let deadline = Instant::now();
 
-        let polled = runtime.block_on(poll_once(runtime.sleep_until(deadline)));
+        let polled = runtime.block_on(poll_immediate(runtime.sleep_until(deadline)));
 
         assert!(polled.is_some());
     }
@@ -754,7 +752,7 @@ in_both_modes! {
         runtime.block_on(async {
             let mut sleep = runtime.sleep(Duration::from_millis(10));
             // Polled first, so that the reset moves a deadline the runtime already waits on.
-            assert!(poll_once(&mut sleep).await.is_none());
+            assert!(poll_immediate(&mut sleep).await.is_none());
             sleep.reset_after(Duration::from_millis(50));
             sleep.await;
         });
@@ -773,7 +771,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut sleep = runtime.sleep(Duration::from_secs(10));
-            assert!(poll_once(&mut sleep).await.is_none());
+            assert!(poll_immediate(&mut sleep).await.is_none());
             sleep.reset_after(Duration::from_millis(20));
             sleep.await;
         });
@@ -874,7 +872,7 @@ in_both_modes! {
         let runtime = Runtime::<M>::new().unwrap();
         let timeout = runtime.timeout_at(Instant::now(), pending::<()>());
 
-        let polled = runtime.block_on(poll_once(timeout));
+        let polled = runtime.block_on(poll_immediate(timeout));
 
         assert_eq!(polled, Some(Err(TimedOut)));
     }
@@ -887,7 +885,7 @@ in_both_modes! {
         let runtime = Runtime::<M>::new().unwrap();
         let timeout = runtime.timeout_at(Instant::now(), async { 7 });
 
-        let polled = runtime.block_on(poll_once(timeout));
+        let polled = runtime.block_on(poll_immediate(timeout));
 
         assert_eq!(polled, Some(Ok(7)));
     }
@@ -981,7 +979,7 @@ in_both_modes! {
         let start = Instant::now();
         let mut interval = runtime.interval_at(start, period);
 
-        let first = runtime.block_on(poll_once(interval.tick()));
+        let first = runtime.block_on(poll_immediate(interval.tick()));
         let second = runtime.block_on(interval.tick());
 
         assert_eq!(first, Some(start));
@@ -1116,11 +1114,11 @@ in_both_modes! {
         let start = Instant::now();
         let mut once = runtime.interval_at(start, Duration::MAX);
 
-        assert!(runtime.block_on(poll_once(never.tick())).is_none());
+        assert!(runtime.block_on(poll_immediate(never.tick())).is_none());
         assert_eq!(Stream::size_hint(&never), (0, None));
-        assert_eq!(runtime.block_on(poll_once(once.tick())), Some(start));
+        assert_eq!(runtime.block_on(poll_immediate(once.tick())), Some(start));
         // The tick after it is a whole period after `start`, beyond the clock.
-        assert!(runtime.block_on(poll_once(once.tick())).is_none());
+        assert!(runtime.block_on(poll_immediate(once.tick())).is_none());
         assert_eq!(Stream::size_hint(&once), (0, None));
     }
 }
@@ -1287,7 +1285,7 @@ in_both_modes! {
         let registration = M::register(&runtime, source.clone()).unwrap();
 
         // Dropped after a single poll, which left it waiting.
-        let polled = runtime.block_on(poll_once(registration.ready(Interest::Readable)));
+        let polled = runtime.block_on(poll_immediate(registration.ready(Interest::Readable)));
         assert!(polled.is_none());
         // Dropped by the race it lost, when the timer won.
         let winner = runtime.block_on(or(
@@ -1391,7 +1389,7 @@ in_both_modes! {
 
         assert!(dropped.load(Ordering::Acquire));
         for task in [polled, never_polled] {
-            let error = futures_lite::future::block_on(task).unwrap_err();
+            let error = futures::executor::block_on(task).unwrap_err();
             assert_eq!(error.to_string(), "the task's runtime is gone");
         }
     }
@@ -1565,7 +1563,7 @@ fn a_second_concurrent_block_on_panics() {
             })
         })
     };
-    futures_lite::future::block_on(announced);
+    futures::executor::block_on(announced);
 
     let panicked = catch_unwind(AssertUnwindSafe(|| runtime.block_on(async {}))).unwrap_err();
 

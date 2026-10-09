@@ -187,7 +187,7 @@ fn a_job_that_panics_leaves_its_thread_to_the_jobs_after_it() {
 #[test]
 #[timeout(15000)]
 fn a_panic_whose_payload_panics_as_it_drops_leaves_the_thread_to_the_jobs_after_it() {
-    let pool = pool(1, SHORT_IDLE_TIMEOUT);
+    let pool = pool(1, LONG_IDLE_TIMEOUT);
 
     Pool::submit(pool.clone(), Box::new(|| panic::panic_any(PanicsOnDrop)));
     let ran = run(&pool, || "the next job ran");
