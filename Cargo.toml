@@ -95,8 +95,7 @@ rustix = { version = "1.1.5", features = ["thread"] }
 
 [dev-dependencies]
 criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }
-futures-lite = "2.6.1"
-futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+futures = { version = "0.3.34", default-features = false, features = ["std", "executor"] }
 ntest = "0.9.5"
 socket2 = { version = "0.6.5", features = ["all"] }
 

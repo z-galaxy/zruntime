@@ -96,7 +96,7 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// # fn main() -> std::io::Result<()> {
 /// use std::{io::Write, thread};
 ///
-/// use futures_lite::AsyncReadExt;
+/// use futures::AsyncReadExt;
 /// use zruntime::{Async, LocalRuntime};
 ///
 /// let runtime = LocalRuntime::new()?;

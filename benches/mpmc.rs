@@ -6,8 +6,8 @@
 //! task ids are not, as the comparison ran its tasks on a tokio runtime. The rows of threads are
 //! timed in `contention.rs`, as only the clock can measure them.
 //!
-//! `mpmc` needs no runtime, so the single-thread ids drive their futures with futures-lite's
-//! `block_on`, not `zruntime::block_on`. Only the two `tasks-*` ids use the runtime, to run tasks
+//! `mpmc` needs no runtime, so the single-thread ids drive their futures with the `block_on` of
+//! `futures`, not `zruntime::block_on`. Only the two `tasks-*` ids use the runtime, to run tasks
 //! on. Every id sends one message and receives it before it is timed, so that what the channel
 //! allocates lazily on its first use is allocated by then.
 //!
@@ -44,7 +44,7 @@ use std::hint::black_box;
 use criterion::{
     BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime,
 };
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use zruntime::LocalRuntime;
 
 #[path = "common/channel.rs"]

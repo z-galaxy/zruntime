@@ -36,11 +36,15 @@ use std::{
     thread,
 };
 
+use futures::{
+    executor::block_on,
+    future::join,
+    stream::{FusedStream, StreamExt},
+};
 use futures_core::Stream;
-use futures_lite::future::{block_on, or, yield_now, zip};
-use futures_util::stream::{FusedStream, StreamExt};
 use ntest::timeout;
 
+use super::{or, yield_now};
 use crate::mpmc::{
     self, Receiver, RecvError, SendError, Sender, TryRecvError, TrySendError, bounded, unbounded,
 };
@@ -551,7 +555,7 @@ fn one_receiver_serves_several_recvs_at_once() {
     s.try_send(1).unwrap();
     s.try_send(2).unwrap();
 
-    assert_eq!(block_on(zip(r.recv(), r.recv())), (Ok(1), Ok(2)));
+    assert_eq!(block_on(join(r.recv(), r.recv())), (Ok(1), Ok(2)));
 }
 
 #[test]

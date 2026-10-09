@@ -1,7 +1,7 @@
 //! Tests of `zruntime::unblock`, the blocking work it hands to a pool of threads, and the future
 //! it hands back.
 //!
-//! The work needs no runtime, so these drive the future with the `block_on` of `futures-lite`, or
+//! The work needs no runtime, so these drive the future with the `block_on` of `futures`, or
 //! poll it by hand with wakers of their own. They come in the order of what they pin down: that
 //! the future hands back the value the work returned, that the work starts without the future
 //! being polled, that a panic in the work reaches whoever awaits the future, which thread the work
@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use ntest::timeout;
 
 use crate::unblock;

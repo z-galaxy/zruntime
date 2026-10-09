@@ -121,7 +121,7 @@ impl super::unix::DirEntryExt for DirEntry {
 /// # Example
 ///
 /// ```
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::fs::DirBuilder;
 ///
 /// # let pid = std::process::id();

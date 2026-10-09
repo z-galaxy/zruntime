@@ -28,7 +28,10 @@ use std::{
     thread,
 };
 
-use futures_lite::future::{block_on, poll_once, zip};
+use futures::{
+    executor::block_on,
+    future::{join, poll_immediate},
+};
 use ntest::timeout;
 use socket2::SockRef;
 
@@ -104,7 +107,7 @@ in_both_modes! {
         runtime.block_on(async {
             // Sent after a delay, with the `peek_from` already waiting for it.
             let mut peeked = [0; 16];
-            let (peek, sent) = zip(
+            let (peek, sent) = join(
                 server.peek_from(&mut peeked),
                 after(&runtime, client.send_to(b"peeked", server_address)),
             )
@@ -117,7 +120,7 @@ in_both_modes! {
             // The datagram is on the socket still, so a receive resolves in its first poll. One
             // that had to wait would mean that the peek took the datagram away.
             let mut received = [0; 16];
-            let (len, from) = poll_once(server.recv_from(&mut received))
+            let (len, from) = poll_immediate(server.recv_from(&mut received))
                 .await
                 .expect("the peeked datagram is still on the socket")
                 .unwrap();
@@ -137,7 +140,7 @@ in_both_modes! {
         runtime.block_on(async {
             // Sent after a delay, with the `peek` already waiting for it.
             let mut peeked = [0; 16];
-            let (peek, sent) = zip(
+            let (peek, sent) = join(
                 server.peek(&mut peeked),
                 after(&runtime, client.send(b"peeked")),
             )
@@ -149,7 +152,7 @@ in_both_modes! {
             // The datagram is on the socket still, so a receive resolves in its first poll. One
             // that had to wait would mean that the peek took the datagram away.
             let mut received = [0; 16];
-            let len = poll_once(server.recv(&mut received))
+            let len = poll_immediate(server.recv(&mut received))
                 .await
                 .expect("the peeked datagram is still on the socket")
                 .unwrap();
@@ -170,7 +173,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 16];
-            let (received_from, sent) = zip(
+            let (received_from, sent) = join(
                 server.recv_from(&mut received),
                 after(&runtime, client.send_to(b"late", server_address)),
             )
@@ -192,7 +195,7 @@ in_both_modes! {
     ///
     /// A call that waits is polled when it begins to, and again each time its task is woken while
     /// it waits: by the timer that ends the delay, since the task polls both of the calls that are
-    /// zipped, and by the datagram arriving. A thread that spun would poll it hundreds of times.
+    /// joined, and by the datagram arriving. A thread that spun would poll it hundreds of times.
     /// Each of the four calls waits once, and a peek is followed by the receive that takes the
     /// datagram it left.
     fn a_receive_that_waits_does_not_spin<M>() {
@@ -239,10 +242,10 @@ in_both_modes! {
             let mut buffer = [0; 16];
             {
                 let mut abandoned = pin!(server.recv_from(&mut buffer));
-                assert!(poll_once(abandoned.as_mut()).await.is_none());
+                assert!(poll_immediate(abandoned.as_mut()).await.is_none());
             }
 
-            let (received, sent) = zip(
+            let (received, sent) = join(
                 server.recv_from(&mut buffer),
                 after(&runtime, client.send_to(b"kept", server_address)),
             )
@@ -318,7 +321,7 @@ in_both_modes! {
 
         runtime.block_on(async {
             let mut received = [0; 16];
-            let (received_from, sent) = zip(
+            let (received_from, sent) = join(
                 socket.recv_from(&mut received),
                 after(&runtime, async { peer.send_to(b"late", address) }),
             )
@@ -649,7 +652,7 @@ where
     F: Future,
 {
     let polls = Cell::new(0);
-    let (output, sent) = zip(
+    let (output, sent) = join(
         counting_polls(&polls, receive),
         after(runtime, sender.send(b"1")),
     )

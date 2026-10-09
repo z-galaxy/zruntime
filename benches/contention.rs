@@ -4,7 +4,7 @@
 //! their threads wait for each other in the kernel, which CodSpeed's CPU simulation leaves out,
 //! and they time their rounds themselves, which the simulation's harness does not run at all.
 //!
-//! Every thread runs its whole round inside one futures-lite `block_on`, not one per operation.
+//! Every thread runs its whole round inside one `block_on` of `futures`, not one per operation.
 //! The threads are spawned once per id and kept alive for every sample: a pair of barriers starts a
 //! round and waits for it to end, and only the time between the two is measured, so spawning and
 //! joining the threads is never counted. Each thread is pinned to a CPU of its own, and they start
@@ -40,7 +40,7 @@ use crew::{Crew, Round};
 use criterion::{
     BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main, measurement::WallTime,
 };
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use zruntime::lock::Mutex;
 
 #[path = "common/channel.rs"]

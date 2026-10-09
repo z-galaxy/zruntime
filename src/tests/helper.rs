@@ -19,11 +19,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_lite::future::{block_on, poll_once, yield_now};
+use futures::{executor::block_on, future::poll_immediate};
 use ntest::timeout;
 use socket2::SockRef;
 
-use super::core::pair;
+use super::{core::pair, yield_now};
 #[cfg(feature = "event")]
 use crate::{Event, EventListener};
 use crate::{
@@ -185,7 +185,7 @@ fn cancelling_a_task_the_helper_polls_waits_for_that_poll() {
 
     let mut cancelling = pin!(task.cancel());
 
-    assert!(block_on(poll_once(cancelling.as_mut())).is_none());
+    assert!(block_on(poll_immediate(cancelling.as_mut())).is_none());
     assert_eq!(Arc::strong_count(&held), 2);
     release.send(()).unwrap();
     assert_eq!(block_on(cancelling), None);
@@ -388,7 +388,7 @@ fn a_dropped_sleep_lets_the_helper_exit() {
     {
         let mut sleep = pin!(runtime.sleep(Duration::from_secs(10)));
         // The first poll is what hands the deadline to the reactor.
-        assert!(block_on(poll_once(sleep.as_mut())).is_none());
+        assert!(block_on(poll_immediate(sleep.as_mut())).is_none());
         assert!(runtime.helper_running());
     }
 
@@ -406,7 +406,7 @@ fn a_sleep_until_starts_the_helper_and_dropping_it_lets_it_exit() {
         let mut sleep = pin!(runtime.sleep_until(Instant::now() + Duration::from_secs(10)));
         // Made but not yet polled, the timer has handed the reactor nothing to wait on.
         assert!(!runtime.helper_running());
-        assert!(block_on(poll_once(sleep.as_mut())).is_none());
+        assert!(block_on(poll_immediate(sleep.as_mut())).is_none());
         assert!(runtime.helper_running());
     }
 
@@ -446,7 +446,7 @@ fn the_helper_fires_a_sleep_reset_to_an_earlier_deadline() {
 fn a_sleep_reset_beyond_the_clock_lets_the_helper_exit() {
     let runtime = runtime();
     let mut sleep = pin!(runtime.sleep(Duration::from_secs(10)));
-    assert!(block_on(poll_once(sleep.as_mut())).is_none());
+    assert!(block_on(poll_immediate(sleep.as_mut())).is_none());
     assert!(runtime.helper_running());
     // Long enough for the helper to reach its wait, bounded by the deadline ten seconds ahead,
     // which the reset then has to break.
@@ -468,7 +468,7 @@ fn a_timeout_starts_the_helper_and_dropping_it_lets_it_exit() {
         let mut timeout = pin!(runtime.timeout(Duration::from_secs(10), pending::<()>()));
         // Made but not yet polled, the timeout has handed the reactor nothing to wait on.
         assert!(!runtime.helper_running());
-        assert!(block_on(poll_once(timeout.as_mut())).is_none());
+        assert!(block_on(poll_immediate(timeout.as_mut())).is_none());
         assert!(runtime.helper_running());
     }
 
@@ -499,7 +499,7 @@ fn an_interval_starts_the_helper_and_dropping_it_lets_it_exit() {
         let mut interval = runtime.interval(Duration::from_secs(10));
         // Made but not yet polled, the interval has handed the reactor nothing to wait on.
         assert!(!runtime.helper_running());
-        assert!(block_on(poll_once(interval.tick())).is_none());
+        assert!(block_on(poll_immediate(interval.tick())).is_none());
         assert!(runtime.helper_running());
     }
 
@@ -544,7 +544,7 @@ fn a_sleep_beyond_the_clock_starts_no_helper() {
     let runtime = runtime();
     let mut sleep = pin!(runtime.sleep(Duration::MAX));
 
-    assert!(block_on(poll_once(sleep.as_mut())).is_none());
+    assert!(block_on(poll_immediate(sleep.as_mut())).is_none());
 
     // A timer nothing can ever fire has no deadline for a thread to wait on, so none is asked
     // for: a helper started here would retire in the very round it started.
@@ -558,7 +558,7 @@ fn an_interval_beyond_the_clock_starts_no_helper() {
     let runtime = runtime();
     let mut interval = runtime.interval(Duration::MAX);
 
-    assert!(block_on(poll_once(interval.tick())).is_none());
+    assert!(block_on(poll_immediate(interval.tick())).is_none());
 
     // An interval whose first tick the clock cannot name has no deadline for a thread to wait
     // on, as a timer that is never to fire has none, so no helper is asked for.

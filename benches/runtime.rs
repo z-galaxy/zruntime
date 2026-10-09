@@ -91,7 +91,7 @@ mod unix {
     };
 
     use criterion::{BatchSize, Criterion, Throughput};
-    use futures_lite::future;
+    use futures::future;
     use zruntime::{Interest, Registration, Shared, SharedRuntime};
 
     use super::{ZruntimeExecutor, cpus::Cpus, runtime_handle};
@@ -186,7 +186,7 @@ mod unix {
             group.bench_function("1MiB", |b| {
                 b.to_async(ZruntimeExecutor).iter(|| async {
                     let mut response = vec![0u8; BIG];
-                    future::zip(
+                    future::join(
                         write_all(&registration, &local, &body),
                         read_exact(&registration, &local, &mut response),
                     )

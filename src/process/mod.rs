@@ -520,7 +520,7 @@ impl fmt::Debug for Command {
 /// ```
 /// # #[cfg(unix)]
 /// # fn main() -> std::io::Result<()> {
-/// use futures_lite::AsyncReadExt;
+/// use futures::AsyncReadExt;
 /// use zruntime::{
 ///     LocalRuntime,
 ///     process::{Command, Stdio},

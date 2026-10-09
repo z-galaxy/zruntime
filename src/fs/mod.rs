@@ -37,12 +37,12 @@
 //!
 //! # Example
 //!
-//! The paths of the example are in a directory made for it, which stands in for the directory of
-//! a program. The futures are driven by `block_on` from the `futures-lite` crate, but the
-//! `block_on` of any executor would do, as the module needs no runtime:
+//! The paths of the example are in a directory made for it, which stands in for the directory of a
+//! program. The futures are driven by `block_on` from the `futures` crate, but the `block_on` of
+//! any executor would do, as the module needs no runtime:
 //!
 //! ```
-//! use futures_lite::{AsyncReadExt, AsyncWriteExt, future::block_on};
+//! use futures::{AsyncReadExt, AsyncWriteExt, executor::block_on};
 //! use zruntime::fs::{self, File};
 //!
 //! # let pid = std::process::id();
@@ -134,7 +134,7 @@ where
 /// This is [`std::fs::copy`], run as blocking work. A `dst` that exists is overwritten, and one
 /// that is the same file as `src` is likely to be truncated by that. To copy between two open
 /// [`File`]s instead, use an async copy that reads and writes through them, such as
-/// `futures_lite::io::copy`.
+/// `futures::io::copy`.
 pub async fn copy<P, Q>(src: P, dst: Q) -> io::Result<u64>
 where
     P: AsRef<Path>,
@@ -220,7 +220,7 @@ where
 /// # Example
 ///
 /// ```
-/// use futures_lite::{StreamExt, future::block_on};
+/// use futures::{StreamExt, executor::block_on};
 /// use zruntime::fs;
 ///
 /// # let pid = std::process::id();

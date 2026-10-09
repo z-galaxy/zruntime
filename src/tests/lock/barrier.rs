@@ -25,7 +25,7 @@ use std::{
     thread,
 };
 
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use ntest::timeout;
 
 use super::{counting_waker, handoff, poll_once, poll_with, ready};

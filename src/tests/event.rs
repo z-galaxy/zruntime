@@ -40,7 +40,7 @@ use std::{
     thread,
 };
 
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use ntest::timeout;
 
 use crate::{Event, EventListener};

@@ -45,9 +45,9 @@
 //! lock from [`std::sync`] would keep the future from being sent to that thread:
 //!
 //! ```
-//! use std::{sync::Arc, thread};
+//! use std::{future, sync::Arc, thread};
 //!
-//! use futures_lite::future::{block_on, yield_now};
+//! use futures::executor::block_on;
 //! use zruntime::lock::Mutex;
 //!
 //! let counter = Arc::new(Mutex::new(0));
@@ -55,8 +55,8 @@
 //!     let counter = counter.clone();
 //!     async move {
 //!         let mut guard = counter.lock().await;
-//!         yield_now().await;
-//!         *guard += 1;
+//!         let step = future::ready(1).await;
+//!         *guard += step;
 //!     }
 //! };
 //!

@@ -3,7 +3,7 @@
 
 use std::{hint::black_box, num::NonZeroUsize};
 
-use futures_lite::future::block_on;
+use futures::executor::block_on;
 use zruntime::mpmc::{Receiver, Sender, bounded, unbounded};
 
 /// A channel with room for `cap` messages, or an unbounded one if `cap` is `None`.

@@ -93,13 +93,13 @@ use super::{BlockingWork, dispose, unblock};
 /// # Example
 ///
 /// A [`Cursor`](std::io::Cursor) stands in for a blocking handle to read, and a `Vec` for one to
-/// write. The futures are driven by `block_on` from the `futures-lite` crate, but the `block_on` of
-/// any executor would do, as the adapter needs no runtime:
+/// write. The futures are driven by `block_on` from the `futures` crate, but the `block_on` of any
+/// executor would do, as the adapter needs no runtime:
 ///
 /// ```
 /// use std::io::Cursor;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt, future::block_on};
+/// use futures::{AsyncReadExt, AsyncWriteExt, executor::block_on};
 /// use zruntime::Unblock;
 ///
 /// block_on(async {
@@ -166,7 +166,7 @@ impl<T> Unblock<T> {
     /// ```
     /// use std::io::Cursor;
     ///
-    /// use futures_lite::{AsyncReadExt, future::block_on};
+    /// use futures::{AsyncReadExt, executor::block_on};
     /// use zruntime::Unblock;
     ///
     /// block_on(async {
@@ -214,7 +214,7 @@ impl<T> Unblock<T> {
     /// ```
     /// use std::io::Cursor;
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::Unblock;
     ///
     /// let mut reader = Unblock::new(Cursor::new(vec![1, 2, 3]));
@@ -255,7 +255,7 @@ impl<T> Unblock<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::{AsyncWriteExt, future::block_on};
+    /// use futures::{AsyncWriteExt, executor::block_on};
     /// use zruntime::Unblock;
     ///
     /// block_on(async {

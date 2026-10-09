@@ -19,7 +19,7 @@ use std::{
 #[cfg(unix)]
 use std::{thread, time::Instant};
 
-use futures_lite::future::poll_once;
+use futures::future::poll_immediate;
 #[cfg(unix)]
 use rustix::{
     io::Errno,
@@ -80,7 +80,7 @@ fn children_are_waited_for_while_blocking_work_fills_the_pool() {
     let input = child.stdin.take();
     let (waited, status) = runtime.block_on(async {
         let mut status = pin!(child.status());
-        if let Some(status) = poll_once(&mut status).await {
+        if let Some(status) = poll_immediate(&mut status).await {
             return (false, Ok(status));
         }
         drop(input);

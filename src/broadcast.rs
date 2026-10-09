@@ -18,7 +18,7 @@
 //! ```
 //! use std::num::NonZeroUsize;
 //!
-//! use futures_lite::{future::block_on, stream::StreamExt};
+//! use futures::{executor::block_on, stream::StreamExt};
 //! use zruntime::broadcast::{TryRecvError, channel};
 //!
 //! block_on(async move {
@@ -115,7 +115,7 @@ use crate::{Event, EventListener};
 /// # Examples
 ///
 /// ```
-/// # futures_lite::future::block_on(async {
+/// # futures::executor::block_on(async {
 /// use std::num::NonZeroUsize;
 /// use zruntime::broadcast::{TryRecvError, TrySendError, channel};
 ///
@@ -291,7 +291,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{SendError, channel};
     ///
@@ -318,7 +318,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -339,7 +339,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -359,7 +359,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -379,7 +379,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -401,7 +401,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -467,7 +467,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -490,7 +490,7 @@ impl<T> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -533,7 +533,7 @@ impl<T: Clone> Sender<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{SendError, channel};
     ///
@@ -768,7 +768,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{SendError, channel};
     ///
@@ -795,7 +795,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -816,7 +816,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -836,7 +836,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -856,7 +856,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -878,7 +878,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -944,7 +944,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::channel;
     ///
@@ -973,7 +973,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{TrySendError, channel};
     ///
@@ -1016,7 +1016,7 @@ impl<T: Clone> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -1056,7 +1056,7 @@ impl<T: Clone> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{TryRecvError, channel};
     ///
@@ -1101,7 +1101,7 @@ impl<T: Clone> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -1136,7 +1136,7 @@ impl<T: Clone> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -1304,7 +1304,7 @@ impl<T> Clone for Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{RecvError, channel};
     ///
@@ -1478,7 +1478,7 @@ impl<T> InactiveReceiver<T> {
     /// # Examples
     ///
     /// ```
-    /// # futures_lite::future::block_on(async {
+    /// # futures::executor::block_on(async {
     /// use std::num::NonZeroUsize;
     /// use zruntime::broadcast::{SendError, channel};
     ///

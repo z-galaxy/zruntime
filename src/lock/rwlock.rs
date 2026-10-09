@@ -54,7 +54,7 @@ use crate::Event;
 /// # Example
 ///
 /// ```
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::RwLock;
 ///
 /// let lock = RwLock::new(0);
@@ -94,7 +94,7 @@ impl<T> RwLock<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::RwLock;
     ///
     /// static SETTING: RwLock<&str> = RwLock::new("off");
@@ -154,7 +154,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::RwLock;
     ///
     /// let lock = RwLock::new(String::from("shared"));
@@ -189,7 +189,7 @@ where
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::RwLock;
     ///
     /// let lock = Arc::new(RwLock::new(0));
@@ -279,7 +279,7 @@ where
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::RwLock;
     ///
     /// let lock = Arc::new(RwLock::new(String::from("shared")));
@@ -336,7 +336,7 @@ where
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::RwLock;
     ///
     /// let lock = Arc::new(RwLock::new(0));
@@ -697,7 +697,7 @@ where
 /// ```
 /// use std::sync::Arc;
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::{RwLock, RwLockReadGuardArc};
 ///
 /// /// A view of the settings that keeps them from changing while it lives.
@@ -781,7 +781,7 @@ where
 /// ```
 /// use std::sync::Arc;
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::{RwLock, RwLockWriteGuardArc};
 ///
 /// /// An edit of a document, which nobody may read until it is done.

@@ -51,7 +51,7 @@ use crate::{Async, Local, Mode, Runtime};
 /// ```
 /// use std::net::Ipv4Addr;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     net::{TcpListener, TcpStream},
@@ -180,7 +180,7 @@ where
     /// ```
     /// use std::net::Ipv4Addr;
     ///
-    /// use futures_lite::StreamExt;
+    /// use futures::StreamExt;
     /// use zruntime::{
     ///     LocalRuntime,
     ///     net::{TcpListener, TcpStream},
@@ -325,7 +325,7 @@ where
 /// ```
 /// use std::net::Ipv4Addr;
 ///
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     net::{TcpListener, TcpStream},

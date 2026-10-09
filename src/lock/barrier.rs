@@ -39,7 +39,7 @@ use crate::Event;
 /// ```
 /// use std::{sync::Arc, thread};
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::Barrier;
 ///
 /// let barrier = Arc::new(Barrier::new(3));
@@ -79,7 +79,7 @@ impl Barrier {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Barrier;
     ///
     /// static GATE: Barrier = Barrier::new(1);
@@ -114,12 +114,12 @@ impl Barrier {
     /// Two waits driven together by one thread, each of which needs the other to have begun:
     ///
     /// ```
-    /// use futures_lite::future::{block_on, zip};
+    /// use futures::{executor::block_on, future::join};
     /// use zruntime::lock::Barrier;
     ///
     /// let barrier = Barrier::new(2);
     ///
-    /// let (first, second) = block_on(zip(barrier.wait(), barrier.wait()));
+    /// let (first, second) = block_on(join(barrier.wait(), barrier.wait()));
     ///
     /// // One of the two led the round.
     /// assert_ne!(first.is_leader(), second.is_leader());
@@ -191,7 +191,7 @@ impl BarrierWaitResult {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Barrier;
     ///
     /// // A barrier for one task completes every round with the task that arrives.

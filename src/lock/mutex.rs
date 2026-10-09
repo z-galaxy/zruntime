@@ -35,7 +35,7 @@ use crate::Event;
 /// # Example
 ///
 /// ```
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::Mutex;
 ///
 /// let mutex = Mutex::new(Vec::new());
@@ -90,7 +90,7 @@ impl<T> Mutex<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Mutex;
     ///
     /// static COUNT: Mutex<u32> = Mutex::new(0);
@@ -147,7 +147,7 @@ where
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Mutex;
     ///
     /// let mutex = Arc::new(Mutex::new(0));
@@ -207,7 +207,7 @@ where
     /// ```
     /// use std::{sync::Arc, thread};
     ///
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::lock::Mutex;
     ///
     /// let mutex = Arc::new(Mutex::new(0));
@@ -458,7 +458,7 @@ where
 /// ```
 /// use std::sync::Arc;
 ///
-/// use futures_lite::future::block_on;
+/// use futures::executor::block_on;
 /// use zruntime::lock::{Mutex, MutexGuardArc};
 ///
 /// /// A log that nothing else may write to while it is open.

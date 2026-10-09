@@ -32,7 +32,7 @@
 //! ```
 //! use std::num::NonZeroUsize;
 //!
-//! use futures_lite::future::block_on;
+//! use futures::executor::block_on;
 //! use zruntime::mpmc::{RecvError, TrySendError, bounded};
 //!
 //! block_on(async {
@@ -291,7 +291,7 @@ impl<T> Sender<T> {
     /// ```
     /// use std::num::NonZeroUsize;
     ///
-    /// use futures_lite::future::{block_on, zip};
+    /// use futures::{executor::block_on, future::join};
     /// use zruntime::mpmc::bounded;
     ///
     /// let (s, r) = bounded(NonZeroUsize::MIN);
@@ -299,7 +299,7 @@ impl<T> Sender<T> {
     /// block_on(async {
     ///     s.send(1).await.unwrap();
     ///
-    ///     let (sent, received) = zip(s.send(2), r.recv()).await;
+    ///     let (sent, received) = join(s.send(2), r.recv()).await;
     ///     assert_eq!(sent, Ok(()));
     ///     assert_eq!(received, Ok(1));
     ///
@@ -575,7 +575,7 @@ impl<T> fmt::Debug for Sender<T> {
 /// # Example
 ///
 /// ```
-/// use futures_lite::{future::block_on, stream::StreamExt};
+/// use futures::{executor::block_on, stream::StreamExt};
 /// use zruntime::mpmc::unbounded;
 ///
 /// let (s, r) = unbounded();
@@ -607,7 +607,7 @@ impl<T> Receiver<T> {
     /// # Example
     ///
     /// ```
-    /// use futures_lite::future::block_on;
+    /// use futures::executor::block_on;
     /// use zruntime::mpmc::{RecvError, unbounded};
     ///
     /// let (s, r) = unbounded();

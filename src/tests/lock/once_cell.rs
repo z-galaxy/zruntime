@@ -33,11 +33,11 @@ use std::{
     thread,
 };
 
-use futures_lite::future::{block_on, yield_now};
+use futures::executor::block_on;
 use ntest::timeout;
 
 use super::{counting_waker, handoff, linger, poll_once, poll_with, ready};
-use crate::lock::OnceCell;
+use crate::{lock::OnceCell, tests::yield_now};
 
 /// A new cell has no value, which `get` reports without waiting; once a value is set, `get` hands
 /// it out.

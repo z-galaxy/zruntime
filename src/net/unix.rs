@@ -70,7 +70,7 @@ use crate::{Async, Local, Mode, Runtime};
 /// removed at the end:
 ///
 /// ```
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     net::unix::{UnixListener, UnixStream},
@@ -275,7 +275,7 @@ where
 /// the one:
 ///
 /// ```
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{LocalRuntime, net::unix::UnixStream};
 ///
 /// let runtime = LocalRuntime::new()?;

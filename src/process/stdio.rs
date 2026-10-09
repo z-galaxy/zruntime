@@ -65,7 +65,7 @@ use crate::{Local, Mode, Runtime};
 /// ```
 /// # #[cfg(unix)]
 /// # fn main() -> std::io::Result<()> {
-/// use futures_lite::{AsyncReadExt, AsyncWriteExt};
+/// use futures::{AsyncReadExt, AsyncWriteExt};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     process::{Command, Stdio},
@@ -250,7 +250,7 @@ where
 /// ```
 /// # #[cfg(unix)]
 /// # fn main() -> std::io::Result<()> {
-/// use futures_lite::{AsyncBufReadExt, StreamExt, io::BufReader};
+/// use futures::{AsyncBufReadExt, StreamExt, io::BufReader};
 /// use zruntime::{
 ///     LocalRuntime,
 ///     process::{Command, Stdio},
@@ -322,7 +322,7 @@ where
     /// ```
     /// # #[cfg(unix)]
     /// # fn main() -> std::io::Result<()> {
-    /// use futures_lite::AsyncReadExt;
+    /// use futures::AsyncReadExt;
     /// use zruntime::{
     ///     LocalRuntime,
     ///     process::{Command, Stdio},
