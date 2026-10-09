@@ -228,6 +228,62 @@ An event needs no runtime. A listener is a plain future, woken through the waker
 polled it last, so it works under any executor, and an event may be notified from any thread. It
 is behind the `event` feature, which builds without the runtime: see [Features](#features).
 
+## Combinators
+
+zruntime has no combinators of its own, and no `future`, `stream` and `io` modules of helpers such
+as smol's: those of the [`futures`] crate work with it. They are built on the `Future`, `Stream`,
+`AsyncRead` and `AsyncWrite` traits, which the tasks, timers, sockets, pipes and adapters of
+zruntime implement, so they work on a runtime of either flavour, as they work under any executor.
+[`futures::future`] joins and races futures, [`futures::stream`] adapts streams, such as an interval
+or the connections a listener takes, and [`futures::io`] gives whatever implements `AsyncRead` or
+`AsyncWrite` the likes of `read_to_end` and `write_all`, and a `BufReader` to read lines through.
+
+The default features of `futures` bring an executor, which a program that runs on zruntime has no
+need for, and the `join!` and `select!` macros, which build a proc-macro and the `syn` crate along
+with it. Leaving them out spares the build both:
+
+```toml
+[dependencies]
+futures = { version = "0.3", default-features = false, features = ["std"] }
+```
+
+`std` brings the I/O extension traits, and `async-await` brings back the macros.
+
+```rust
+use std::time::Duration;
+
+use futures::future;
+use zruntime::LocalRuntime;
+
+let runtime = LocalRuntime::new().expect("a runtime for this thread");
+runtime.block_on(async {
+    // Two tasks after the same answer, one of which has it much sooner than the other.
+    let soon = runtime.clone();
+    let near = runtime.spawn("near", async move {
+        soon.sleep(Duration::from_millis(1)).await;
+        "near"
+    });
+    let late = runtime.clone();
+    let far = runtime.spawn("far", async move {
+        late.sleep(Duration::from_secs(60)).await;
+        "far"
+    });
+
+    // The first to answer wins. The other is handed back along with the answer, and dropping it
+    // cancels it.
+    let (answer, _) = future::select(near, far).await.factor_first();
+    assert_eq!(answer.expect("the task did not panic"), "near");
+
+    // Two futures awaited together, the outputs of both kept.
+    let (a, b) = future::join(async { 21 }, async { 2 }).await;
+    assert_eq!(a * b, 42);
+});
+```
+
+A race against a timer is a time limit, which [`Runtime::timeout`] puts on any future in one call.
+The documentation of [`Unblock`] has an example of reading the standard input line by line,
+through such a `BufReader`.
+
 ## Features
 
 * `runtime` (default): [`Runtime`], [`LocalRuntime`] and [`SharedRuntime`], with the tasks,
@@ -337,6 +393,10 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`fs`]: https://docs.rs/zruntime/latest/zruntime/fs/index.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
 [`process`]: https://docs.rs/zruntime/latest/zruntime/process/index.html
+[`futures`]: https://docs.rs/futures
+[`futures::future`]: https://docs.rs/futures/latest/futures/future/index.html
+[`futures::stream`]: https://docs.rs/futures/latest/futures/stream/index.html
+[`futures::io`]: https://docs.rs/futures/latest/futures/io/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
 [MIT]: (LICENSE)

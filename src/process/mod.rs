@@ -8,7 +8,7 @@
 //! meantime.
 //!
 //! The pipes implement the `AsyncWrite` and `AsyncRead` traits of [`futures-io`], so the extension
-//! traits of [`futures-lite`] or [`futures-util`] write to and read from them.
+//! traits of [`futures`] write to and read from them.
 //!
 //! # The runtime
 //!
@@ -99,8 +99,7 @@
 //! ```
 //!
 //! [`futures-io`]: https://docs.rs/futures-io
-//! [`futures-lite`]: https://docs.rs/futures-lite
-//! [`futures-util`]: https://docs.rs/futures-util
+//! [`futures`]: https://docs.rs/futures
 //! [`LocalRuntime`]: crate::LocalRuntime
 //! [`Runtime`]: crate::Runtime
 //! [`Runtime::block_on`]: crate::Runtime::block_on

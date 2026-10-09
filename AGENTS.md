@@ -372,6 +372,10 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   `runtime` alone (for what `spawn` does without `helper`), and checks `runtime`, `event`,
   `broadcast`, `mpmc`, `lock`, `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
+  Tests, doc examples and benchmarks take `block_on`, the combinators and the I/O extension traits
+  from the `futures` dev-dependency (no default features; `std` and `executor`), the crate the
+  README points users at, and not from smol's futures-lite. `src/tests/mod.rs` has the
+  `yield_now` and `or` that `futures` lacks.
 - **Cross-platform**: Validate changes work on Linux, Windows, macOS (and ideally the BSDs and
   Android, which CI also checks).
 - **Dependencies**: Keep this crate's own dependency footprint small; it is meant to be pulled in

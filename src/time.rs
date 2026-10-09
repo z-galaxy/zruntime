@@ -165,13 +165,12 @@ impl From<TimedOut> for io::Error {
 /// [`MissedTickBehavior`].
 ///
 /// An interval is a [`Stream`] of the instants it ticks at, which never ends, so the extension
-/// traits of [`futures-lite`] or [`futures-util`] drive it as well as [`tick`](Self::tick) does.
-/// Like a [`Sleep`], it costs nothing until it is first polled, and holds its runtime, so a task
-/// holding one keeps that runtime alive.
+/// traits of [`futures`] drive it as well as [`tick`](Self::tick) does. Like a [`Sleep`], it costs
+/// nothing until it is first polled, and holds its runtime, so a task holding one keeps that
+/// runtime alive.
 ///
 /// [`Stream`]: futures_core::Stream
-/// [`futures-lite`]: https://docs.rs/futures-lite
-/// [`futures-util`]: https://docs.rs/futures-util
+/// [`futures`]: https://docs.rs/futures
 pub struct Interval<M = Local>
 where
     M: Mode,

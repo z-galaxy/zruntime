@@ -90,7 +90,7 @@ use super::{BlockingWork, dispose, unblock};
 /// waits for that operation, as it is for [`unblock()`]. The handle goes with the panic, and any
 /// use of the adapter after it panics as well.
 ///
-/// # Example
+/// # Examples
 ///
 /// A [`Cursor`](std::io::Cursor) stands in for a blocking handle to read, and a `Vec` for one to
 /// write. The futures are driven by `block_on` from the `futures` crate, but the `block_on` of any
@@ -112,6 +112,28 @@ use super::{BlockingWork, dispose, unblock};
 ///     writer.write_all(b"goodbye").await?;
 ///     writer.flush().await?;
 ///     assert_eq!(writer.into_inner().await, b"goodbye");
+///
+///     std::io::Result::Ok(())
+/// })
+/// .unwrap();
+/// ```
+///
+/// The standard input, read line by line as the lines come in, through a `BufReader` of the
+/// `futures` crate and the `lines` of its `AsyncBufReadExt`. A `Cursor` stands in for
+/// `std::io::stdin()` here:
+///
+/// ```
+/// use std::io::Cursor;
+///
+/// use futures::{AsyncBufReadExt, StreamExt, executor::block_on, io::BufReader};
+/// use zruntime::Unblock;
+///
+/// block_on(async {
+///     let stdin = Cursor::new("first line\nsecond line\n");
+///     let mut lines = BufReader::new(Unblock::new(stdin)).lines();
+///     while let Some(line) = lines.next().await {
+///         println!("{}", line?);
+///     }
 ///
 ///     std::io::Result::Ok(())
 /// })
