@@ -269,11 +269,12 @@ waker lives inside the task's join state instead, saving an allocation per task.
 **Single-threaded, seat-based driving (the `helper` feature)**: on top of `Runtime<Shared>`,
 `driver.rs` gives a runtime made through the per-thread registries (`SharedRuntime::current()`,
 the free `block_on`) a seat: only one thread at a time runs its scheduler and reactor. A thread
-calling `block_on` takes the seat for as long as it is inside the call; when nothing is inside a
-`block_on`, a helper thread takes the seat instead, so that spawned tasks, timers and registered
-I/O still make progress. The helper parks as soon as a `block_on` arrives to take the seat back,
-and puts itself down once it finds nothing left to run, watch or time. A `Runtime::new()` runtime
-never has a seat or a helper: it runs only while some thread is inside `block_on` on it.
+that calls `block_on` takes the seat for as long as the call lasts; when no thread is running
+`block_on` on the runtime, a helper thread takes the seat instead, so that spawned tasks, timers
+and registered I/O still make progress. The helper parks as soon as a thread calls `block_on` to
+take the seat back, and puts itself down once it finds nothing left to run, watch or time. A
+`Runtime::new()` runtime never has a seat or a helper: it runs only while some thread is running
+`block_on` on it.
 
 **Parallelism through several runtimes**: a runtime's scheduler and reactor are only ever run by
 one thread at a time, so all of its tasks share one core, and that stays so: several threads
@@ -338,10 +339,10 @@ no destructor (its `Weak` is in a `ManuallyDrop`, and every writer clears it as 
 driving), so that a `block_on` run from a thread-local's destructor finds it. `spawn` falls back,
 with `helper`, on what `SharedRuntime::current` resolves to, which differs from the record for a
 `Runtime::new` runtime being driven: `driver::driven` leaves a runtime with no seat out. A runtime
-that fallback brings into being inside the free `block_on` is held by that call from then on
-(`driver::current_to_spawn_on`), as nothing else would hold it, in a thread-local of its own
-(`HELD`) that, like the records, has no destructor. Both name the task by `Location::caller()`
-through `scheduler::Name`, which never allocates.
+that fallback brings into being while the thread is running the free `block_on` is held by that
+call from then on (`driver::current_to_spawn_on`), as nothing else would hold it, in a thread-local
+of its own (`HELD`) that, like the records, has no destructor. Both name the task by
+`Location::caller()` through `scheduler::Name`, which never allocates.
 
 **Sockets (the `net` features)**: every socket is an `AsyncIo<T, M>`: the std socket, non-blocking,
 in the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
