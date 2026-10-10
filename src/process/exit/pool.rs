@@ -28,7 +28,7 @@ use windows_sys::Win32::{
 };
 
 #[cfg(target_os = "linux")]
-use crate::Async;
+use crate::AsyncIo;
 use crate::{BlockingWork, Mode, Runtime, process::WAITS, unblock::unblock_on};
 
 /// What tells a [`Child`](crate::process::Child) that its process has exited: see the
@@ -49,7 +49,7 @@ where
     /// has nothing more to tell, and is let go of: a wait after that, for a process that still
     /// cannot be collected, goes on on the pool, whose `waitid` waits for it without spinning.
     #[cfg(target_os = "linux")]
-    Watched(Async<OwnedFd, M>),
+    Watched(AsyncIo<OwnedFd, M>),
     /// Blocking work on a thread of the pool kept for the waits for children.
     Pool {
         /// The blocking work that waits, from the first wait until it has resolved.
@@ -86,10 +86,10 @@ where
             return Ok(Self::pool());
         };
 
-        // Registered as it is, rather than through `Async::new`, which would switch it to
+        // Registered as it is, rather than through `AsyncIo::new`, which would switch it to
         // non-blocking mode first: nothing is ever read from or written to a pidfd here, only its
         // readiness is waited for, so its mode does not matter.
-        Ok(Self::Watched(Async::from_nonblocking(runtime, pidfd)?))
+        Ok(Self::Watched(AsyncIo::from_nonblocking(runtime, pidfd)?))
     }
 
     /// The wait for `child`, a process spawned on `runtime`, to exit, not started yet.

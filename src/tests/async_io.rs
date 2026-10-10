@@ -1,4 +1,4 @@
-//! Tests of [`Async`], the async handle of any source a runtime watches: over loopback sockets,
+//! Tests of [`AsyncIo`], the async handle of any source a runtime watches: over loopback sockets,
 //! which every platform has, and, on unix, over pipes, unix-domain sockets and the standard I/O of
 //! a child process.
 //!
@@ -47,14 +47,14 @@ use ntest::timeout;
 use socket2::SockRef;
 
 use super::{or, yield_now};
-use crate::{Async, Local, LocalRuntime, Mode, Readiness, Runtime, Shared, SharedRuntime};
+use crate::{AsyncIo, Local, LocalRuntime, Mode, Readiness, Runtime, Shared, SharedRuntime};
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local` and
 /// a `shared` test that run its body with the type its parameter names standing for
 /// [`Local`] and for [`Shared`].
 ///
 /// The body is written out once for each flavour rather than once over a mode parameter. A
-/// parameter cannot promise what `Async::new` asks of a source, which depends on the flavour, nor
+/// parameter cannot promise what `AsyncIo::new` asks of a source, which depends on the flavour, nor
 /// what `spawn` asks of a future, so a body that is written out for each meets the bounds of
 /// whichever flavour it runs on. What it uses has to meet both, though: a source that is `Send`
 /// and `Sync`, and, for a task, a future that is `Send`.
@@ -121,7 +121,7 @@ in_both_modes! {
         #[cfg(unix)]
         assert!(!SockRef::from(&near).nonblocking().unwrap());
 
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
 
         #[cfg(unix)]
         assert!(SockRef::from(&near).nonblocking().unwrap());
@@ -143,8 +143,8 @@ in_both_modes! {
         let (non_blocking, _non_blocking_far) = tcp_pair();
         non_blocking.set_nonblocking(true).unwrap();
 
-        let blocking = Async::new_nonblocking(&runtime, blocking).unwrap();
-        let non_blocking = Async::new_nonblocking(&runtime, non_blocking).unwrap();
+        let blocking = AsyncIo::new_nonblocking(&runtime, blocking).unwrap();
+        let non_blocking = AsyncIo::new_nonblocking(&runtime, non_blocking).unwrap();
 
         assert!(!SockRef::from(&blocking).nonblocking().unwrap());
         assert!(SockRef::from(&non_blocking).nonblocking().unwrap());
@@ -158,7 +158,7 @@ in_both_modes! {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
         near.set_nonblocking(true).unwrap();
-        let near = Async::new_nonblocking(&runtime, near).unwrap();
+        let near = AsyncIo::new_nonblocking(&runtime, near).unwrap();
 
         runtime.block_on(async {
             // Written once the read below has had to wait for it.
@@ -180,8 +180,8 @@ in_both_modes! {
     fn read_with_and_write_with_carry_bytes_between_two_asyncs<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
-        let far = Async::new(&runtime, far).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let far = AsyncIo::new(&runtime, far).unwrap();
 
         runtime.block_on(async {
             let (received, ()) = join(read_exactly(&far, 4), async {
@@ -212,8 +212,8 @@ in_both_modes! {
 
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = tcp_pair();
-        let writer = Async::new(&runtime, near).unwrap();
-        let reader = Async::new(&runtime, far).unwrap();
+        let writer = AsyncIo::new(&runtime, near).unwrap();
+        let reader = AsyncIo::new(&runtime, far).unwrap();
         let bytes = pattern(LEN);
         let blocked = Cell::new(0);
 
@@ -249,7 +249,7 @@ in_both_modes! {
     fn an_interrupted_operation_is_made_again_without_waiting<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, _far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
         // Interrupted twice, and then a success that is the number of calls it took so far.
         let calls = Cell::new(0);
         let interrupted_twice = |_: &TcpStream| {
@@ -285,7 +285,7 @@ in_both_modes! {
     fn an_operation_that_fails_resolves_to_its_error<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, _far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
 
         runtime.block_on(async {
             let error = near
@@ -316,7 +316,7 @@ in_both_modes! {
 
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = udp_pair();
-        let receiver = P::new(Async::new(&runtime, near).unwrap());
+        let receiver = P::new(AsyncIo::new(&runtime, near).unwrap());
         let waiting = Arc::new(AtomicUsize::new(0));
         let received = Arc::new(AtomicUsize::new(0));
         let tasks: Vec<_> = (0..TASKS)
@@ -377,7 +377,7 @@ in_both_modes! {
 
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
-        let reader = P::new(Async::new(&runtime, near).unwrap());
+        let reader = P::new(AsyncIo::new(&runtime, near).unwrap());
         let waiting = Arc::new(AtomicUsize::new(0));
         let tasks: Vec<_> = (0..TASKS)
             .map(|_| {
@@ -416,7 +416,7 @@ in_both_modes! {
     fn writable_completes_on_a_fresh_socket<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, _far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
 
         runtime.block_on(near.writable()).unwrap();
     }
@@ -439,7 +439,7 @@ in_both_modes! {
 
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
         // Something to read in the socket that the wait for room is not to be taken for.
         far.write_all(b"!").unwrap();
         let filled = fill(&near);
@@ -465,7 +465,7 @@ in_both_modes! {
     fn a_dropped_read_with_does_not_keep_a_later_one_from_completing<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
 
         runtime.block_on(async {
             let outcome = or(async { Some(read_exactly(&near, 1).await) }, async {
@@ -494,7 +494,7 @@ in_both_modes! {
 
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
-        let writer = P::new(Async::new(&runtime, near).unwrap());
+        let writer = P::new(AsyncIo::new(&runtime, near).unwrap());
         let filled = fill(&writer);
         let waiting = Arc::new(AtomicUsize::new(0));
         let tasks: Vec<_> = (0..TASKS)
@@ -542,7 +542,7 @@ in_both_modes! {
     fn giving_up_one_wait_leaves_the_other_waiting<M, P>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
-        let reader = P::new(Async::new(&runtime, near).unwrap());
+        let reader = P::new(AsyncIo::new(&runtime, near).unwrap());
         let waiting = Arc::new(AtomicUsize::new(0));
         let mut waits = (0..2).map(|_| {
             let (reader, waiting) = (reader.clone(), waiting.clone());
@@ -577,8 +577,8 @@ in_both_modes! {
     fn the_io_traits_carry_bytes_through_an_async<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = tcp_pair();
-        let mut near = Async::new(&runtime, near).unwrap();
-        let mut far = Async::new(&runtime, far).unwrap();
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
+        let mut far = AsyncIo::new(&runtime, far).unwrap();
 
         runtime.block_on(async {
             let mut received = [0; 5];
@@ -601,8 +601,8 @@ in_both_modes! {
     fn reading_through_the_traits_goes_on_to_the_end_of_the_stream<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = tcp_pair();
-        let mut near = Async::new(&runtime, near).unwrap();
-        let mut far = Async::new(&runtime, far).unwrap();
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
+        let mut far = AsyncIo::new(&runtime, far).unwrap();
 
         runtime.block_on(async {
             near.write_all(b"the end").await.unwrap();
@@ -623,8 +623,8 @@ in_both_modes! {
     fn a_reader_and_a_writer_share_one_async_through_references<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = tcp_pair();
-        let near = Async::new(&runtime, near).unwrap();
-        let far = Async::new(&runtime, far).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let far = AsyncIo::new(&runtime, far).unwrap();
         let (mut near_reader, mut near_writer) = (&near, &near);
         let (mut far_reader, mut far_writer) = (&far, &far);
         let (mut at_near, mut at_far) = ([0; 4], [0; 4]);
@@ -655,8 +655,8 @@ in_both_modes! {
     fn vectored_reads_and_writes_carry_every_buffer<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = tcp_pair();
-        let mut near = Async::new(&runtime, near).unwrap();
-        let mut far = Async::new(&runtime, far).unwrap();
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
+        let mut far = AsyncIo::new(&runtime, far).unwrap();
 
         runtime.block_on(async {
             let written = near
@@ -692,7 +692,7 @@ in_both_modes! {
     fn closing_flushes_and_leaves_the_source_open<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
-        let mut near = Async::new(&runtime, near).unwrap();
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
 
         runtime.block_on(async {
             near.write_all(b"one ").await.unwrap();
@@ -721,7 +721,7 @@ in_both_modes! {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, mut far) = tcp_pair();
         let raw = raw_id(&near);
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
         // A read that has to wait, so that a wait of the runtime watches the source before the
         // source is asked for.
         runtime.block_on(async {
@@ -768,8 +768,8 @@ fn into_inner_returns_while_another_thread_waits_on_the_source() {
     let runtime = SharedRuntime::new().unwrap();
     let (near, mut far) = tcp_pair();
     let (trigger_near, mut trigger_far) = tcp_pair();
-    let watched = Async::new(&runtime, near).unwrap();
-    let trigger = Async::new(&runtime, trigger_near).unwrap();
+    let watched = AsyncIo::new(&runtime, near).unwrap();
+    let trigger = AsyncIo::new(&runtime, trigger_near).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
     let waiting = watched.poll_read_with(&mut cx, |mut stream| stream.read(&mut [0]));
     assert!(waiting.is_pending());
@@ -826,11 +826,11 @@ fn a_destructor_run_by_a_wait_takes_other_sources_back() {
     let mut inner = Vec::new();
     for _ in 0..INNER {
         let (near, far) = tcp_pair();
-        inner.push(Async::new(&runtime, near).unwrap());
+        inner.push(AsyncIo::new(&runtime, near).unwrap());
         peers.push(far);
     }
     let (near, _far) = tcp_pair();
-    let outer = Async::new(
+    let outer = AsyncIo::new(
         &runtime,
         TakesBack {
             stream: near,
@@ -847,7 +847,7 @@ fn a_destructor_run_by_a_wait_takes_other_sources_back() {
     let waiting = outer.poll_read_with(&mut cx, |source| (&source.stream).read(&mut [0]));
     assert!(waiting.is_pending());
     let (trigger_near, mut trigger_far) = tcp_pair();
-    let trigger = Async::new(&runtime, trigger_near).unwrap();
+    let trigger = AsyncIo::new(&runtime, trigger_near).unwrap();
     let (inside, entered) = mpsc::channel();
     let driver = {
         let runtime = runtime.clone();
@@ -885,8 +885,8 @@ in_both_modes! {
         let runtime = Runtime::<M>::new().unwrap();
         let (inner, _inner_far) = tcp_pair();
         let (near, _far) = tcp_pair();
-        let inner = Async::new(&runtime, inner).unwrap();
-        let outer = Async::new(
+        let inner = AsyncIo::new(&runtime, inner).unwrap();
+        let outer = AsyncIo::new(
             &runtime,
             AsksToTakeBack {
                 stream: near,
@@ -926,7 +926,7 @@ in_both_modes! {
     fn a_wait_on_a_regular_file_fails<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
-        let file = Async::new(&runtime, file).unwrap();
+        let file = AsyncIo::new(&runtime, file).unwrap();
 
         let refused = runtime.block_on(file.readable()).unwrap_err();
 
@@ -941,7 +941,7 @@ in_both_modes! {
 fn a_local_async_takes_a_source_that_is_neither_send_nor_sync() {
     let runtime = LocalRuntime::new().unwrap();
     let (near, mut far) = tcp_pair();
-    let near = Async::new(&runtime, Unshareable::new(near)).unwrap();
+    let near = AsyncIo::new(&runtime, Unshareable::new(near)).unwrap();
 
     runtime.block_on(async {
         far.write_all(b"in").unwrap();
@@ -971,8 +971,8 @@ in_both_modes! {
     fn the_ends_of_a_pipe_carry_bytes_to_the_end<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (reader, writer) = std::io::pipe().unwrap();
-        let mut reader = Async::new(&runtime, reader).unwrap();
-        let mut writer = Async::new(&runtime, writer).unwrap();
+        let mut reader = AsyncIo::new(&runtime, reader).unwrap();
+        let mut writer = AsyncIo::new(&runtime, writer).unwrap();
         let mut received = Vec::new();
 
         let (read, written) = runtime.block_on(join(reader.read_to_end(&mut received), async {
@@ -1003,7 +1003,7 @@ in_both_modes! {
 
         let runtime = Runtime::<M>::new().unwrap();
         let (reader, writer) = std::io::pipe().unwrap();
-        let writer = Async::new(&runtime, writer).unwrap();
+        let writer = AsyncIo::new(&runtime, writer).unwrap();
 
         runtime.block_on(async {
             let mut writable = pin!(writer.writable());
@@ -1026,8 +1026,8 @@ in_both_modes! {
     fn a_unix_stream_pair_carries_bytes_both_ways<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let (near, far) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut near = Async::new(&runtime, near).unwrap();
-        let mut far = Async::new(&runtime, far).unwrap();
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
+        let mut far = AsyncIo::new(&runtime, far).unwrap();
 
         runtime.block_on(async {
             let mut received = [0; 4];
@@ -1059,7 +1059,7 @@ in_both_modes! {
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
-        let mut stdout = Async::new(&runtime, PipeReader::from(OwnedFd::from(stdout))).unwrap();
+        let mut stdout = AsyncIo::new(&runtime, PipeReader::from(OwnedFd::from(stdout))).unwrap();
 
         let mut output = Vec::new();
         runtime.block_on(stdout.read_to_end(&mut output)).unwrap();
@@ -1082,8 +1082,8 @@ in_both_modes! {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let mut stdin = Async::new(&runtime, PipeWriter::from(OwnedFd::from(stdin))).unwrap();
-        let mut stdout = Async::new(&runtime, PipeReader::from(OwnedFd::from(stdout))).unwrap();
+        let mut stdin = AsyncIo::new(&runtime, PipeWriter::from(OwnedFd::from(stdin))).unwrap();
+        let mut stdout = AsyncIo::new(&runtime, PipeReader::from(OwnedFd::from(stdout))).unwrap();
         let mut output = Vec::new();
 
         let (read, written) = runtime.block_on(join(stdout.read_to_end(&mut output), async {
@@ -1102,7 +1102,7 @@ in_both_modes! {
 }
 
 in_both_modes! {
-    /// A handle prints as the source it wraps does, inside an `Async { io: .. }` of its own, and
+    /// A handle prints as the source it wraps does, inside an `AsyncIo { io: .. }` of its own, and
     /// hands that source out by reference.
     fn an_async_prints_as_its_source_and_hands_it_out<M>() {
         let runtime = Runtime::<M>::new().unwrap();
@@ -1110,11 +1110,11 @@ in_both_modes! {
         let printed = format!("{near:?}");
         let address = near.local_addr().unwrap();
 
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
 
         assert_eq!(
             format!("{near:?}"),
-            format!("Async {{ io: {printed}, .. }}")
+            format!("AsyncIo {{ io: {printed}, .. }}")
         );
         assert_eq!(near.get_ref().local_addr().unwrap(), address);
     }
@@ -1129,7 +1129,7 @@ in_both_modes! {
         let address = near.local_addr().unwrap();
         let raw = raw_id(&near);
 
-        let near = Async::new(&runtime, near).unwrap();
+        let near = AsyncIo::new(&runtime, near).unwrap();
 
         #[cfg(unix)]
         {
@@ -1163,7 +1163,7 @@ fn shared_asyncs_are_send_sync_and_unpin() {
     {
     }
 
-    sent_and_shared::<Async<TcpStream, Shared>>();
+    sent_and_shared::<AsyncIo<TcpStream, Shared>>();
     sent_and_shared::<Readiness<'static, Shared>>();
 }
 
@@ -1177,7 +1177,7 @@ fn local_asyncs_are_unpin() {
     {
     }
 
-    unpin::<Async<TcpStream, Local>>();
+    unpin::<AsyncIo<TcpStream, Local>>();
     unpin::<Readiness<'static, Local>>();
 }
 
@@ -1188,7 +1188,7 @@ where
     M: Mode,
 {
     stream: TcpStream,
-    inner: Mutex<Option<Async<TcpStream, M>>>,
+    inner: Mutex<Option<AsyncIo<TcpStream, M>>>,
     armed: AtomicBool,
     asked: AtomicUsize,
 }
@@ -1238,13 +1238,13 @@ where
 /// goes, saying how many it took back.
 struct TakesBack {
     stream: TcpStream,
-    inner: Vec<Async<TcpStream, Shared>>,
+    inner: Vec<AsyncIo<TcpStream, Shared>>,
     returned: mpsc::Sender<usize>,
 }
 
 impl Drop for TakesBack {
     fn drop(&mut self) {
-        let taken_back = self.inner.drain(..).map(Async::into_inner).count();
+        let taken_back = self.inner.drain(..).map(AsyncIo::into_inner).count();
         // The test may have stopped listening, having failed already.
         let _ = self.returned.send(taken_back);
     }
@@ -1317,7 +1317,7 @@ impl AsSocket for Unshareable {
 }
 
 /// Reads `len` bytes from `io` through `read_with`, however many reads that takes.
-async fn read_exactly<M>(io: &Async<TcpStream, M>, len: usize) -> Vec<u8>
+async fn read_exactly<M>(io: &AsyncIo<TcpStream, M>, len: usize) -> Vec<u8>
 where
     M: Mode,
 {
@@ -1336,7 +1336,7 @@ where
 }
 
 /// Writes all of `bytes` to `io` through `write_with`, however many writes that takes.
-async fn write_everything<M>(io: &Async<TcpStream, M>, bytes: &[u8])
+async fn write_everything<M>(io: &AsyncIo<TcpStream, M>, bytes: &[u8])
 where
     M: Mode,
 {
@@ -1351,7 +1351,7 @@ where
 
 /// Writes to `io` until its socket has no room for more, and says how many bytes that took.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn fill(io: &Async<TcpStream, impl Mode>) -> usize {
+fn fill(io: &AsyncIo<TcpStream, impl Mode>) -> usize {
     let mut stream = io.get_ref();
     let mut filled = 0;
     loop {
