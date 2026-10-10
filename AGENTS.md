@@ -22,9 +22,9 @@ zbus's built-in runtime, which now depends on it.
 
 Two default cargo features, each usable without the other, split the crate. `runtime` is the
 runtime above — `Runtime`, `LocalRuntime`, `SharedRuntime`, tasks, timers, I/O registrations
-and `Async`, the async handle of any source the reactor can watch — and is what needs `rustix`
+and `AsyncIo`, the async handle of any source the reactor can watch — and is what needs `rustix`
 on unix and `windows-sys` on Windows, and `futures-core` and `futures-io` everywhere, for the
-`Stream` impl of its interval timer and the `AsyncRead` and `AsyncWrite` impls of `Async`.
+`Stream` impl of its interval timer and the `AsyncRead` and `AsyncWrite` impls of `AsyncIo`.
 `event` is `Event` and `EventListener`, a notification that tasks wait for, which needs
 no runtime and works under any executor. A crate that only notifies builds zruntime with
 `default-features = false, features = ["event"]` and gets none of the runtime (zbus, whatever
@@ -200,10 +200,10 @@ threads. A target holds benchmarks of one kind only, and a new one goes in the l
 ```
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Readiness,
-│                 # Interest, Async, Source, Task, Sleep, Timeout, TimedOut, Interval,
+│                 # Interest, AsyncIo, Source, Task, Sleep, Timeout, TimedOut, Interval,
 │                 # MissedTickBehavior, and the free spawn and spawn_local (runtime feature),
 │                 # Event, EventListener (event feature), and the free block_on (helper feature)
-├── async_io.rs   # [runtime feature] Async<T, M>: the async handle of any source the reactor
+├── async_io.rs   # [runtime feature] AsyncIo<T, M>: the async handle of any source the reactor
 │                 # can watch
 ├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
 │                 # any executor, with no use of the runtime
@@ -219,7 +219,7 @@ src/
 │                 # with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
 ├── mode.rs       # [runtime feature] The sealed `Mode` trait: what Local/Shared build state from
-├── net/          # [tcp, udp, unix features] Async sockets, each built on `Async<T, M>`:
+├── net/          # [tcp, udp, unix features] Async sockets, each built on `AsyncIo<T, M>`:
 │                 # connect.rs, the non-blocking connect; tcp.rs; udp.rs; unix.rs, the
 │                 # `net::unix` module (unix only)
 ├── process/      # [process feature] Async child processes: mod.rs, Command and Child, and the
@@ -307,20 +307,20 @@ way (a poller that keeps what it watches in the kernel) or only the next one (on
 way, and a source whose registration goes while a wait runs is kept in `Sources::retired`, so
 that its descriptor stays open, until that wait returns.
 
-**`Async`, the handle of a source**: `Async<T, M>` is a `Registration` and the mode's `Ptr<T>`
+**`AsyncIo`, the handle of a source**: `AsyncIo<T, M>` is a `Registration` and the mode's `Ptr<T>`
 (`Rc`/`Arc`) of the source, of which the reactor holds a clone through the sealed
 `IntoSource::source_ptr`; its I/O runs on the `Ptr<T>`. The constructors are written once, generic
-over `M`, with `T: Source<M>`: a sealed public bound, whose per-flavour blanket impls go through
-the private supertrait `IntoSource<M>` (`AsFd`/`AsSocket` and `'static`, and `Send + Sync` for
-`Shared`). A `new` in an `impl` of each flavour instead would make `Async::new` ambiguous (E0034),
+over `M`, with `T: Source<M>`: a sealed public bound, whose per-flavour blanket impls go through the
+private supertrait `IntoSource<M>` (`AsFd`/`AsSocket` and `'static`, and `Send + Sync` for
+`Shared`). A `new` in an `impl` of each flavour instead would make `AsyncIo::new` ambiguous (E0034),
 as the compiler looks the item up before it has chosen the flavour. No `&mut T` is handed out, the
-reactor sharing the pointer, so the I/O traits are there only where `&T` implements
-`Read`/`Write`, for `Async` and `&Async` both. `readable`, `writable`, `read_with` and `write_with`
-wait through `Readiness`, any number of tasks at once; `poll_read_with`, `poll_write_with` and the
-traits keep one waiting task per direction, through `poll_io`. `into_inner` ends the watch and
-takes the source out of the pointer: on `Local` nothing else holds it by then, and on `Shared` it
-yields until a wait under way on another thread returns and the reactor lets go of the source it
-kept for that wait, which it does clear of every lock and before it wakes anyone.
+reactor sharing the pointer, so the I/O traits are there only where `&T` implements `Read`/`Write`,
+for `AsyncIo` and `&AsyncIo` both. `readable`, `writable`, `read_with` and `write_with` wait through
+`Readiness`, any number of tasks at once; `poll_read_with`, `poll_write_with` and the traits keep
+one waiting task per direction, through `poll_io`. `into_inner` ends the watch and takes the source
+out of the pointer: on `Local` nothing else holds it by then, and on `Shared` it yields until a wait
+under way on another thread returns and the reactor lets go of the source it kept for that wait,
+which it does clear of every lock and before it wakes anyone.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
@@ -343,10 +343,10 @@ that fallback brings into being inside the free `block_on` is held by that call 
 (`HELD`) that, like the records, has no destructor. Both name the task by `Location::caller()`
 through `scheduler::Name`, which never allocates.
 
-**Sockets (the `net` features)**: every socket is an `Async<T, M>`: the std socket, non-blocking,
+**Sockets (the `net` features)**: every socket is an `AsyncIo<T, M>`: the std socket, non-blocking,
 in the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
 `Mode::source_ptr`, and the `Registration` its I/O waits on, made by the crate-private
-`Async::from_nonblocking`. The async methods (`accept`, `peek`, `recv`, `send` and the like) wait
+`AsyncIo::from_nonblocking`. The async methods (`accept`, `peek`, `recv`, `send` and the like) wait
 through `read_with` and `write_with`, which wait on `Registration::ready`, so any number of tasks
 wait in them at once. The poll-based traits and the `Incoming` streams go through `poll_read_with`
 and `poll_write_with` instead, and so through `Registration::poll_io`, which keeps one waker per
@@ -390,7 +390,7 @@ neither kind of wait takes the place of the other. A stream implements `futures-
 - `src/runtime.rs`: `Core<M>`, the scheduler + reactor + driving state `Runtime<M>` owns
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
 - `src/reactor.rs`: I/O readiness and timers
-- `src/async_io.rs`: `Async<T, M>`, the async handle of any source the reactor can watch, built on
+- `src/async_io.rs`: `AsyncIo<T, M>`, the async handle of any source the reactor can watch, built on
   a `Registration` and the `Ptr<T>` of the source it shares with the reactor
 - `src/scheduler.rs`: Task storage and polling
 - `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps

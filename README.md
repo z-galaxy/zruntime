@@ -179,14 +179,14 @@ host names: a name is the caller's to look up, which the `unblock` feature can d
 
 ## Other sources
 
-[`Async`] wraps any source the runtime can watch, as smol has in `smol::Async`. On unix that is
+[`AsyncIo`] wraps any source the runtime can watch, as smol has in `smol::Async`. On unix that is
 anything with a file descriptor: a pipe, a terminal, an eventfd, an inotify instance, the standard
 I/O of a child process, or a socket of a type the [`net`] module has none for. On Windows it is a
-socket, and nothing else. [`Async::readable`] and [`Async::writable`] wait for readiness alone, to
-hand the descriptor to a library that does its own I/O, and [`Async::read_with`] and
-[`Async::write_with`] run an operation on the source until it stops reporting `WouldBlock`. Any
+socket, and nothing else. [`AsyncIo::readable`] and [`AsyncIo::writable`] wait for readiness alone,
+to hand the descriptor to a library that does its own I/O, and [`AsyncIo::read_with`] and
+[`AsyncIo::write_with`] run an operation on the source until it stops reporting `WouldBlock`. Any
 number of tasks may wait at once through these four. The `AsyncRead` and `AsyncWrite` traits of
-`futures-io`, which [`Async`] implements wherever `&T` implements `Read` or `Write`, keep one
+`futures-io`, which [`AsyncIo`] implements wherever `&T` implements `Read` or `Write`, keep one
 waiting task per direction instead. [`Runtime::register`] and [`Registration`] are the lower level
 it is built on.
 
@@ -287,7 +287,7 @@ through such a `BufReader`.
 ## Features
 
 * `runtime` (default): [`Runtime`], [`LocalRuntime`] and [`SharedRuntime`], with the tasks,
-  timers and I/O registrations built on them, and [`Async`], the async handle of any source they
+  timers and I/O registrations built on them, and [`AsyncIo`], the async handle of any source they
   can watch; it brings the `futures-core` and `futures-io` crates.
 * `event` (default): [`Event`] and [`EventListener`], which need no runtime.
 * `tracing` (default): the runtime logs through [`tracing`]; a build without it emits no log
@@ -372,15 +372,15 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Runtime::register`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.register
 [`Registration`]: https://docs.rs/zruntime/latest/zruntime/struct.Registration.html
-[`Async`]: https://docs.rs/zruntime/latest/zruntime/struct.Async.html
-[`Async::readable`]:
-    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.readable
-[`Async::writable`]:
-    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.writable
-[`Async::read_with`]:
-    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.read_with
-[`Async::write_with`]:
-    https://docs.rs/zruntime/latest/zruntime/struct.Async.html#method.write_with
+[`AsyncIo`]: https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html
+[`AsyncIo::readable`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html#method.readable
+[`AsyncIo::writable`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html#method.writable
+[`AsyncIo::read_with`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html#method.read_with
+[`AsyncIo::write_with`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html#method.write_with
 [`Event`]: https://docs.rs/zruntime/latest/zruntime/struct.Event.html
 [`EventListener`]: https://docs.rs/zruntime/latest/zruntime/struct.EventListener.html
 [`broadcast`]: https://docs.rs/zruntime/latest/zruntime/broadcast/index.html

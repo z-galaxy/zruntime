@@ -67,7 +67,7 @@ use std::{
 };
 
 #[cfg(feature = "runtime")]
-pub use async_io::Async;
+pub use async_io::AsyncIo;
 #[cfg(feature = "event")]
 pub use event::{Event, EventListener};
 #[cfg(feature = "runtime")]
@@ -556,7 +556,7 @@ impl Runtime<Local> {
     /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), until the registration that watches it is
     /// dropped. A clone of a descriptor, such as `try_clone` makes, is a descriptor of its own.
     ///
-    /// [`Async`] is the handle that registers a source, keeps it and does the I/O for the caller;
+    /// [`AsyncIo`] is the handle that registers a source, keeps it and does the I/O for the caller;
     /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
     /// other way.
     ///
@@ -716,7 +716,7 @@ impl Runtime<Shared> {
     /// [`AlreadyExists`](io::ErrorKind::AlreadyExists), until the registration that watches it is
     /// dropped. A clone of a descriptor, such as `try_clone` makes, is a descriptor of its own.
     ///
-    /// [`Async`] is the handle that registers a source, keeps it and does the I/O for the caller;
+    /// [`AsyncIo`] is the handle that registers a source, keeps it and does the I/O for the caller;
     /// [`Registration::ready`] waits for readiness alone, for a caller that does its I/O some
     /// other way.
     pub fn register<S>(&self, source: S) -> io::Result<Registration<Shared>>

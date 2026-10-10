@@ -9,7 +9,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use crate::{Async, Local, Mode, Runtime};
+use crate::{AsyncIo, Local, Mode, Runtime};
 
 /// A UDP socket, to send datagrams from and to receive them on.
 ///
@@ -73,7 +73,7 @@ pub struct UdpSocket<M = Local>
 where
     M: Mode,
 {
-    io: Async<std::net::UdpSocket, M>,
+    io: AsyncIo<std::net::UdpSocket, M>,
 }
 
 impl<M> UdpSocket<M>
@@ -114,7 +114,7 @@ where
         socket.set_nonblocking(true)?;
 
         Ok(Self {
-            io: Async::from_nonblocking(runtime, socket)?,
+            io: AsyncIo::from_nonblocking(runtime, socket)?,
         })
     }
 

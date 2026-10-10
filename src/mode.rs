@@ -69,7 +69,7 @@ pub enum Shared {}
 impl Mode for Shared {}
 
 /// A source a runtime of the flavour `M` can watch for readiness, and so what an
-/// [`Async`](crate::Async) built on such a runtime can wrap.
+/// [`AsyncIo`](crate::AsyncIo) built on such a runtime can wrap.
 ///
 /// On unix that is anything with a file descriptor (`std::os::fd::AsFd`): a socket, a pipe, a
 /// terminal or an eventfd, say. Linux and Android cannot watch a regular file, a directory or

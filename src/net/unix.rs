@@ -39,7 +39,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use socket2::SockAddr;
 
 use super::{connect, set_nosigpipe};
-use crate::{Async, Local, Mode, Runtime};
+use crate::{AsyncIo, Local, Mode, Runtime};
 
 /// A unix-domain socket server, listening for connections.
 ///
@@ -104,7 +104,7 @@ pub struct UnixListener<M = Local>
 where
     M: Mode,
 {
-    io: Async<std::os::unix::net::UnixListener, M>,
+    io: AsyncIo<std::os::unix::net::UnixListener, M>,
 }
 
 impl<M> UnixListener<M>
@@ -149,7 +149,7 @@ where
         set_nosigpipe(&listener)?;
 
         Ok(Self {
-            io: Async::from_nonblocking(runtime, listener)?,
+            io: AsyncIo::from_nonblocking(runtime, listener)?,
         })
     }
 
@@ -306,7 +306,7 @@ pub struct UnixStream<M = Local>
 where
     M: Mode,
 {
-    io: Async<std::os::unix::net::UnixStream, M>,
+    io: AsyncIo<std::os::unix::net::UnixStream, M>,
 }
 
 impl<M> UnixStream<M>
@@ -404,7 +404,7 @@ where
         set_nosigpipe(&stream)?;
 
         Ok(Self {
-            io: Async::from_nonblocking(runtime, stream)?,
+            io: AsyncIo::from_nonblocking(runtime, stream)?,
         })
     }
 
@@ -620,7 +620,7 @@ pub struct UnixDatagram<M = Local>
 where
     M: Mode,
 {
-    io: Async<std::os::unix::net::UnixDatagram, M>,
+    io: AsyncIo<std::os::unix::net::UnixDatagram, M>,
 }
 
 impl<M> UnixDatagram<M>
@@ -692,7 +692,7 @@ where
         set_nosigpipe(&socket)?;
 
         Ok(Self {
-            io: Async::from_nonblocking(runtime, socket)?,
+            io: AsyncIo::from_nonblocking(runtime, socket)?,
         })
     }
 

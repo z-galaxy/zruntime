@@ -22,7 +22,7 @@ use std::{
 use futures_io::{AsyncRead, AsyncWrite};
 
 #[cfg(unix)]
-use crate::Async;
+use crate::AsyncIo;
 #[cfg(windows)]
 use crate::Unblock;
 use crate::{Local, Mode, Runtime};
@@ -476,9 +476,9 @@ type StderrPipe = std::process::ChildStderr;
 /// A pipe to or from a child, with the I/O of the platform it runs on: the three public pipes are
 /// this, over the type of their own end.
 ///
-/// An `Async` of the runtime on unix, which watches the pipe for readiness.
+/// An `AsyncIo` of the runtime on unix, which watches the pipe for readiness.
 #[cfg(unix)]
-struct Pipe<T, M>(Async<T, M>)
+struct Pipe<T, M>(AsyncIo<T, M>)
 where
     M: Mode;
 
@@ -487,7 +487,7 @@ where
 ///
 /// An `Unblock` on Windows, which runs each operation as blocking work. The pointer a runtime of
 /// the flavour shares its state by is what the type is tied to its flavour through, so that a
-/// pipe built on a local runtime stays on its thread on every platform, as the `Async` of unix
+/// pipe built on a local runtime stays on its thread on every platform, as the `AsyncIo` of unix
 /// does of itself.
 #[cfg(windows)]
 struct Pipe<T, M>(Unblock<T>, PhantomData<M::Ptr<()>>)
@@ -512,7 +512,7 @@ where
         let pipe = T::from(pipe.into());
         rustix::io::ioctl_fionbio(&pipe, true)?;
 
-        Ok(Self(Async::from_nonblocking(runtime, pipe)?))
+        Ok(Self(AsyncIo::from_nonblocking(runtime, pipe)?))
     }
 }
 

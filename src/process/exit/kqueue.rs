@@ -14,7 +14,7 @@ use rustix::{
     process::Pid,
 };
 
-use crate::{Async, Mode, Runtime};
+use crate::{AsyncIo, Mode, Runtime};
 
 /// What tells a [`Child`](crate::process::Child) that its process has exited: see the
 /// [module documentation](super) of what every platform's does.
@@ -27,7 +27,7 @@ where
     /// Nothing is done with it but waiting for it to be readable. The readiness is level-triggered:
     /// the descriptor stays readable once the process has exited, so a wait that is given up on and
     /// made again, or made after the child has been collected, finds it as it was.
-    Watched(Async<OwnedFd, M>),
+    Watched(AsyncIo<OwnedFd, M>),
     /// The process has exited, as far as a kqueue can tell: it was gone before it could be
     /// watched, or the queue has reported its exit already.
     ///
@@ -64,11 +64,11 @@ where
             return Ok(Self::Exited(runtime.clone()));
         }
 
-        // Registered as it is, rather than through `Async::new`, which would switch it to
+        // Registered as it is, rather than through `AsyncIo::new`, which would switch it to
         // non-blocking mode first: nothing is ever read from or written to a queue here, only its
         // readiness is waited for, so its mode does not matter. Apple's platforms turn the switch
         // away anyway (`ENOTTY`), for a kqueue is no device that has a mode of its own.
-        Ok(Self::Watched(Async::from_nonblocking(runtime, queue)?))
+        Ok(Self::Watched(AsyncIo::from_nonblocking(runtime, queue)?))
     }
 
     /// Waits for the process this was made for to exit, without collecting its status.

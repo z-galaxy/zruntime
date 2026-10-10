@@ -19,7 +19,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use socket2::{Domain, SockAddr};
 
 use super::{connect, set_nosigpipe};
-use crate::{Async, Local, Mode, Runtime};
+use crate::{AsyncIo, Local, Mode, Runtime};
 
 /// A TCP socket server, listening for connections.
 ///
@@ -80,7 +80,7 @@ pub struct TcpListener<M = Local>
 where
     M: Mode,
 {
-    io: Async<std::net::TcpListener, M>,
+    io: AsyncIo<std::net::TcpListener, M>,
 }
 
 impl<M> TcpListener<M>
@@ -121,7 +121,7 @@ where
         listener.set_nonblocking(true)?;
 
         Ok(Self {
-            io: Async::from_nonblocking(runtime, listener)?,
+            io: AsyncIo::from_nonblocking(runtime, listener)?,
         })
     }
 
@@ -362,7 +362,7 @@ pub struct TcpStream<M = Local>
 where
     M: Mode,
 {
-    io: Async<std::net::TcpStream, M>,
+    io: AsyncIo<std::net::TcpStream, M>,
     /// Whether the write half of the socket is shut down already, by a close or by a `shutdown`
     /// of it, so that a close finding it so shuts nothing down again.
     ///
@@ -441,7 +441,7 @@ where
         set_nosigpipe(&stream)?;
 
         Ok(Self {
-            io: Async::from_nonblocking(runtime, stream)?,
+            io: AsyncIo::from_nonblocking(runtime, stream)?,
             write_shut: AtomicBool::new(false),
         })
     }

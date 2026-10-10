@@ -1,4 +1,4 @@
-//! [`Async`]: a non-blocking I/O handle that waits for its readiness on a runtime, and the I/O
+//! [`AsyncIo`]: a non-blocking I/O handle that waits for its readiness on a runtime, and the I/O
 //! traits it implements.
 
 #[cfg(all(
@@ -40,38 +40,38 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// file descriptor: a pipe, a terminal, an eventfd, an inotify instance, the standard I/O of a
 /// child process, or a socket of a type the `net` module has none for. On Windows it is a socket,
 /// and nothing else, as that is all the runtime's `select` can watch there. The handle also serves
-/// to give a descriptor to another library that does its own I/O: [`readable`](Async::readable)
-/// and [`writable`](Async::writable) wait for the readiness that library's operation needs, with
+/// to give a descriptor to another library that does its own I/O: [`readable`](AsyncIo::readable)
+/// and [`writable`](AsyncIo::writable) wait for the readiness that library's operation needs, with
 /// no operation of their own.
 ///
 /// The handle runs on the runtime given to the constructor that made it, whose reactor watches
 /// the source from then on. Its operations make progress while some thread is inside
 /// [`Runtime::block_on`] on that runtime, or, on a runtime from `SharedRuntime::current`, while
 /// the helper thread runs it. The handle's type carries the flavour of that runtime: one built on
-/// a [`LocalRuntime`](crate::LocalRuntime) is an `Async<T, Local>`, [`Local`] being
+/// a [`LocalRuntime`](crate::LocalRuntime) is an `AsyncIo<T, Local>`, [`Local`] being
 /// the default, and stays on the thread it was made on; one built on a
-/// [`SharedRuntime`](crate::SharedRuntime) is an `Async<T, Shared>`, which may be sent to, and
+/// [`SharedRuntime`](crate::SharedRuntime) is an `AsyncIo<T, Shared>`, which may be sent to, and
 /// used from, any thread. A shared runtime watches only a source that is `Send` and `Sync`, as
 /// [`Source`] says.
 ///
 /// # Waiting
 ///
-/// [`readable`](Async::readable), [`writable`](Async::writable),
-/// [`read_with`](Async::read_with) and [`write_with`](Async::write_with) let any number of tasks
-/// wait at once, in either direction, each through a shared reference to the handle.
+/// [`readable`](AsyncIo::readable), [`writable`](AsyncIo::writable),
+/// [`read_with`](AsyncIo::read_with) and [`write_with`](AsyncIo::write_with) let any number of
+/// tasks wait at once, in either direction, each through a shared reference to the handle.
 ///
-/// The poll-based [`poll_read_with`](Async::poll_read_with) and
-/// [`poll_write_with`](Async::poll_write_with), and the `AsyncRead` and `AsyncWrite`
+/// The poll-based [`poll_read_with`](AsyncIo::poll_read_with) and
+/// [`poll_write_with`](AsyncIo::poll_write_with), and the `AsyncRead` and `AsyncWrite`
 /// implementations built on them, keep one waiting task per direction instead: where a second task
 /// waits to read, say, it takes the first one's place, which is then never woken. Tasks that share
 /// a direction through them take turns, behind a lock of their own.
 ///
 /// # The I/O traits
 ///
-/// `Async<T, M>` implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
+/// `AsyncIo<T, M>` implements the `AsyncRead` and `AsyncWrite` traits of [`futures-io`], so the
 /// extension traits of [`futures`] read from and write to it. So does a shared reference to it,
-/// `&Async<T, M>`, which lets a reader and a writer share one handle. Both are there wherever `&T`
-/// implements `Read`, for the first trait, and `Write`, for the second, as it does for
+/// `&AsyncIo<T, M>`, which lets a reader and a writer share one handle. Both are there wherever
+/// `&T` implements `Read`, for the first trait, and `Write`, for the second, as it does for
 /// `std::io::PipeReader` and `PipeWriter`, and for std's stream sockets, `TcpStream` and
 /// `UnixStream`: a listener or a datagram socket implements neither.
 ///
@@ -97,12 +97,12 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 /// use std::{io::Write, thread};
 ///
 /// use futures::AsyncReadExt;
-/// use zruntime::{Async, LocalRuntime};
+/// use zruntime::{AsyncIo, LocalRuntime};
 ///
 /// let runtime = LocalRuntime::new()?;
 /// let (reader, mut writer) = std::io::pipe()?;
 /// // The reading end is switched to non-blocking mode, and watched by the runtime from here on.
-/// let mut reader = Async::new(&runtime, reader)?;
+/// let mut reader = AsyncIo::new(&runtime, reader)?;
 ///
 /// // The writer is dropped as the thread ends, which is the end of what the reader reads.
 /// let writing = thread::spawn(move || writer.write_all(b"hello"));
@@ -120,7 +120,7 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mod
 ///
 /// [`futures-io`]: https://docs.rs/futures-io
 /// [`futures`]: https://docs.rs/futures
-pub struct Async<T, M = Local>
+pub struct AsyncIo<T, M = Local>
 where
     M: Mode,
 {
@@ -130,11 +130,11 @@ where
     io: M::Ptr<T>,
 }
 
-impl<T, M> Async<T, M>
+impl<T, M> AsyncIo<T, M>
 where
     M: Mode,
 {
-    /// An `Async` on `runtime` that does its I/O on `io`, which this switches to non-blocking
+    /// An `AsyncIo` on `runtime` that does its I/O on `io`, which this switches to non-blocking
     /// mode.
     ///
     /// On unix the mode belongs to the open file description rather than to a handle on it, so it
@@ -142,7 +142,7 @@ where
     /// standard input, where it is a terminal, is shared with the shell that started the program,
     /// say, and is left in non-blocking mode for it. A caller that must leave the mode alone for
     /// them puts the source in non-blocking mode itself, where it knows that is safe, and makes
-    /// the handle with [`new_nonblocking`](Async::new_nonblocking).
+    /// the handle with [`new_nonblocking`](AsyncIo::new_nonblocking).
     ///
     /// What can fail is the switch to non-blocking mode, and the runtime taking the source under
     /// its watch. A runtime watches a descriptor through one handle at a time, and turns away a
@@ -158,7 +158,7 @@ where
         Self::new_nonblocking(runtime, io)
     }
 
-    /// An `Async` on `runtime` that does its I/O on `io`, as it is.
+    /// An `AsyncIo` on `runtime` that does its I/O on `io`, as it is.
     ///
     /// `io` must be in non-blocking mode already, which is the caller's to see to: each operation
     /// is tried on the source at once, and waits for readiness only once it reports
@@ -210,7 +210,7 @@ where
     /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
     /// task may take the bytes before this one gets to them, so an operation run after the wait
     /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`read_with`](Async::read_with) does. The wait fails where the runtime cannot
+    /// gets one, as [`read_with`](AsyncIo::read_with) does. The wait fails where the runtime cannot
     /// start to watch the source, which the system's poller may refuse to. See
     /// [`Registration::ready`] for what the wait is.
     pub fn readable(&self) -> Readiness<'_, M> {
@@ -223,8 +223,8 @@ where
     /// Any number of tasks may wait at once. Readiness is a hint rather than a promise: another
     /// task may take the room before this one gets to it, so an operation run after the wait
     /// still has to expect [`WouldBlock`](io::ErrorKind::WouldBlock), and to wait again when it
-    /// gets one, as [`write_with`](Async::write_with) does. The wait fails where the runtime cannot
-    /// start to watch the source, which the system's poller may refuse to. See
+    /// gets one, as [`write_with`](AsyncIo::write_with) does. The wait fails where the runtime
+    /// cannot start to watch the source, which the system's poller may refuse to. See
     /// [`Registration::ready`] for what the wait is.
     pub fn writable(&self) -> Readiness<'_, M> {
         self.registration.ready(Interest::Writable)
@@ -235,7 +235,7 @@ where
     /// between.
     ///
     /// Resolves to the first success `operation` returns, and to the first error other than
-    /// `WouldBlock`, or to the error of a wait for readiness, as [`readable`](Async::readable)
+    /// `WouldBlock`, or to the error of a wait for readiness, as [`readable`](AsyncIo::readable)
     /// says. A call the kernel interrupted is made again straight away.
     ///
     /// `operation` must not block: the source is in non-blocking mode so that a call on it
@@ -266,7 +266,7 @@ where
     ///
     /// Resolves to the first success `operation` returns, a partial write included, and to the
     /// first error other than `WouldBlock`, or to the error of a wait for readiness, as
-    /// [`writable`](Async::writable) says. A call the kernel interrupted is made again straight
+    /// [`writable`](AsyncIo::writable) says. A call the kernel interrupted is made again straight
     /// away.
     ///
     /// `operation` must not block: the source is in non-blocking mode so that a call on it
@@ -291,7 +291,7 @@ where
         }
     }
 
-    /// [`read_with`](Async::read_with), polled: what an implementation of a poll-based trait runs
+    /// [`read_with`](AsyncIo::read_with), polled: what an implementation of a poll-based trait runs
     /// its read through.
     ///
     /// Runs `operation` on the source, and where it reports
@@ -308,7 +308,7 @@ where
         self.poll_io(cx, Interest::Readable, operation)
     }
 
-    /// [`write_with`](Async::write_with), polled: what an implementation of a poll-based trait
+    /// [`write_with`](AsyncIo::write_with), polled: what an implementation of a poll-based trait
     /// runs its write through.
     ///
     /// Runs `operation` on the source, and where it reports
@@ -325,14 +325,15 @@ where
         self.poll_io(cx, Interest::Writable, operation)
     }
 
-    /// An `Async` on `runtime` that does its I/O on `io`, as it is: the constructor the sockets of
-    /// the `net` module and the pipes and exit descriptors of the `process` module are built with.
+    /// An `AsyncIo` on `runtime` that does its I/O on `io`, as it is: the constructor the sockets
+    /// of the `net` module and the pipes and exit descriptors of the `process` module are built
+    /// with.
     ///
     /// Those are generic over the flavour, and a [`Source<M>`](Source) bound cannot be met for an
     /// abstract `M`, so this takes what both flavours need of a source instead, `Send` and `Sync`
     /// included. `io` must be in non-blocking mode already, as for
-    /// [`new_nonblocking`](Async::new_nonblocking), unless nothing is ever read from it or written
-    /// to it, and only its readiness is waited for, as for the exit descriptors.
+    /// [`new_nonblocking`](AsyncIo::new_nonblocking), unless nothing is ever read from it or
+    /// written to it, and only its readiness is waited for, as for the exit descriptors.
     #[cfg(any(
         feature = "tcp",
         feature = "udp",
@@ -395,20 +396,20 @@ where
     }
 }
 
-impl<T, M> fmt::Debug for Async<T, M>
+impl<T, M> fmt::Debug for AsyncIo<T, M>
 where
     M: Mode,
     T: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Async")
+        f.debug_struct("AsyncIo")
             .field("io", self.get_ref())
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(unix)]
-impl<T, M> AsFd for Async<T, M>
+impl<T, M> AsFd for AsyncIo<T, M>
 where
     M: Mode,
     T: AsFd,
@@ -419,7 +420,7 @@ where
 }
 
 #[cfg(unix)]
-impl<T, M> AsRawFd for Async<T, M>
+impl<T, M> AsRawFd for AsyncIo<T, M>
 where
     M: Mode,
     T: AsRawFd,
@@ -430,7 +431,7 @@ where
 }
 
 #[cfg(windows)]
-impl<T, M> AsSocket for Async<T, M>
+impl<T, M> AsSocket for AsyncIo<T, M>
 where
     M: Mode,
     T: AsSocket,
@@ -441,7 +442,7 @@ where
 }
 
 #[cfg(windows)]
-impl<T, M> AsRawSocket for Async<T, M>
+impl<T, M> AsRawSocket for AsyncIo<T, M>
 where
     M: Mode,
     T: AsRawSocket,
@@ -451,7 +452,7 @@ where
     }
 }
 
-impl<T, M> AsyncRead for Async<T, M>
+impl<T, M> AsyncRead for AsyncIo<T, M>
 where
     M: Mode,
     for<'a> &'a T: Read,
@@ -474,9 +475,9 @@ where
 }
 
 /// Closing flushes, and leaves the source open: shutting a socket down, or closing the
-/// descriptor, is the source's business, and is done by dropping the `Async` or by taking the
-/// source back with [`into_inner`](Async::into_inner).
-impl<T, M> AsyncWrite for Async<T, M>
+/// descriptor, is the source's business, and is done by dropping the `AsyncIo` or by taking the
+/// source back with [`into_inner`](AsyncIo::into_inner).
+impl<T, M> AsyncWrite for AsyncIo<T, M>
 where
     M: Mode,
     for<'a> &'a T: Write,
@@ -506,7 +507,7 @@ where
     }
 }
 
-impl<T, M> AsyncRead for &Async<T, M>
+impl<T, M> AsyncRead for &AsyncIo<T, M>
 where
     M: Mode,
     for<'a> &'a T: Read,
@@ -529,9 +530,9 @@ where
 }
 
 /// Closing flushes, and leaves the source open: shutting a socket down, or closing the
-/// descriptor, is the source's business, and is done by dropping the `Async` or by taking the
-/// source back with [`into_inner`](Async::into_inner).
-impl<T, M> AsyncWrite for &Async<T, M>
+/// descriptor, is the source's business, and is done by dropping the `AsyncIo` or by taking the
+/// source back with [`into_inner`](AsyncIo::into_inner).
+impl<T, M> AsyncWrite for &AsyncIo<T, M>
 where
     M: Mode,
     for<'a> &'a T: Write,
