@@ -4,7 +4,7 @@
 //! spawns.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
-//! the `core` module, in both flavours wherever the test means the same in each. `Async`, the
+//! the `core` module, in both flavours wherever the test means the same in each. `AsyncIo`, the
 //! async handle of any source a runtime watches, is tested in the `async_io` module, in both
 //! flavours wherever the test means the same in each. An event and its listeners, which need no
 //! runtime, are tested in the `event` module. What the type system is to rule out — a local
@@ -179,7 +179,7 @@ struct LocalHandlesStayOnTheirThread;
 /// {
 /// }
 ///
-/// sent::<zruntime::Async<std::net::TcpStream, zruntime::Local>>();
+/// sent::<zruntime::AsyncIo<std::net::TcpStream, zruntime::Local>>();
 /// ```
 ///
 /// ```compile_fail
@@ -201,7 +201,7 @@ struct LocalHandlesStayOnTheirThread;
 /// {
 /// }
 ///
-/// shared::<zruntime::Async<std::net::TcpStream, zruntime::Local>>();
+/// shared::<zruntime::AsyncIo<std::net::TcpStream, zruntime::Local>>();
 /// ```
 ///
 /// ```compile_fail
@@ -224,7 +224,7 @@ struct LocalHandlesStayOnTheirThread;
 /// {
 /// }
 ///
-/// sent_and_shared::<zruntime::Async<std::net::TcpStream, zruntime::Shared>>();
+/// sent_and_shared::<zruntime::AsyncIo<std::net::TcpStream, zruntime::Shared>>();
 /// sent_and_shared::<zruntime::Readiness<'static, zruntime::Shared>>();
 /// ```
 #[cfg(all(doctest, feature = "runtime"))]
@@ -312,13 +312,13 @@ struct SharedRuntimeTakesSendFuturesOnly;
 
 /// A shared runtime's reactor is waited on by whichever thread drives the runtime, which then
 /// reaches every source it watches, so it watches only a source that may be reached from any
-/// thread. `Async::new` turns away one that is `Send` but not `Sync`, such as a socket beside a
+/// thread. `AsyncIo::new` turns away one that is `Send` but not `Sync`, such as a socket beside a
 /// `Cell`...
 ///
 /// ```compile_fail
 /// use std::cell::Cell;
 ///
-/// use zruntime::{Async, Shared, SharedRuntime};
+/// use zruntime::{AsyncIo, Shared, SharedRuntime};
 ///
 /// # #[cfg(unix)]
 /// # type Socket = std::os::fd::OwnedFd;
@@ -342,8 +342,11 @@ struct SharedRuntimeTakesSendFuturesOnly;
 ///     }
 /// }
 ///
-/// fn watch(runtime: &SharedRuntime, source: NotSync) -> std::io::Result<Async<NotSync, Shared>> {
-///     Async::new(runtime, source)
+/// fn watch(
+///     runtime: &SharedRuntime,
+///     source: NotSync,
+/// ) -> std::io::Result<AsyncIo<NotSync, Shared>> {
+///     AsyncIo::new(runtime, source)
 /// }
 /// ```
 ///
@@ -353,7 +356,7 @@ struct SharedRuntimeTakesSendFuturesOnly;
 /// ```
 /// use std::cell::Cell;
 ///
-/// use zruntime::{Async, Local, LocalRuntime};
+/// use zruntime::{AsyncIo, Local, LocalRuntime};
 ///
 /// # #[cfg(unix)]
 /// # type Socket = std::os::fd::OwnedFd;
@@ -377,8 +380,8 @@ struct SharedRuntimeTakesSendFuturesOnly;
 ///     }
 /// }
 ///
-/// fn watch(runtime: &LocalRuntime, source: NotSync) -> std::io::Result<Async<NotSync, Local>> {
-///     Async::new(runtime, source)
+/// fn watch(runtime: &LocalRuntime, source: NotSync) -> std::io::Result<AsyncIo<NotSync, Local>> {
+///     AsyncIo::new(runtime, source)
 /// }
 /// ```
 #[cfg(all(doctest, feature = "runtime"))]
