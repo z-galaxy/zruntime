@@ -179,11 +179,11 @@ cargo bench --features helper,lock
 # The broadcast channel's benchmark needs the broadcast feature and no runtime
 cargo bench --features broadcast --bench broadcast
 
-# The MPMC channel's benchmark needs the mpmc feature and the default runtime one: its task ids
-# run on a LocalRuntime
+# The MPMC channel's benchmark needs the mpmc feature and no runtime
 cargo bench --features mpmc --bench mpmc
 
-# The channel and the mutex between contending threads need the mpmc and lock features
+# The channel and the mutex between contending threads, and the channel between the tasks of a
+# runtime, need the mpmc and lock features and the default runtime one
 cargo bench --features mpmc,lock --bench contention
 
 # The benchmark of handing work to `unblock` needs the unblock feature and no runtime
@@ -191,9 +191,10 @@ cargo bench --features unblock --bench unblock
 ```
 
 On CodSpeed, `.github/workflows/bench.yml` measures each bench target in one of two jobs: by CPU
-simulation, on a GitHub-hosted runner, the targets that run on one thread and wait on no timer or
-socket; by the clock, on a CodSpeed macro runner, those that wait on timers, sockets or other
-threads. A target holds benchmarks of one kind only, and a new one goes in the list of its job.
+simulation, on a GitHub-hosted runner, the targets that run on one thread, with no runtime; by the
+clock, on a CodSpeed macro runner, those that wait on timers, sockets or other threads, or run on a
+runtime, which waits on its reactor at every turn. A target holds benchmarks of one kind only, and
+a new one goes in the list of its job.
 
 ## Architecture Overview
 

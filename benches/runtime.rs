@@ -1,7 +1,6 @@
 //! What the runtime costs: a timer, watching a socket, and bytes moved through the reactor's
-//! readiness path, within one thread and across two. What spawning a task costs, which waits on no
-//! timer, socket or other thread, and so needs no clock to measure, is in `spawn.rs`. These are
-//! the runtime's share of
+//! readiness path, within one thread and across two. What spawning a task costs is in `spawn.rs`.
+//! These are the runtime's share of
 //! what a connection built on it costs: the ids mirror what zbus measures of its connections (a
 //! connection's setup and teardown, a method call's round trip, a large body, a burst of
 //! concurrent calls to a peer on another thread) with the protocol taken out.
