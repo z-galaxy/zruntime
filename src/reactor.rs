@@ -1052,6 +1052,25 @@ mod tests {
         );
     }
 
+    /// A wait that comes between a `notify` raising the flag and its write to the channel finds
+    /// the flag up and nothing to take out, and is no worse for it.
+    ///
+    /// The flag says a wake-up is on its way, not that it has arrived. A wait that took it for one
+    /// to be read, and read the channel on its say-so, would find it empty and fail where it ought
+    /// to have woken for nothing: the wait reads the channel only where the poll found it readable,
+    /// and the read stops at the first error, an empty channel's included.
+    #[test]
+    #[timeout(15000)]
+    fn a_wake_up_flagged_and_not_yet_written_fails_no_wait() {
+        let runtime = runtime();
+        let remote = &runtime.core.remote;
+        remote.wake_pending.store(true, Ordering::Release);
+
+        runtime.core.reactor.wait(Some(Duration::ZERO)).unwrap();
+
+        assert!(!remote.wake_pending(), "the wait took the flag down");
+    }
+
     #[test]
     #[timeout(15000)]
     fn a_wait_ends_at_the_nearest_deadline() {
