@@ -38,7 +38,7 @@ The runtime, and what runs on it:
 
 What needs no runtime, and works under any executor:
 
-* **Blocking work and files**: [`unblock`], [`Unblock`] and the [`fs`] module.
+* **Blocking work and files**: [`unblock()`], [`Unblock`] and the [`fs`] module.
 * **Events, locks and channels**: [`Event`], the [`lock`] module, [`mpmc`] and [`broadcast`].
 
 The runtime and [`Event`] are on by default. The rest is behind [cargo features](#cargo-features).
@@ -170,7 +170,7 @@ its `unix` module has `UnixListener`, `UnixStream` and `UnixDatagram`. They are 
 from `futures-io`. Connecting never blocks the thread.
 
 The TCP and UDP sockets take socket addresses, not host names. To look up a name without blocking
-the thread, run the lookup with [`unblock`].
+the thread, run the lookup with [`unblock()`].
 
 ## Other I/O sources
 
@@ -197,7 +197,7 @@ For code that does its own polling, [`Runtime::register`] watches a source and r
 
 ## Blocking work and files
 
-[`unblock`] runs blocking work on a pool of threads, and returns a future of its result.
+[`unblock()`] runs blocking work on a pool of threads, and returns a future of its result.
 [`Unblock`] wraps a blocking I/O handle, such as a file or the standard input. It implements the
 async I/O traits by running each operation on that pool.
 
@@ -330,7 +330,7 @@ To race a future against a timer, use [`Runtime::timeout`].
 * `lock`: the [`lock`] module. Implies `event`.
 * `mpmc`: the [`mpmc`] module. Implies `event`.
 * `broadcast`: the [`broadcast`] module. Implies `event`.
-* `unblock`: [`unblock`] and [`Unblock`].
+* `unblock`: [`unblock()`] and [`Unblock`].
 * `fs`: the [`fs`] module. Implies `unblock` and `lock`.
 * `tcp`: `TcpListener` and `TcpStream` in the [`net`] module. Implies `runtime`.
 * `udp`: `UdpSocket` in the [`net`] module. Implies `runtime`.
@@ -407,7 +407,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [the module's example]:
     https://docs.rs/zruntime/latest/zruntime/mpmc/index.html#spreading-work-over-threads
 [`lock`]: https://docs.rs/zruntime/latest/zruntime/lock/index.html
-[`unblock`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
+[`unblock()`]: https://docs.rs/zruntime/latest/zruntime/fn.unblock.html
 [`Unblock`]: https://docs.rs/zruntime/latest/zruntime/struct.Unblock.html
 [`fs`]: https://docs.rs/zruntime/latest/zruntime/fs/index.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
@@ -418,4 +418,4 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`futures::io`]: https://docs.rs/futures/latest/futures/io/index.html
 [`tracing`]: https://docs.rs/tracing
 [zbus]: https://github.com/z-galaxy/zbus
-[MIT]: (LICENSE)
+[MIT]: https://github.com/z-galaxy/zruntime/blob/main/LICENSE
