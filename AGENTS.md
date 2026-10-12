@@ -126,10 +126,16 @@ cargo +nightly fmt --all
 # Lint with clippy
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Lint the pollers no CI runner waits on by default, as CI does
+# Lint the pollers no CI runner waits on by default, as CI does: `poll(2)` on the host and on
+# each unix target (`--target x86_64-unknown-freebsd`, say), and kqueue on macOS
 RUSTFLAGS="--cfg zruntime_poll" cargo clippy --all-targets --all-features -- -D warnings
 RUSTFLAGS="--cfg zruntime_kqueue" cargo clippy --all-targets --all-features \
     --target x86_64-apple-darwin -- -D warnings
+
+# Lint the locks and channels for `wasm32-unknown-unknown`, which the wasm check below runs the
+# locks on, as CI does
+cargo clippy --no-default-features --features lock,broadcast,mpmc \
+    --target wasm32-unknown-unknown -- -D warnings
 
 # Check the runtime, Event, the two channels, the locks, unblock, fs, each family of socket and
 # the child processes built alone: `--all-features` cannot show that each builds without the

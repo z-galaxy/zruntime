@@ -87,7 +87,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, x86_64-pc-windows-gnu, aarch64-linux-android
+          targets: x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, x86_64-pc-windows-gnu, aarch64-linux-android, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Catch common mistakes and unwrap calls
         run: |
@@ -97,11 +97,20 @@ jobs:
           cargo --locked clippy --all-targets --all-features --target x86_64-unknown-netbsd
           cargo --locked clippy --all-targets --all-features --target x86_64-pc-windows-gnu
           cargo --locked clippy --all-targets --all-features --target aarch64-linux-android
-      # The pollers that no runner waits on by default, as the test job runs them.
+      # The pollers that no runner waits on by default, as the test job runs them: `poll(2)`, which
+      # is there on every unix the crate builds for, and kqueue on Apple's platforms.
       - name: Catch common mistakes in the poll(2) and kqueue pollers
         run: |
           RUSTFLAGS="-D warnings --cfg zruntime_poll" cargo --locked clippy --all-targets --all-features
+          RUSTFLAGS="-D warnings --cfg zruntime_poll" cargo --locked clippy --all-targets --all-features --target x86_64-apple-darwin
+          RUSTFLAGS="-D warnings --cfg zruntime_poll" cargo --locked clippy --all-targets --all-features --target x86_64-unknown-freebsd
+          RUSTFLAGS="-D warnings --cfg zruntime_poll" cargo --locked clippy --all-targets --all-features --target x86_64-unknown-netbsd
+          RUSTFLAGS="-D warnings --cfg zruntime_poll" cargo --locked clippy --all-targets --all-features --target aarch64-linux-android
           RUSTFLAGS="-D warnings --cfg zruntime_kqueue" cargo --locked clippy --all-targets --all-features --target x86_64-apple-darwin
+      # The locks and channels build for `wasm32-unknown-unknown` too, where the wasm job runs the
+      # locks: the library alone, as that job builds it.
+      - name: Catch common mistakes in the build for wasm32-unknown-unknown
+        run: cargo --locked clippy --no-default-features --features lock,broadcast,mpmc --target wasm32-unknown-unknown
 
   test:
     runs-on: ${{ matrix.os }}
