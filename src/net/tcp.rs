@@ -1,7 +1,7 @@
 //! The TCP sockets: [`TcpListener`], [`TcpStream`], and the [`Incoming`] stream of the connections
 //! a listener accepts.
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
@@ -16,9 +16,8 @@ use std::{
 
 use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
-use socket2::{Domain, SockAddr};
 
-use super::{connect, set_nosigpipe};
+use super::set_nosigpipe;
 use crate::{AsyncIo, Local, Mode, Runtime};
 
 /// A TCP socket server, listening for connections.
@@ -96,6 +95,10 @@ where
     ///
     /// Fails if the socket cannot be bound to `addr`, or for the reasons
     /// [`from_std`](TcpListener::from_std) fails.
+    ///
+    /// On `wasm32-wasip1` it always fails with [`Unsupported`](io::ErrorKind::Unsupported): that
+    /// target cannot create a socket (see the [module documentation](super)).
+    /// [`from_std`](TcpListener::from_std) takes a listener that the host handed in instead.
     pub fn bind<A>(runtime: &Runtime<M>, addr: A) -> io::Result<Self>
     where
         A: Into<SocketAddr>,
@@ -226,7 +229,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<M> AsFd for TcpListener<M>
 where
     M: Mode,
@@ -236,7 +239,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<M> AsRawFd for TcpListener<M>
 where
     M: Mode,
@@ -388,6 +391,10 @@ where
     /// of sockets (see the [module documentation](super)), and a connect that would exceed the
     /// limit fails.
     ///
+    /// On `wasm32-wasip1` it always fails with [`Unsupported`](io::ErrorKind::Unsupported): that
+    /// target cannot create a socket (see the [module documentation](super)).
+    /// [`from_std`](TcpStream::from_std) takes a stream that the host handed in instead.
+    ///
     /// # Cancel safety
     ///
     /// Dropping the future before it completes gives up the connection attempt.
@@ -395,13 +402,7 @@ where
     where
         A: Into<SocketAddr>,
     {
-        let address = addr.into();
-        let io = connect::connect(
-            runtime,
-            Domain::for_address(address),
-            &SockAddr::from(address),
-        )
-        .await?;
+        let io = connect_io(runtime, addr.into()).await?;
 
         Ok(Self {
             io,
@@ -617,7 +618,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<M> AsFd for TcpStream<M>
 where
     M: Mode,
@@ -627,7 +628,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<M> AsRawFd for TcpStream<M>
 where
     M: Mode,
@@ -733,4 +734,41 @@ where
         // sets right.
         TcpStream::from_std(&self.io.runtime(), stream).map(|stream| (stream, address))
     }
+}
+
+/// A connection to `address`, made and registered on `runtime`: what `TcpStream::connect` waits
+/// for.
+#[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+async fn connect_io<M>(
+    runtime: &Runtime<M>,
+    address: SocketAddr,
+) -> io::Result<AsyncIo<std::net::TcpStream, M>>
+where
+    M: Mode,
+{
+    use socket2::{Domain, SockAddr};
+
+    super::connect::connect(
+        runtime,
+        Domain::for_address(address),
+        &SockAddr::from(address),
+    )
+    .await
+}
+
+/// What `connect_io` is on `wasm32-wasip1`, which cannot create a socket: an error, always.
+///
+/// socket2 does not build for that target, and std fails to make a socket there as well.
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+async fn connect_io<M>(
+    _runtime: &Runtime<M>,
+    _address: SocketAddr,
+) -> io::Result<AsyncIo<std::net::TcpStream, M>>
+where
+    M: Mode,
+{
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "wasm32-wasip1 cannot create a socket",
+    ))
 }

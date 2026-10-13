@@ -1,14 +1,9 @@
 //! [`AsyncIo`]: a non-blocking I/O handle that waits for its readiness on a runtime, and the I/O
 //! traits it implements.
 
-#[cfg(all(
-    unix,
-    any(
-        feature = "tcp",
-        feature = "udp",
-        feature = "unix",
-        feature = "process"
-    )
+#[cfg(any(
+    all(any(unix, target_os = "wasi"), any(feature = "tcp", feature = "udp")),
+    all(unix, any(feature = "unix", feature = "process"))
 ))]
 use std::os::fd::AsFd as AsSource;
 #[cfg(any(unix, target_os = "wasi"))]

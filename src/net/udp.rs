@@ -1,6 +1,6 @@
 //! The UDP socket, [`UdpSocket`].
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
@@ -86,6 +86,9 @@ where
     ///
     /// Fails if the socket cannot be bound to `addr`, or for the reasons
     /// [`from_std`](UdpSocket::from_std) fails.
+    ///
+    /// On `wasm32-wasip1` it always fails with [`Unsupported`](io::ErrorKind::Unsupported): that
+    /// target has no UDP (see the [module documentation](super)).
     pub fn bind<A>(runtime: &Runtime<M>, addr: A) -> io::Result<Self>
     where
         A: Into<SocketAddr>,
@@ -105,6 +108,9 @@ where
     /// Fails if switching to non-blocking mode fails, or if the runtime cannot start watching the
     /// socket. On Windows a runtime watches a limited number of sockets; see the
     /// [module documentation](super).
+    ///
+    /// On `wasm32-wasip1` it always fails with [`Unsupported`](io::ErrorKind::Unsupported), even
+    /// on a socket that the host handed in: that target has no UDP.
     pub fn from_std(runtime: &Runtime<M>, socket: std::net::UdpSocket) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
 
@@ -362,7 +368,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<M> AsFd for UdpSocket<M>
 where
     M: Mode,
@@ -372,7 +378,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<M> AsRawFd for UdpSocket<M>
 where
     M: Mode,
