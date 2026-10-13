@@ -1,4 +1,7 @@
 #![cfg_attr(feature = "runtime", doc = include_str!("../README.md"))]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/z-galaxy/zruntime/ea4838abe428518349fb90cad0e71d097bd65e96/data/logo.png"
+)]
 // The README's examples need the runtime, so a build without it gets an overview of its own.
 #![cfg_attr(
     all(feature = "event", not(feature = "runtime")),

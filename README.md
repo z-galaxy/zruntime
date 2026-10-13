@@ -1,9 +1,23 @@
-# zruntime
+<p align="center">
+  <a href="https://github.com/z-galaxy/zruntime/actions/workflows/rust.yml">
+    <img alt="CI Pipeline Status" src="https://github.com/z-galaxy/zruntime/actions/workflows/rust.yml/badge.svg">
+  </a>
+  <a href="https://docs.rs/zruntime/">
+    <img alt="API Documentation" src="https://docs.rs/zruntime/badge.svg">
+  </a>
+  <a href="https://crates.io/crates/zruntime">
+    <img alt="crates.io" src="https://img.shields.io/crates/v/zruntime">
+  </a>
+  <a href="https://app.codspeed.io/z-galaxy/zruntime?utm_source=badge">
+    <img alt="CodSpeed" src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json">
+  </a>
+</p>
 
-[![CI Pipeline Status](https://github.com/z-galaxy/zruntime/actions/workflows/rust.yml/badge.svg)](https://github.com/z-galaxy/zruntime/actions/workflows/rust.yml)
-[![](https://docs.rs/zruntime/badge.svg)](https://docs.rs/zruntime/)
-[![](https://img.shields.io/crates/v/zruntime)](https://crates.io/crates/zruntime)
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/zruntime?utm_source=badge)
+<p align="center">
+  <img alt="zruntime logo" src="https://raw.githubusercontent.com/z-galaxy/zruntime/ea4838abe428518349fb90cad0e71d097bd65e96/data/logo.svg">
+</p>
+
+<h1 align="center">zruntime</h1>
 
 A simple, single-threaded async runtime for Rust.
 
