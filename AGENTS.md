@@ -56,12 +56,13 @@ of the async tasks, and a future of its outcome, moved here from zbus. It also g
 `zruntime::Unblock`, as smol has `smol::Unblock`: an adapter that gives a blocking I/O handle (a
 file, the standard input, an iterator) `futures-io`'s `AsyncRead`, `AsyncWrite` and `AsyncSeek`
 and `futures-core`'s `Stream` by running each operation on it as such work. Both need no runtime
-and work under any executor.
+and work under any executor. Neither is built on WASI, which cannot start a thread for the work.
 
 A non-default `fs` feature, which implies `unblock` and `lock` and adds no dependency of its own,
 gives `zruntime::fs`: async access to the filesystem in the shape of `std::fs`, as smol has in
 `smol::fs` (the async-fs crate), with each operation run as blocking work through `unblock`, and a
-`File` built on `Unblock`. It needs no runtime and works under any executor.
+`File` built on `Unblock`. It needs no runtime and works under any executor. It is not built on
+WASI, as `unblock` is not.
 
 A non-default `tcp` feature, which implies `runtime` and adds the `socket2` dependency, gives the
 `zruntime::net` module's TCP sockets, `TcpListener` and `TcpStream`, as smol has in `smol::net`.
@@ -72,7 +73,7 @@ sockets through whichever runtime a connection runs on. A non-default `udp` feat
 `runtime` and adds no dependency, gives the module's `UdpSocket`, likewise. A non-default `unix`
 feature, which implies `runtime` and adds the `socket2` dependency and `rustix`'s `net` feature,
 gives the `zruntime::net::unix` module's `UnixListener`, `UnixStream` and `UnixDatagram`, on unix
-only: on Windows it builds nothing.
+only: on Windows and WASI it builds nothing.
 
 A non-default `process` feature, which implies `runtime` and `unblock` and adds `rustix`'s
 `process` feature on unix and `windows-sys`'s `Win32_Foundation` and `Win32_System_Threading`
@@ -93,7 +94,27 @@ once it is dropped, so that a `kill` never reaches a reused process ID. Dropping
 the process running unless `kill_on_drop(true)`; on unix, a still-running child that is let go of
 is reaped from a thread of that same pool unless `reap_on_drop(false)`, so that the waits of a
 program that lets go of, or waits for, many long-running children never fill the pool that the
-rest of the blocking work shares.
+rest of the blocking work shares. It builds nothing on WASI, which has no child
+processes.
+
+The crate builds for WASI, `wasm32-wasip1` and `wasm32-wasip2`, too. There the runtime waits on
+`poll(2)` (`src/poll/generic.rs`), whose `notify` raises a flag that ends the next wait rather than
+writing to a pipe, which WASI lacks, and bounds a wait with no limit by `MAX_TIMEOUT`, which WASI
+would otherwise fail (preview 1) or trap on (preview 2) where nothing is watched. WASI cannot start
+a thread, so nothing in the crate starts one there: `driver::spawn_helper` starts no helper, so a
+runtime with a seat runs only inside `block_on` on it. It checks `cfg!(target_os = "wasi")`, so that
+the threads' side of the code still builds there; no `cfg` tells `wasm32-wasip1-threads` apart, so
+it gets the same treatment. Blocking work would have to run on the thread that polls it, blocking
+every task on that thread, so the `unblock` and `fs` features build nothing on WASI: each of their
+public items has a `WASI` section in its documentation, from the `not_on_wasi!` macro of its module,
+that says why and what could change it. `std::thread::park` returns at once on WASI, so nothing
+reachable there may wait in a park for another thread. The `tcp` and `udp` sockets work on
+preview 2; preview 1 cannot create a socket, so socket2, which does not build for it, is no
+dependency there, and the constructors that create one fail with `Unsupported` (a TCP socket's
+`from_std` takes one the host handed in). Preview 1 has no UDP at all: std fails every operation of
+its UDP socket there, so `UdpSocket::from_std` fails too. The `unix` and `process` features build
+nothing on WASI. `ci/wasi` is a crate of its own that runs the runtime, the shared runtimes and the
+sockets on both previews under wasmtime.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -162,6 +183,18 @@ cargo +nightly miri test --no-default-features --features lock,broadcast,mpmc,un
 cargo build --release --target wasm32-unknown-unknown --manifest-path ci/wasm/Cargo.toml
 node ci/wasm/run.mjs ci/wasm/target/wasm32-unknown-unknown/release/zruntime_wasm_check.wasm
 
+# Lint the builds for WASI, as CI does: with every feature on, and with each alone
+cargo clippy --all-features --target wasm32-wasip1 -- -D warnings
+cargo clippy --all-features --target wasm32-wasip2 -- -D warnings
+cargo clippy --no-default-features --features tcp --target wasm32-wasip1 -- -D warnings
+
+# Run the runtime, the shared runtimes and the sockets on WASI under wasmtime, as CI does: the
+# sockets need preview 2 and the network
+cargo build --target wasm32-wasip1 --manifest-path ci/wasi/Cargo.toml
+cargo build --target wasm32-wasip2 --manifest-path ci/wasi/Cargo.toml
+wasmtime run ci/wasi/target/wasm32-wasip1/debug/zruntime-wasi-check.wasm
+wasmtime run -S inherit-network ci/wasi/target/wasm32-wasip2/debug/zruntime-wasi-check.wasm
+
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
 cargo check --all-features --target x86_64-apple-darwin
@@ -229,18 +262,18 @@ src/
 ├── net/          # [tcp, udp, unix features] Async sockets, each built on `AsyncIo<T, M>`:
 │                 # connect.rs, the non-blocking connect; tcp.rs; udp.rs; unix.rs, the
 │                 # `net::unix` module (unix only)
-├── process/      # [process feature] Async child processes: mod.rs, Command and Child, and the
-│                 # pool that the waits for children run on; stdio.rs, the pipes; exit/, the wait
-│                 # for a child's exit: kqueue.rs (Apple, the BSDs), pool.rs (elsewhere, behind a
-│                 # pidfd on Linux)
+├── process/      # [process feature, not on WASI] Async child processes: mod.rs, Command and
+│                 # Child, and the pool that the waits for children run on; stdio.rs, the pipes;
+│                 # exit/, the wait for a child's exit: kqueue.rs (Apple, the BSDs), pool.rs
+│                 # (elsewhere, behind a pidfd on Linux)
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
 ├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, Timeout and Interval
 ├── poll/         # [runtime feature] The OS pollers: epoll.rs (Linux, Android), kqueue.rs (the
-│                 # BSDs), select.rs (Apple), generic.rs (poll(2), any other unix), windows.rs
-│                 # (Winsock's select); list.rs, the list the last three keep; pipe.rs, the
-│                 # channel that breaks a unix wait
+│                 # BSDs), select.rs (Apple), generic.rs (poll(2), any other unix, and WASI),
+│                 # windows.rs (Winsock's select); list.rs, the list the last three keep;
+│                 # pipe.rs, the channel that breaks a unix wait
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
 │                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime
@@ -281,7 +314,7 @@ that calls `block_on` takes the seat for as long as the call lasts; when no thre
 and registered I/O still make progress. The helper parks as soon as a thread calls `block_on` to
 take the seat back, and puts itself down once it finds nothing left to run, watch or time. A
 `Runtime::new()` runtime never has a seat or a helper: it runs only while some thread is running
-`block_on` on it.
+`block_on` on it. On WASI no helper is ever started, so a runtime with a seat runs that way too.
 
 **Parallelism through several runtimes**: a runtime's scheduler and reactor are only ever run by
 one thread at a time, so all of its tasks share one core, and that stays so: several threads
@@ -375,10 +408,12 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
   into the runtime; nor may `unblock`, which needs neither, or `fs`, which implies `unblock` and
-  `lock`. `tcp`, `udp` and `unix` imply `runtime`, and `unix` builds nothing on Windows. `process`
-  implies `runtime` and `unblock`. CI builds and tests everything with every feature on, tests
-  `runtime` alone (for what `spawn` does without `helper`), and checks `runtime`, `event`,
-  `broadcast`, `mpmc`, `lock`, `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone.
+  `lock`. `unblock` and `fs` build nothing on WASI. `tcp`, `udp` and `unix` imply `runtime`, and
+  `unix` builds nothing on Windows or WASI. `process` implies `runtime` and `unblock`, and builds
+  nothing on WASI. CI builds and tests everything with every feature on, tests `runtime` alone
+  (for what `spawn` does without `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`,
+  `lock`, `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone, on the host and on both
+  WASI targets.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
   Tests, doc examples and benchmarks take `block_on`, the combinators and the I/O extension traits
   from the `futures` dev-dependency (no default features; `std` and `executor`), the crate the

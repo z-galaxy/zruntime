@@ -218,7 +218,8 @@ async I/O traits by running each operation on that pool.
 The [`fs`] module is async filesystem access, in the shape of `std::fs` and like `smol::fs`. It
 runs each operation on the same pool.
 
-None of these needs a runtime: they work under any executor.
+None of these needs a runtime: they work under any executor. None of them is built on WASI, which
+has no thread to run the work on (see [WASI](#wasi)).
 
 ## Child processes
 
@@ -276,9 +277,31 @@ The `helper` feature supports this:
   runtime. From anywhere else, code on a runtime from `SharedRuntime::new` included, it is one
   runtime that the whole process shares.
 * If such a runtime has work and no thread is running `block_on` on it, a helper thread runs it
-  in the meantime. A `block_on` call takes the runtime back for as long as it lasts.
+  in the meantime. A `block_on` call takes the runtime back for as long as it lasts. On WASI,
+  there is no helper thread (see [WASI](#wasi)).
 * [`spawn`] works from any thread. If no shared runtime runs the calling code, the task goes on
   the runtime that [`SharedRuntime::current`] returns.
+
+## WASI
+
+The runtime builds for WASI, `wasm32-wasip1` and `wasm32-wasip2`, where it waits on `poll(2)`.
+WASI cannot start a thread, so there:
+
+* A runtime runs only while a thread is inside `block_on` on it. With the `helper` feature, no
+  helper thread runs its work in between, as [`SharedRuntime::current`] details.
+* [`unblock()`], [`Unblock`] and the [`fs`] module are not built. Their work would have to run on
+  the thread that polls it, which would block every task on that thread until the work is done.
+  The documentation of each item says what could change that.
+
+No `cfg` tells a WASI target with threads, such as `wasm32-wasip1-threads`, from one without, so
+such a target is treated the same way. There, a wake from a thread of the program's own reaches a
+runtime only once the wait the runtime is in ends.
+
+The sockets of the [`net`] module work on `wasm32-wasip2`, where the host grants the network, as
+`wasmtime run -S inherit-network` does. `wasm32-wasip1` cannot create a socket: the TCP sockets
+work there only on one that the host hands in, and the UDP socket not at all. WASI has no
+unix-domain sockets and no child processes, so the `unix` and `process` features build nothing
+there.
 
 ## Combinators
 
@@ -344,12 +367,12 @@ To race a future against a timer, use [`Runtime::timeout`].
 * `lock`: the [`lock`] module. Implies `event`.
 * `mpmc`: the [`mpmc`] module. Implies `event`.
 * `broadcast`: the [`broadcast`] module. Implies `event`.
-* `unblock`: [`unblock()`] and [`Unblock`].
-* `fs`: the [`fs`] module. Implies `unblock` and `lock`.
+* `unblock`: [`unblock()`] and [`Unblock`], except on WASI.
+* `fs`: the [`fs`] module, except on WASI. Implies `unblock` and `lock`.
 * `tcp`: `TcpListener` and `TcpStream` in the [`net`] module. Implies `runtime`.
 * `udp`: `UdpSocket` in the [`net`] module. Implies `runtime`.
 * `unix`: the `net::unix` module, on unix only. Implies `runtime`.
-* `process`: the [`process`] module. Implies `runtime` and `unblock`.
+* `process`: the [`process`] module, except on WASI. Implies `runtime` and `unblock`.
 
 `runtime` and `event` do not depend on each other. A crate that only needs `Event`, or the locks
 and channels built on it, can turn off the default features. It then enables only what it uses,
