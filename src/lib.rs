@@ -51,7 +51,7 @@ mod time;
 #[cfg(feature = "unblock")]
 mod unblock;
 
-#[cfg(all(feature = "runtime", unix))]
+#[cfg(all(feature = "runtime", any(unix, target_os = "wasi")))]
 use std::os::fd::AsFd as AsSource;
 #[cfg(all(feature = "runtime", windows))]
 use std::os::windows::io::AsSocket as AsSource;

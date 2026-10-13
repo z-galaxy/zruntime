@@ -235,7 +235,7 @@ where
 {
     // Read here, once, and never again: a wait watches the descriptor the source lends now, so
     // that it runs no code of the source's. Clear of the lock, as that is somebody else's code.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     let descriptor = std::os::fd::AsRawFd::as_raw_fd(&M::as_source(&source));
     #[cfg(windows)]
     let descriptor = std::os::windows::io::AsRawSocket::as_raw_socket(&M::as_source(&source));

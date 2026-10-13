@@ -78,7 +78,7 @@ socket2 = { version = "0.6.5", optional = true }
 # that the events still reach a subscriber that a thread sets as its default.
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 
-[target."cfg(unix)".dependencies.rustix]
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies.rustix]
 version = "1.1.5"
 default-features = false
 features = ["event", "pipe", "std", "time"]

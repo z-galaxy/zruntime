@@ -1,9 +1,18 @@
-//! The wait on any unix the other pollers do not serve: `poll(2)` over the sources' descriptors and
-//! a pipe that breaks the wait.
+//! The wait on any unix the other pollers do not serve, and on WASI: `poll(2)` over the sources'
+//! descriptors and, on unix, a pipe that breaks the wait.
 //!
 //! `poll(2)` takes the whole set of descriptors on every call, so this poller keeps the list it is
 //! told about and hands it over afresh on each wait.
+//!
+//! WASI has no pipe to break a wait with, so a `notify` there raises a flag that ends the next wait
+//! at once instead. A wait under way is not broken: on a WASI target without threads, there is no
+//! other thread to call `notify` while it runs, and the thread that waits looks at its ready tasks,
+//! its sources and its timers before every wait. A program built for `wasm32-wasip1-threads` that
+//! wakes the runtime's tasks from a thread of its own has each such wake looked at once the wait
+//! under way ends, which may be as late as that wait's timeout.
 
+#[cfg(target_os = "wasi")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, os::fd::BorrowedFd, time::Duration};
 
 use rustix::{
@@ -11,10 +20,18 @@ use rustix::{
     io::Errno,
 };
 
-use super::{Directions, RawSource, Ready, list::List, pipe::Pipe};
+#[cfg(target_os = "wasi")]
+use super::MAX_TIMEOUT;
+#[cfg(unix)]
+use super::pipe::Pipe;
+use super::{Directions, RawSource, Ready, list::List};
 
 pub(crate) struct Poller {
+    #[cfg(unix)]
     wake: Pipe,
+    /// Whether a `notify` came since the last wait started.
+    #[cfg(target_os = "wasi")]
+    woken: AtomicBool,
     list: List,
 }
 
@@ -25,14 +42,28 @@ impl Poller {
 
     pub(crate) fn new() -> io::Result<Self> {
         Ok(Self {
+            #[cfg(unix)]
             wake: Pipe::new()?,
+            #[cfg(target_os = "wasi")]
+            woken: AtomicBool::new(false),
             list: List::new(),
         })
     }
 
     /// Breaks a `wait` in progress or the next one; callable from any thread.
+    ///
+    /// On WASI, only the next one: see the module documentation.
     pub(crate) fn notify(&self) -> io::Result<()> {
-        self.wake.notify()
+        #[cfg(unix)]
+        {
+            self.wake.notify()
+        }
+        #[cfg(target_os = "wasi")]
+        {
+            self.woken.store(true, Ordering::Release);
+
+            Ok(())
+        }
     }
 
     /// Takes the source `key` in, watched for nothing yet.
@@ -72,10 +103,6 @@ impl Poller {
     pub(crate) fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<Ready>> {
         let watched = self.list.snapshot();
         let mut fds = Vec::with_capacity(watched.len() + 1);
-        fds.push(PollFd::from_borrowed_fd(
-            self.wake.read_end(),
-            PollFlags::IN,
-        ));
         for &(_key, descriptor, directions) in &watched {
             let mut flags = PollFlags::empty();
             if directions.readable {
@@ -93,6 +120,21 @@ impl Poller {
             let fd = unsafe { BorrowedFd::borrow_raw(descriptor) };
             fds.push(PollFd::from_borrowed_fd(fd, flags));
         }
+        // After the sources, so that each of them has the same index here as in `watched`.
+        #[cfg(unix)]
+        fds.push(PollFd::from_borrowed_fd(
+            self.wake.read_end(),
+            PollFlags::IN,
+        ));
+        #[cfg(target_os = "wasi")]
+        let timeout = Some(if self.woken.swap(false, Ordering::AcqRel) {
+            Duration::ZERO
+        } else {
+            // WASI turns away a wait with no limit that watches nothing, which on one thread
+            // could never end: preview 1 fails it and preview 2 traps. One bounded instead ends
+            // after `MAX_TIMEOUT`, and the reactor's next wait goes on from there.
+            timeout.unwrap_or(MAX_TIMEOUT)
+        });
         // The reactor bounds every timeout to `MAX_TIMEOUT`, which a `Timespec` holds.
         let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());
         match poll(&mut fds, timeout.as_ref()) {
@@ -100,13 +142,14 @@ impl Poller {
             Err(Errno::INTR) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         }
-        if fds[0].revents().contains(PollFlags::IN) {
+        #[cfg(unix)]
+        if fds[watched.len()].revents().contains(PollFlags::IN) {
             self.wake.drain();
         }
 
         Ok(watched
             .iter()
-            .zip(&fds[1..])
+            .zip(&fds)
             .filter_map(|(&(key, _, _), fd)| {
                 let revents = fd.revents();
                 let hung_up = revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL);

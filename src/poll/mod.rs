@@ -2,7 +2,8 @@
 //!
 //! A poller watches each source in the directions it was last told to, and a wait on it reports
 //! which of them it found ready. Each poller keeps a channel of its own that a `notify` writes to,
-//! so that a wait can be broken from another thread.
+//! so that a wait can be broken from another thread. WASI has no such channel, and no other thread
+//! that could break a wait: its poller keeps a flag instead, which ends the next wait at once.
 //!
 //! What a source is watched for is told to the poller as it changes, rather than on every wait: a
 //! source is added once, as it is registered, its directions are changed from then on, and it is
@@ -19,9 +20,9 @@
 
 // Which poller a platform waits on: epoll on Linux and Android, kqueue on the BSDs, `select(2)` on
 // Apple's platforms, where neither `poll(2)` nor kqueue can watch a terminal, `poll(2)` on any
-// other unix and Winsock's `select` on Windows. A build with `--cfg zruntime_poll` waits on
-// `poll(2)` on every unix, and one with `--cfg zruntime_kqueue` on kqueue on Apple's platforms,
-// which is how CI runs the tests on those two pollers on a platform that has another.
+// other unix and on WASI, and Winsock's `select` on Windows. A build with `--cfg zruntime_poll`
+// waits on `poll(2)` on every unix, and one with `--cfg zruntime_kqueue` on kqueue on Apple's
+// platforms, which is how CI runs the tests on those two pollers on a platform that has another.
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)))]
 mod epoll;
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(zruntime_poll)))]
@@ -55,35 +56,41 @@ mod select;
 #[cfg(all(target_vendor = "apple", not(any(zruntime_poll, zruntime_kqueue))))]
 pub(super) use select::Poller;
 
-#[cfg(all(
-    unix,
-    any(
-        zruntime_poll,
-        not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-            target_vendor = "apple",
-        )),
+#[cfg(any(
+    target_os = "wasi",
+    all(
+        unix,
+        any(
+            zruntime_poll,
+            not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                target_vendor = "apple",
+            )),
+        ),
     ),
 ))]
 mod generic;
-#[cfg(all(
-    unix,
-    any(
-        zruntime_poll,
-        not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-            target_vendor = "apple",
-        )),
+#[cfg(any(
+    target_os = "wasi",
+    all(
+        unix,
+        any(
+            zruntime_poll,
+            not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                target_vendor = "apple",
+            )),
+        ),
     ),
 ))]
 pub(super) use generic::Poller;
@@ -143,9 +150,9 @@ pub(super) struct Ready {
     pub(super) dropped: Directions,
 }
 
-/// The descriptor of a source, as the platform's wait takes it: a file descriptor on unix, and a
-/// socket on Windows.
-#[cfg(unix)]
+/// The descriptor of a source, as the platform's wait takes it: a file descriptor on unix and on
+/// WASI, and a socket on Windows.
+#[cfg(any(unix, target_os = "wasi"))]
 pub(super) type RawSource = std::os::fd::RawFd;
 #[cfg(windows)]
 pub(super) type RawSource = std::os::windows::io::RawSocket;
