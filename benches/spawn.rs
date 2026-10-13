@@ -1,8 +1,10 @@
 //! What spawning a task costs: a hundred tasks spawned on the runtime and awaited, inside one
 //! `zruntime::block_on`, the shape of a program that does all of its work inside one call. The
 //! runtime handle the tasks are spawned on is taken once, in a `block_on` of its own, before the
-//! group starts, as in `runtime.rs`, whose ids, unlike this one, wait on timers, sockets or
-//! another thread, which only the clock can measure.
+//! group starts, as in `runtime.rs`. Measured by the clock, as that file's ids are: the tasks wait
+//! on nothing, but the runtime waits on its reactor at every turn of `block_on`, and the helper
+//! thread that holds the runtime's seat between two `block_on` calls parks and unparks around
+//! each, all in the kernel, which CodSpeed's CPU simulation leaves out.
 
 use std::hint::black_box;
 

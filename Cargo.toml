@@ -142,12 +142,12 @@ required-features = ["broadcast"]
 [[bench]]
 name = "mpmc"
 harness = false
-required-features = ["mpmc", "runtime"]
+required-features = ["mpmc"]
 
 [[bench]]
 name = "contention"
 harness = false
-required-features = ["mpmc", "lock"]
+required-features = ["mpmc", "lock", "runtime"]
 
 [[bench]]
 name = "unblock"
