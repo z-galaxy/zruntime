@@ -55,7 +55,7 @@ body = """
 {% if group is ending_with("Other") %}\
 {% set title = subject | upper_first %}\
 {% else %}\
-{% set title = subject | replace_regex(from="^\\s*(?:✨|🎉|🚸|🐛|🚑|🩹|🥅|⚡|📝|💡|♻|🎨|🚚|🔧|🏗|💄|💥|🔥|🗑|⬆|⬇|📌|➕|➖|🔒|✅|🧪|👷|💚|🧵|🦺|🚩|🚨|💸)\\u{FE0F}?\\s+", to="") %}\
+{% set title = subject | replace_regex(from="^\\s*(?:✨|🎉|🚸|🐛|🚑|🩹|🥅|⚡|📝|💡|♻|🎨|🚚|🔧|🏗|💄|💥|🔥|🗑|⬆|⬇|📌|➕|➖|🔒|✅|🧪|👷|💚|🧵|🦺|🚩|🚨|💸|🍱)\\u{FE0F}?\\s+", to="") %}\
 {% if title == subject %}{% set title = title | upper_first %}{% endif %}\
 {% endif %}\
 - {{ title | trim | trim_end_matches(pat=".") }}\
@@ -114,6 +114,8 @@ commit_parsers = [
     { message = "^💡", group = "<!-- 06 -->📝 Documentation" },
     # Sponsors, named in the README.
     { message = "^💸", group = "<!-- 06 -->📝 Documentation" },
+    # Assets, such as the logo the README and API docs show.
+    { message = "^🍱", group = "<!-- 06 -->📝 Documentation" },
 
     # Refactoring/changes.
     { message = "^♻️", group = "<!-- 03 -->♻️ Changed" },
