@@ -1,0 +1,19 @@
+[package]
+name = "zruntime-wasi-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Runs zruntime on WASI, which has no threads, under wasmtime"
+
+# Its own workspace, so that it never joins zruntime's package or build.
+[workspace]
+
+[dependencies]
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
+zruntime = { path = "../..", default-features = false, features = [
+    "runtime",
+    "event",
+    "helper",
+    "tcp",
+    "udp",
+] }

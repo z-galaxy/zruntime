@@ -196,6 +196,46 @@ jobs:
           cargo --locked build --release --target wasm32-unknown-unknown
           node run.mjs target/wasm32-unknown-unknown/release/zruntime_wasm_check.wasm
 
+  # WASI cannot start a thread, has no pipe, and on preview 1 cannot create a socket, all of which
+  # the runtime does without there. This lints what builds there, each feature alone included, as
+  # the MSRV job checks it on the host, and runs the runtime, its shared runtimes without a helper
+  # and the sockets there under wasmtime: preview 2 with the network, which its sockets need.
+  wasi:
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+          targets: wasm32-wasip1, wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            ci/wasi
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Catch common mistakes in the builds for WASI
+        run: |
+          for target in wasm32-wasip1 wasm32-wasip2; do
+            cargo --locked clippy --all-features --target $target
+            for feature in runtime event broadcast mpmc lock unblock fs tcp udp unix process helper; do
+              cargo --locked clippy --no-default-features --features $feature --target $target
+            done
+          done
+      - name: Run zruntime on WASI
+        working-directory: ci/wasi
+        run: |
+          cargo --locked clippy --target wasm32-wasip1
+          cargo --locked clippy --target wasm32-wasip2
+          cargo --locked build --target wasm32-wasip1
+          cargo --locked build --target wasm32-wasip2
+          wasmtime run target/wasm32-wasip1/debug/zruntime-wasi-check.wasm
+          wasmtime run -S inherit-network target/wasm32-wasip2/debug/zruntime-wasi-check.wasm
+
   doc_build:
     runs-on: ubuntu-latest
     env:
