@@ -152,6 +152,7 @@ use super::{BlockingWork, dispose, unblock};
 /// })
 /// .unwrap();
 /// ```
+#[doc = not_on_wasi!()]
 pub struct Unblock<T> {
     /// Behind a mutex that is never locked: the adapter is only ever used through a mutable
     /// borrow, which reaches what the mutex holds through its `get_mut`. The mutex is there for

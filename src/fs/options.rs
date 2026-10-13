@@ -42,6 +42,7 @@ use crate::unblock;
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
+#[doc = not_on_wasi!()]
 #[derive(Clone, Debug)]
 pub struct OpenOptions(std::fs::OpenOptions);
 

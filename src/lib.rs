@@ -24,7 +24,7 @@ pub mod broadcast;
 mod driver;
 #[cfg(feature = "event")]
 mod event;
-#[cfg(feature = "fs")]
+#[cfg(all(feature = "fs", not(target_os = "wasi")))]
 pub mod fs;
 #[cfg(feature = "lock")]
 pub mod lock;
@@ -48,7 +48,7 @@ mod runtime;
 mod scheduler;
 #[cfg(feature = "runtime")]
 mod time;
-#[cfg(feature = "unblock")]
+#[cfg(all(feature = "unblock", not(target_os = "wasi")))]
 mod unblock;
 
 #[cfg(all(feature = "runtime", any(unix, target_os = "wasi")))]
@@ -85,7 +85,7 @@ use runtime::Core;
 use scheduler::{JoinHandle, Name};
 #[cfg(feature = "runtime")]
 pub use time::{Interval, MissedTickBehavior, Sleep, TimedOut, Timeout};
-#[cfg(feature = "unblock")]
+#[cfg(all(feature = "unblock", not(target_os = "wasi")))]
 pub use unblock::{BlockingWork, Unblock, unblock};
 
 /// Runs `future` to completion on the calling thread, together with the thread's own runtime.

@@ -12,6 +12,11 @@
 //! present only on its own platform. They match the extension traits of std. Code written for
 //! `smol::fs` usually needs only a changed import path.
 //!
+//! # WASI
+//!
+//! The module is not built on WASI. It runs each operation through `std::fs` as blocking work, on a
+//! pool of threads, and WASI cannot start a thread: see the `WASI` section of each item.
+//!
 //! # Dropping a future
 //!
 //! Each function converts its arguments to owned values and submits its work to the pool when its
@@ -83,6 +88,25 @@
 //!
 //! [`async-fs`]: https://crates.io/crates/async-fs
 
+/// The `WASI` section of the documentation of each item of the module, which is not built on WASI.
+macro_rules! not_on_wasi {
+    () => {
+        "\n\n# WASI\n\n\
+        Not available on WASI. The module runs each operation through `std::fs` as blocking \
+        work, on a pool of threads, and `wasm32-wasip1` and `wasm32-wasip2` cannot start a \
+        thread. Running the operation on the thread that polls its future instead would block \
+        that thread, and every task on it, until the operation is done, which is no async at \
+        all.\n\n\
+        A WASI target with threads could run the module as it is, once it can be told apart \
+        from one without: `wasm32-wasip1-threads` can start threads, but no `cfg` sets it apart \
+        from `wasm32-wasip1`. Without threads, the module would need a backend of its own on \
+        WASI's filesystem interface. On `wasm32-wasip2`, that interface reads and writes a file \
+        through streams that can be waited on without blocking, but its operations on paths \
+        and metadata, such as opening a file, reading a directory or renaming, block until \
+        they are done. WASI 0.3 makes those async too."
+    };
+}
+
 mod dir;
 mod file;
 mod options;
@@ -112,6 +136,7 @@ use crate::unblock;
 /// # Errors
 ///
 /// Fails if `path`, or any directory on the way to it, does not exist.
+#[doc = not_on_wasi!()]
 pub async fn canonicalize<P>(path: P) -> io::Result<PathBuf>
 where
     P: AsRef<Path>,
@@ -126,6 +151,7 @@ where
 /// Runs [`std::fs::copy`] as blocking work. An existing `dst` is overwritten. If `dst` is the same
 /// file as `src`, it is likely to be truncated. To copy between two open [`File`]s, use an async
 /// copy that reads and writes through them, such as `futures::io::copy`.
+#[doc = not_on_wasi!()]
 pub async fn copy<P, Q>(src: P, dst: Q) -> io::Result<u64>
 where
     P: AsRef<Path>,
@@ -144,6 +170,7 @@ where
 ///
 /// Fails if the parent of `path` does not exist, or if `path` already exists. To create missing
 /// parents and accept an existing directory, use [`create_dir_all`].
+#[doc = not_on_wasi!()]
 pub async fn create_dir<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -156,6 +183,7 @@ where
 ///
 /// Runs [`std::fs::create_dir_all`] as blocking work. It is not an error if the directory already
 /// exists, or if another thread or process creates it in the meantime.
+#[doc = not_on_wasi!()]
 pub async fn create_dir_all<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -168,6 +196,7 @@ where
 ///
 /// Runs [`std::fs::hard_link`] as blocking work. Both names refer to the same file. Most operating
 /// systems allow this only for two names on the same filesystem.
+#[doc = not_on_wasi!()]
 pub async fn hard_link<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -182,6 +211,7 @@ where
 ///
 /// Runs [`std::fs::metadata`] as blocking work. To read the metadata of a link itself, use
 /// [`symlink_metadata`].
+#[doc = not_on_wasi!()]
 pub async fn metadata<P>(path: P) -> io::Result<Metadata>
 where
     P: AsRef<Path>,
@@ -196,6 +226,7 @@ where
 /// can, and does all of its reading in one piece of work. That makes it faster than opening a
 /// [`File`] and reading that, which takes one piece of work per chunk read. To read text, use
 /// [`read_to_string`].
+#[doc = not_on_wasi!()]
 pub async fn read<P>(path: P) -> io::Result<Vec<u8>>
 where
     P: AsRef<Path>,
@@ -242,6 +273,7 @@ where
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
+#[doc = not_on_wasi!()]
 pub async fn read_dir<P>(path: P) -> io::Result<ReadDir>
 where
     P: AsRef<Path>,
@@ -255,6 +287,7 @@ where
 ///
 /// Runs [`std::fs::read_link`] as blocking work. The path it returns is the one stored in the link.
 /// It can be relative to the directory of the link, and can lead nowhere.
+#[doc = not_on_wasi!()]
 pub async fn read_link<P>(path: P) -> io::Result<PathBuf>
 where
     P: AsRef<Path>,
@@ -270,6 +303,7 @@ where
 /// # Errors
 ///
 /// Fails with [`InvalidData`](io::ErrorKind::InvalidData) if the file is not valid UTF-8.
+#[doc = not_on_wasi!()]
 pub async fn read_to_string<P>(path: P) -> io::Result<String>
 where
     P: AsRef<Path>,
@@ -282,6 +316,7 @@ where
 ///
 /// Runs [`std::fs::remove_dir`] as blocking work. To remove a directory together with its contents,
 /// use [`remove_dir_all`].
+#[doc = not_on_wasi!()]
 pub async fn remove_dir<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -295,6 +330,7 @@ where
 /// Runs [`std::fs::remove_dir_all`] as blocking work. A large directory takes a while to remove,
 /// and the polling thread stays free meanwhile. If the removal fails part of the way, what was not
 /// yet removed stays where it is.
+#[doc = not_on_wasi!()]
 pub async fn remove_dir_all<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -307,6 +343,7 @@ where
 ///
 /// Runs [`std::fs::remove_file`] as blocking work. It removes a name. For a symbolic link, that is
 /// the link and not its target.
+#[doc = not_on_wasi!()]
 pub async fn remove_file<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -323,6 +360,7 @@ where
 /// # Errors
 ///
 /// Fails, for example, if `src` and `dst` are on different filesystems.
+#[doc = not_on_wasi!()]
 pub async fn rename<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -337,6 +375,7 @@ where
 ///
 /// Runs [`std::fs::set_permissions`] as blocking work. To change only some of the permissions,
 /// start from the ones that [`metadata`] reads.
+#[doc = not_on_wasi!()]
 pub async fn set_permissions<P>(path: P, perm: Permissions) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -349,6 +388,7 @@ where
 ///
 /// Runs [`std::fs::symlink_metadata`] as blocking work. To read the metadata of what a link points
 /// at, use [`metadata`].
+#[doc = not_on_wasi!()]
 pub async fn symlink_metadata<P>(path: P) -> io::Result<Metadata>
 where
     P: AsRef<Path>,
@@ -362,6 +402,7 @@ where
 ///
 /// Runs [`std::fs::write`] as blocking work. The bytes are copied when the future is first polled,
 /// because the work runs on another thread and cannot borrow them from the caller.
+#[doc = not_on_wasi!()]
 pub async fn write<P, C>(path: P, contents: C) -> io::Result<()>
 where
     P: AsRef<Path>,

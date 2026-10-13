@@ -5,6 +5,24 @@
 //! write, seek and stream traits by running each operation on it as blocking work.
 //!
 //! Neither needs a runtime. Both work under any executor.
+//!
+//! Neither is built on WASI, where blocking work has no thread to run on: see the `WASI` section
+//! of each item.
+
+/// The `WASI` section of the documentation of each item that runs blocking work on the pool, and
+/// that is therefore not built on WASI.
+macro_rules! not_on_wasi {
+    () => {
+        "\n\n# WASI\n\n\
+        Not available on WASI. Blocking work needs a thread of its own to run on, out of the way \
+        of the thread that polls tasks, and `wasm32-wasip1` and `wasm32-wasip2` cannot start a \
+        thread. Running the work on the thread that polls its future instead would block that \
+        thread, and every task on it, until the work is done, which is no async at all.\n\n\
+        This can change once a WASI target with threads can be told apart from one without: \
+        `wasm32-wasip1-threads` can start threads, but no `cfg` sets it apart from \
+        `wasm32-wasip1`."
+    };
+}
 
 mod io;
 pub(crate) mod pool;
@@ -80,6 +98,7 @@ use pool::Pool;
 ///
 /// assert_eq!(block_on(answer), 42);
 /// ```
+#[doc = not_on_wasi!()]
 pub fn unblock<T>(work: impl FnOnce() -> T + Send + 'static) -> BlockingWork<T>
 where
     T: Send + 'static,
@@ -95,6 +114,7 @@ where
 /// Dropping it before it resolves gives up the wait, not the work. The pool still runs the work to
 /// the end, in its turn if no thread has started it yet. Once the future is dropped or has
 /// resolved, the work no longer keeps the awaiting task or its executor alive.
+#[doc = not_on_wasi!()]
 pub struct BlockingWork<T>(Arc<Mutex<State<T>>>);
 
 impl<T> Future for BlockingWork<T> {

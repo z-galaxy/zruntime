@@ -26,6 +26,7 @@ use crate::{Unblock, unblock};
 /// of blocking work and yields them one by one. So the directory is read slightly ahead of the
 /// entries the stream has yielded, and an entry created after that read may or may not appear. See
 /// [`read_dir()`](super::read_dir) for an example.
+#[doc = not_on_wasi!()]
 pub struct ReadDir(Unblock<std::fs::ReadDir>);
 
 impl ReadDir {
@@ -58,6 +59,7 @@ impl fmt::Debug for ReadDir {
 /// number.
 ///
 /// Cloning an entry is cheap. The clones share the entry of std.
+#[doc = not_on_wasi!()]
 #[derive(Clone)]
 pub struct DirEntry(Arc<std::fs::DirEntry>);
 
@@ -138,6 +140,7 @@ impl super::unix::DirEntryExt for DirEntry {
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
+#[doc = not_on_wasi!()]
 #[derive(Debug, Default)]
 pub struct DirBuilder {
     /// Whether the parents that are missing are made as well, and a directory that is there
