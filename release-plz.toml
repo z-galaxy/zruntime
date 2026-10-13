@@ -14,7 +14,7 @@ semver_check = true
 
 # Bump minor version for non-bugfix commits.
 custom_minor_increment_regex = """\
-^(🎨|⚡️|🔥|✨|💄|🎉|🔒️|⬇️|⬆️|📌|➕|➖|🔧|👽️|💥|♿️|💬|🔊|🔇|🚸|🏗️|🗑️)\
+^(🎨|⚡️|🔥|✨|💄|🎉|🔒️|⬇️|⬆️|📌|➕|➖|🔧|👽️|💥|♿️|💬|🔊|🔇|🚸|🏗️|🗑️|🧵|🚩)\
 """
 
 # PR configuration.
@@ -55,7 +55,7 @@ body = """
 {% if group is ending_with("Other") %}\
 {% set title = subject | upper_first %}\
 {% else %}\
-{% set title = subject | replace_regex(from="^\\s*(?:✨|🎉|🚸|🐛|🚑|🩹|🥅|⚡|📝|💡|♻|🎨|🚚|🔧|🏗|💄|💥|🔥|🗑|⬆|⬇|📌|➕|➖|🔒|✅|🧪|👷|💚)\\u{FE0F}?\\s+", to="") %}\
+{% set title = subject | replace_regex(from="^\\s*(?:✨|🎉|🚸|🐛|🚑|🩹|🥅|⚡|📝|💡|♻|🎨|🚚|🔧|🏗|💄|💥|🔥|🗑|⬆|⬇|📌|➕|➖|🔒|✅|🧪|👷|💚|🧵|🦺|🚩|🚨|💸)\\u{FE0F}?\\s+", to="") %}\
 {% if title == subject %}{% set title = title | upper_first %}{% endif %}\
 {% endif %}\
 - {{ title | trim | trim_end_matches(pat=".") }}\
@@ -103,6 +103,8 @@ commit_parsers = [
     { message = "^🚑", group = "<!-- 07 -->🐛 Fixed" },
     { message = "^🩹", group = "<!-- 07 -->🐛 Fixed" },
     { message = "^🥅", group = "<!-- 07 -->🐛 Fixed" },
+    # Validation: a check that turns bad input away.
+    { message = "^🦺", group = "<!-- 07 -->🐛 Fixed" },
 
     # Performance.
     { message = "^⚡", group = "<!-- 09 -->⚡️ Performance" },
@@ -110,6 +112,8 @@ commit_parsers = [
     # Documentation.
     { message = "^📝", group = "<!-- 06 -->📝 Documentation" },
     { message = "^💡", group = "<!-- 06 -->📝 Documentation" },
+    # Sponsors, named in the README.
+    { message = "^💸", group = "<!-- 06 -->📝 Documentation" },
 
     # Refactoring/changes.
     { message = "^♻️", group = "<!-- 03 -->♻️ Changed" },
@@ -118,6 +122,10 @@ commit_parsers = [
     { message = "^🔧", group = "<!-- 03 -->♻️ Changed" },
     { message = "^🏗️", group = "<!-- 03 -->♻️ Changed" },
     { message = "^💄", group = "<!-- 03 -->♻️ Changed" },
+    # Cargo features.
+    { message = "^🚩", group = "<!-- 03 -->♻️ Changed" },
+    # Concurrency work.
+    { message = "^🧵", group = "<!-- 03 -->♻️ Changed" },
 
     # Breaking changes/removals.
     { message = "^💥", group = "<!-- 01 -->💥 Breaking" },
@@ -141,6 +149,8 @@ commit_parsers = [
     # CI/Build.
     { message = "^👷", group = "<!-- 02 -->👷 CI" },
     { message = "^💚", group = "<!-- 02 -->👷 CI" },
+    # Lints.
+    { message = "^🚨", group = "<!-- 02 -->👷 CI" },
 
     # Everything else.
     { message = ".*", group = "<!-- 08 -->⚙️ Other" },
