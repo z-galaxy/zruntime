@@ -110,6 +110,9 @@ pub use unblock::{BlockingWork, Unblock, unblock};
 /// Do not call this from a task of another executor either. It blocks that executor's thread until
 /// `future` completes, which deadlocks if `future` needs that thread.
 ///
+/// On WASI, there is no helper thread, as no thread can be started: see
+/// [`SharedRuntime::current`] for what that means for the work left when the call returns.
+///
 /// # Panics
 ///
 /// Panics if the calling thread is already running a runtime, for example when called from a task
@@ -140,6 +143,10 @@ where
 ///
 /// So the task goes on the runtime that runs the code spawning it. For a runtime created by
 /// [`Runtime::new`], that is not the runtime `SharedRuntime::current` would return.
+///
+/// On WASI, there is no helper thread, so a task spawned outside any `block_on` runs only once a
+/// `block_on` on its runtime does, and is dropped with that runtime if nothing holds it until then.
+/// The documentation of `SharedRuntime::current` has the details.
 ///
 /// For a future that is not `Send`, use [`spawn_local`] on a local runtime.
 ///
@@ -615,6 +622,34 @@ impl Runtime<Shared> {
     /// there is work and no thread runs the runtime, and stops once nothing is left to run, watch
     /// or time.
     ///
+    /// # On WASI
+    ///
+    /// On WASI, no helper thread is ever started. `wasm32-wasip1` and `wasm32-wasip2` cannot start
+    /// a thread, and a WASI target with threads, such as `wasm32-wasip1-threads`, cannot be told
+    /// apart from them, so it is treated the same way. A runtime from this function then works as
+    /// one from [`Runtime::new`] does: its tasks, timers and I/O make progress only while a thread
+    /// is running `block_on` on that very runtime, and wait for the next such call otherwise. That
+    /// includes the work left on it when a call of the free [`block_on`] returns, and the work
+    /// built outside any `block_on`, which goes on the runtime the process shares rather than
+    /// on the calling thread's own. Awaiting such work from a `block_on` on another runtime
+    /// waits for good.
+    ///
+    /// Nor does a helper keep such a runtime alive: only its handles do, along with the work that
+    /// holds one. Once the last of them is dropped, the runtime is dropped, with whatever work is
+    /// left on it. To have work that outlives a `block_on` call carry on in a later one, keep a
+    /// handle from this function, and call `block_on` on it:
+    ///
+    /// ```
+    /// use zruntime::SharedRuntime;
+    ///
+    /// // Outside any `block_on`, this is the runtime the process shares, and the one the free
+    /// // `spawn` puts the task on. The handle keeps it, and the task, alive.
+    /// let runtime = SharedRuntime::current().unwrap();
+    /// let task = zruntime::spawn(async { 7 });
+    ///
+    /// assert_eq!(runtime.block_on(task).unwrap(), 7);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Fails if the OS cannot provide the resources the reactor of a new runtime needs.
@@ -666,9 +701,10 @@ impl Runtime<Shared> {
     ///
     /// The task runs concurrently with the caller, on the thread that runs [`Runtime::block_on`] on
     /// this runtime. On a runtime from `SharedRuntime::current`, a helper thread runs it when no
-    /// such thread does. Awaiting the [`Task`] returns the output of `future`, or `Err` if the
-    /// runtime lost the task, for example because it panicked. Dropping the [`Task`] cancels the
-    /// task, and [`Task::detach`] lets it run on.
+    /// such thread does, except on WASI, where it waits for one (see `SharedRuntime::current`).
+    /// Awaiting the [`Task`] returns the output of `future`, or `Err` if the runtime lost the task,
+    /// for example because it panicked. Dropping the [`Task`] cancels the task, and
+    /// [`Task::detach`] lets it run on.
     ///
     /// `name` says what the task is for, such as `"socket reader"`. It is only used for
     /// diagnostics, for example in the log message if the task panics. Code that has no runtime
@@ -795,9 +831,9 @@ where
     ///
     /// The runtime keeps a detached task until it ends. The task runs whenever a thread is running
     /// [`Runtime::block_on`] on its runtime. On a runtime from `SharedRuntime::current`, a helper
-    /// thread runs it when no such thread does. A task that never ends is kept, with everything its
-    /// future holds, for as long as the runtime lives. If a helper thread runs it, it keeps that
-    /// helper for the life of the process.
+    /// thread runs it when no such thread does, except on WASI (see `SharedRuntime::current`). A
+    /// task that never ends is kept, with everything its future holds, for as long as the runtime
+    /// lives. If a helper thread runs it, it keeps that helper for the life of the process.
     pub fn detach(self) {
         self.0.detach();
     }
