@@ -38,7 +38,7 @@ pub mod mpmc;
 pub mod net;
 #[cfg(feature = "runtime")]
 mod poll;
-#[cfg(feature = "process")]
+#[cfg(all(feature = "process", not(target_os = "wasi")))]
 pub mod process;
 #[cfg(feature = "runtime")]
 mod reactor;

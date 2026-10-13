@@ -9,7 +9,7 @@
 //! another, never side by side. This one holds the single test: a second would run beside it, and
 //! wait behind the pool that it fills.
 
-#![cfg(feature = "process")]
+#![cfg(all(feature = "process", not(target_os = "wasi")))]
 
 use std::{
     pin::pin,
