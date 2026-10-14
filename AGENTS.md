@@ -58,11 +58,11 @@ file, the standard input, an iterator) `futures-io`'s `AsyncRead`, `AsyncWrite` 
 and `futures-core`'s `Stream` by running each operation on it as such work. Both need no runtime
 and work under any executor. Neither is built on WASI, which cannot start a thread for the work.
 
-A non-default `fs` feature, which implies `unblock` and `lock` and adds no dependency of its own,
-gives `zruntime::fs`: async access to the filesystem in the shape of `std::fs`, as smol has in
-`smol::fs` (the async-fs crate), with each operation run as blocking work through `unblock`, and a
-`File` built on `Unblock`. It needs no runtime and works under any executor. It is not built on
-WASI, as `unblock` is not.
+A non-default `fs` feature, which adds `futures-io` and `futures-core` dependencies, gives
+`zruntime::fs`: async access to the filesystem in the shape of `std::fs`, as smol has in
+`smol::fs` (the async-fs crate), with each operation run on the thread that polls its future, within
+that poll, and a `File` that holds std's file. It needs no runtime and works under any executor. It
+is not built on WASI.
 
 A non-default `tcp` feature, which implies `runtime` and adds the `socket2` dependency, gives the
 `zruntime::net` module's TCP sockets, `TcpListener` and `TcpStream`, as smol has in `smol::net`.
@@ -470,8 +470,8 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
   tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
-  into the runtime; nor may `unblock`, which needs neither, or `fs`, which implies `unblock` and
-  `lock`. `unblock` and `fs` build nothing on WASI. `tcp`, `udp` and `unix` imply `runtime`, and
+  into the runtime; nor may `unblock` or `fs`, which need neither. `unblock` and `fs` build nothing
+  on WASI. `tcp`, `udp` and `unix` imply `runtime`, and
   `unix` builds nothing on Windows or WASI. `process` implies `runtime` and `unblock`, and builds
   nothing on WASI. CI builds and tests everything with every feature on, tests `runtime` alone
   (for what `spawn` does without `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`,

@@ -399,7 +399,7 @@ To race a future against a timer, use [`Runtime::timeout`].
 * `mpmc`: the [`mpmc`] module. Implies `event`.
 * `broadcast`: the [`broadcast`] module. Implies `event`.
 * `unblock`: [`unblock()`] and [`Unblock`], except on WASI.
-* `fs`: the [`fs`] module, except on WASI. Implies `unblock` and `lock`.
+* `fs`: the [`fs`] module, except on WASI.
 * `tcp`: `TcpListener` and `TcpStream` in the [`net`] module. Implies `runtime`.
 * `udp`: `UdpSocket` in the [`net`] module. Implies `runtime`.
 * `unix`: the `net::unix` module, on unix only. Implies `runtime`.
