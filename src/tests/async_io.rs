@@ -15,23 +15,31 @@
 //! tests of what a wait does: that any number of tasks read from one handle or wait for its
 //! readiness at once, that `readable` and `writable` wait for the right direction, and that a wait
 //! given up leaves the others alone. The tests of the `AsyncRead` and `AsyncWrite` traits follow,
-//! through the handle and through a reference to it, then those of `into_inner`, of the kinds of
+//! through the handle and through a reference to it. Then come the tests of how a handle shares the
+//! thread with the other tasks: that a task whose I/O is always ready yields to the next once it
+//! has spent the budget of operations of its poll, through the traits, `read_with` or `write_with`,
+//! however many futures it polls side by side, and so does the future of `block_on`; that a future
+//! polled by something other than a runtime has no budget, while a blocking executor that a task
+//! runs shares the task's, and gets its future done inside `unconstrained`; and that the budget
+//! ends with the poll it was given for. After them come those of `into_inner`, of the kinds of
 //! source a handle takes, and last, of the handle's `Debug`, descriptors and auto traits.
 
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, OwnedSocket};
 use std::{
     cell::Cell,
-    future::poll_fn,
+    future::{Future, poll_fn},
     io::{self, IoSlice, IoSliceMut, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::pin,
     rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    task::{Context, Waker},
+    task::{Context, Poll, Waker},
     thread,
     time::Duration,
 };
@@ -42,12 +50,18 @@ use std::{
     process::{Command, Stdio},
 };
 
-use futures::{AsyncReadExt, AsyncWriteExt, future::join};
+use futures::{
+    AsyncReadExt, AsyncWriteExt,
+    future::{join, select_all},
+};
 use ntest::timeout;
 use socket2::SockRef;
 
 use super::{or, yield_now};
-use crate::{AsyncIo, Local, LocalRuntime, Mode, Readiness, Runtime, Shared, SharedRuntime};
+use crate::{
+    AsyncIo, Local, LocalRuntime, Mode, Readiness, Runtime, Shared, SharedRuntime, coop,
+    unconstrained,
+};
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local` and
 /// a `shared` test that run its body with the type its parameter names standing for
@@ -714,6 +728,303 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// A task that reads a byte at a time through the traits, from a source that always has one
+    /// ready, gives the next task its turn once its budget is spent, not once the last byte is
+    /// read.
+    ///
+    /// Without the budget the reader would never return `Pending`, and the task spawned right after
+    /// it would first run when the reader was done. The look is exact: the reader is stopped by the
+    /// budget and by nothing else, as it has more bytes to read than that.
+    fn a_task_reading_through_the_traits_from_a_ready_source_yields_to_the_next<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(READS);
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
+        let (reads, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let reader = {
+            let reads = reads.clone();
+            runtime.spawn("a reader", async move {
+                for _ in 0..READS {
+                    near.read_exact(&mut [0]).await.unwrap();
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        // Spawned right after the reader, so that it is next in the queue.
+        let looker = runtime.spawn("a looker", note_progress(reads.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            reader.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(reads.load(Ordering::SeqCst), READS);
+    }
+}
+
+in_both_modes! {
+    /// A task that reads a byte at a time through `read_with`, from a source that always has one
+    /// ready, gives the next task its turn once its budget is spent.
+    ///
+    /// `read_with` does not go through `poll_io`, as the traits do, so it spends the budget itself.
+    fn a_task_in_read_with_on_a_ready_source_yields_to_the_next<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(READS);
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let (reads, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let reader = {
+            let reads = reads.clone();
+            runtime.spawn("a reader", async move {
+                for _ in 0..READS {
+                    near.read_with(|mut stream| stream.read(&mut [0])).await.unwrap();
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let looker = runtime.spawn("a looker", note_progress(reads.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            reader.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(reads.load(Ordering::SeqCst), READS);
+    }
+}
+
+in_both_modes! {
+    /// A task that sends a datagram at a time through `write_with`, to a socket that always has
+    /// room for one, gives the next task its turn once its budget is spent.
+    ///
+    /// A datagram socket takes each send at once, and drops what its peer has no room for rather
+    /// than make the sender wait, so that no send finds the socket not ready.
+    fn a_task_in_write_with_on_a_ready_source_yields_to_the_next<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = udp_pair();
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let (writes, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let writer = {
+            let writes = writes.clone();
+            runtime.spawn("a writer", async move {
+                for _ in 0..READS {
+                    near.write_with(|socket| socket.send(&[0])).await.unwrap();
+                    writes.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let looker = runtime.spawn("a looker", note_progress(writes.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            writer.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(writes.load(Ordering::SeqCst), READS);
+    }
+}
+
+in_both_modes! {
+    /// A task that reads a byte at a time through more futures than its budget has operations,
+    /// which `select_all` polls side by side, from a source that always has one ready, gives the
+    /// next task its turn once the budget is spent, as a task with a single reader does.
+    ///
+    /// `select_all` polls each of its readers in turn, within the one poll of the task and with the
+    /// task's waker. The first reader spends the budget, and every reader after it finds the budget
+    /// spent and yields, the last one as well as the second, so that a poll ends with no more reads
+    /// than its budget, however many futures it polls. The first reader is done after as many polls
+    /// as its reads take, and the others never read.
+    fn a_task_that_selects_over_more_readers_than_its_budget_yields_to_the_next<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(2 * READS);
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let (reads, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let reader = {
+            let reads = reads.clone();
+            runtime.spawn("a reader", async move {
+                let (near, reads) = (&near, &reads);
+                let readers = (0..BUDGET + 1).map(|_| {
+                    Box::pin(async move {
+                        for _ in 0..READS {
+                            near.read_with(|mut stream| stream.read(&mut [0]))
+                                .await
+                                .unwrap();
+                            reads.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                });
+                select_all(readers).await;
+            })
+        };
+        let looker = runtime.spawn("a looker", note_progress(reads.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            reader.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(reads.load(Ordering::SeqCst), READS);
+    }
+}
+
+in_both_modes! {
+    /// The future passed to `block_on` has a budget as a task has: a task spawned from it runs
+    /// after its budget's worth of reads, though the future itself would read on to the end.
+    ///
+    /// The tasks run only between the polls of that future, so one that does not return would hold
+    /// them all up.
+    fn the_future_of_block_on_yields_to_the_tasks_after_the_budget<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(READS);
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let (reads, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+
+        runtime.block_on(async {
+            let looker = runtime.spawn("a looker", note_progress(reads.clone(), seen.clone()));
+            for _ in 0..READS {
+                near.read_with(|mut stream| stream.read(&mut [0])).await.unwrap();
+                reads.fetch_add(1, Ordering::SeqCst);
+            }
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(reads.load(Ordering::SeqCst), READS);
+    }
+}
+
+in_both_modes! {
+    /// A future that something other than a runtime polls has no budget: it does all its reads in
+    /// the one poll, whether they go through `read_with` or through the traits.
+    ///
+    /// The poll here is made by the test, with a waker that does nothing, so that a future that
+    /// yielded would be left without anything to wake it.
+    fn a_future_polled_outside_a_runtime_is_never_held_to_the_budget<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(2 * READS);
+        let mut near = AsyncIo::new(&runtime, near).unwrap();
+
+        assert!(reads_in_one_poll(&near, READS));
+
+        let mut reading = pin!(async {
+            for _ in 0..READS {
+                near.read_exact(&mut [0]).await.unwrap();
+            }
+        });
+        let polled = reading.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(polled.is_ready());
+    }
+}
+
+in_both_modes! {
+    /// A blocking executor of another crate that a task runs gets its future done when that
+    /// future runs inside `unconstrained`, though the executor has no budget of its own and
+    /// shares what is left of the task's.
+    ///
+    /// The task reads ten bytes and then has `futures`'s `block_on` read the rest, many times
+    /// more than the budget. That executor polls again at once whenever a read that yields wakes
+    /// it, inside the same poll of the task, so a read that found the budget spent would be
+    /// turned away for good. Inside `unconstrained` none is, and the task holds the thread until
+    /// the last byte is read.
+    fn a_blocking_executor_that_a_task_runs_gets_its_future_done<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(READS);
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let task = runtime.spawn("a task", async move {
+            read_ready(&near, 10).await;
+            futures::executor::block_on(unconstrained(read_ready(&near, READS - 10)));
+
+            near
+        });
+
+        let near = runtime.block_on(task).unwrap();
+
+        // Every byte was read: the next read finds none.
+        let read = near.get_ref().peek(&mut [0]);
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+}
+
+in_both_modes! {
+    /// The budget goes with the poll it was given for: a thread that has been through a task, the
+    /// future of `block_on`, a task that panicked or a future of `block_on` that did runs a future
+    /// of someone else's to its end in one poll again.
+    ///
+    /// Each of them spends a part of the budget first, so that one left behind would show as a
+    /// future that yields before the end of its reads.
+    fn the_budget_is_gone_once_the_poll_it_was_given_for_is_over<M, P>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair_holding(4 * READS);
+        let near = P::new(AsyncIo::new(&runtime, near).unwrap());
+
+        runtime.block_on(async {
+            let reader = {
+                let near = near.clone();
+                runtime.spawn("a reader", async move { read_ready(&near, 10).await })
+            };
+            reader.await.unwrap();
+            read_ready(&near, 10).await;
+        });
+        assert!(reads_in_one_poll(&near, READS));
+
+        let panicking = {
+            let near = near.clone();
+            runtime.spawn("a task that panics", async move {
+                read_ready(&near, 10).await;
+                panic!("the task panicked on purpose");
+            })
+        };
+        assert!(runtime.block_on(panicking).is_err());
+        assert!(reads_in_one_poll(&near, READS));
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                read_ready(&near, 10).await;
+                panic!("the future panicked on purpose");
+            })
+        }));
+        assert!(panicked.is_err());
+        assert!(reads_in_one_poll(&near, READS));
+    }
+}
+
+in_both_modes! {
+    /// Only an operation that completes spends the budget: a call that finds the source not ready
+    /// costs nothing however many times over it is made, while one that fails for another reason
+    /// costs as much as one that succeeds.
+    ///
+    /// The calls are made through `poll_read_with` in a poll of the test's own, which has a budget
+    /// the way a task has.
+    fn only_an_operation_that_completes_spends_budget<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair();
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+
+        coop::budgeted(|| {
+            for _ in 0..2 * BUDGET {
+                let polled = near
+                    .poll_read_with(&mut cx, |_| Err::<(), _>(io::ErrorKind::WouldBlock.into()));
+                assert!(polled.is_pending());
+            }
+
+            for _ in 0..BUDGET {
+                let polled = near
+                    .poll_read_with(&mut cx, |_| Err::<(), _>(io::ErrorKind::BrokenPipe.into()));
+                assert!(matches!(polled, Poll::Ready(Err(_))));
+            }
+            // The budget is spent: this yields, and the operation does not run.
+            let polled = near.poll_read_with(&mut cx, |_| -> io::Result<()> {
+                unreachable!("an operation does not run once the budget is spent")
+            });
+            assert!(polled.is_pending());
+        });
+    }
+}
+
+in_both_modes! {
     /// `into_inner` hands the source back: the same descriptor it was made from, still in
     /// non-blocking mode, and as good as it was, though a read of the handle was left waiting
     /// for the runtime to wake it.
@@ -1264,6 +1575,39 @@ impl AsSocket for TakesBack {
     }
 }
 
+/// How many operations the tests of the budget make: a good many times what one poll may complete,
+/// and few enough for any socket to hold the bytes without making the writer wait.
+pub(super) const READS: usize = 1024;
+
+/// How many operations a poll may complete, as a count.
+pub(super) const BUDGET: usize = coop::BUDGET as usize;
+
+const _: () = assert!(READS > 2 * BUDGET);
+
+/// Notes in `seen` how far `count` has got by the time this runs, which is the first time its task
+/// is polled.
+pub(super) async fn note_progress(count: Arc<AtomicUsize>, seen: Arc<AtomicUsize>) {
+    seen.store(count.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// A connected pair of TCP streams over loopback, as [`tcp_pair`] makes them, whose first end
+/// already holds `len` bytes that the second end wrote.
+///
+/// This returns only once the first end has all of them. A write on loopback does not promise that
+/// its peer can read the bytes at once on every platform, and a read that finds none yet would
+/// spoil the run of reads that never wait, which the tests of the budget are about.
+pub(super) fn tcp_pair_holding(len: usize) -> (TcpStream, TcpStream) {
+    let (near, mut far) = tcp_pair();
+    far.write_all(&pattern(len)).unwrap();
+    // Both are blocking, so a peek waits for at least a byte and returns what has come so far.
+    let mut peeked = vec![0; len];
+    while near.peek(&mut peeked).unwrap() < len {
+        thread::yield_now();
+    }
+
+    (near, far)
+}
+
 /// How long a test lets a task wait before the other one does what the first waits for: long
 /// enough for the waiting to have begun, and short enough to cost the suite next to nothing.
 ///
@@ -1344,6 +1688,34 @@ where
     while sent < bytes.len() {
         sent += io
             .write_with(|mut stream| stream.write(&bytes[sent..]))
+            .await
+            .unwrap();
+    }
+}
+
+/// Whether `reads` reads from `io`, which holds the bytes for them, complete in one poll made by
+/// the caller, which no runtime is part of.
+fn reads_in_one_poll<M>(io: &AsyncIo<TcpStream, M>, reads: usize) -> bool
+where
+    M: Mode,
+{
+    let mut reading = pin!(read_ready(io, reads));
+
+    reading
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready()
+}
+
+/// Reads `reads` bytes from `io` one at a time through `read_with`.
+///
+/// A source that holds that many bytes never makes a read wait.
+async fn read_ready<M>(io: &AsyncIo<TcpStream, M>, reads: usize)
+where
+    M: Mode,
+{
+    for _ in 0..reads {
+        io.read_with(|mut stream| stream.read(&mut [0]))
             .await
             .unwrap();
     }

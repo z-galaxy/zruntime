@@ -26,6 +26,7 @@ use std::os::android::net::SocketAddrExt;
 use std::os::linux::net::SocketAddrExt;
 use std::{
     fmt,
+    future::poll_fn,
     io::{self, Read},
     net::Shutdown,
     os::{
@@ -43,7 +44,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use socket2::SockAddr;
 
 use super::{connect, set_nosigpipe};
-use crate::{AsyncIo, Local, Mode, Runtime};
+use crate::{AsyncIo, Local, Mode, Runtime, coop};
 
 /// A unix-domain socket server, listening for connections.
 ///
@@ -753,14 +754,21 @@ where
     {
         let path = path.as_ref();
 
-        // Not a readiness wait: see `SEND_TO_INTERVAL`.
+        // Not a readiness wait: see `SEND_TO_INTERVAL`. For that reason the send does not go
+        // through `AsyncIo`, which counts the operations it runs against the budget of the poll
+        // (see the `coop` module), so this counts its own.
         loop {
+            poll_fn(coop::poll_proceed).await;
             match self.io.get_ref().send_to(buf, path) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.io.runtime().sleep(SEND_TO_INTERVAL).await;
                 }
-                result => return result,
+                result => {
+                    coop::spend();
+
+                    return result;
+                }
             }
         }
     }

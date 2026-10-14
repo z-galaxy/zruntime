@@ -16,9 +16,9 @@
 //! peer that has gone, then the ways of sharing a stream and what a call that has to wait does: a
 //! write waits for room and a read for bytes, without spinning, and giving up an `accept` loses no
 //! connection. After the tests of `incoming` come those of the datagram sockets, a `send_to` that
-//! finds the receiver's queue full among them, of a shared runtime's sockets crossing threads,
-//! serving tasks and having several of them wait at once, and last, of the sockets' `Debug`,
-//! descriptors and auto traits.
+//! finds the receiver's queue full and one that finds the budget of its poll spent among them, of
+//! a shared runtime's sockets crossing threads, serving tasks and having several of them wait at
+//! once, and last, of the sockets' `Debug`, descriptors and auto traits.
 
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
@@ -26,7 +26,7 @@ use std::os::android::net::SocketAddrExt;
 use std::os::linux::net::SocketAddrExt;
 use std::{
     cell::Cell,
-    future::poll_fn,
+    future::{Future, poll_fn},
     io::{self, Read, Write},
     net::Shutdown,
     os::fd::AsRawFd,
@@ -36,7 +36,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    task::Poll,
+    task::{Context, Poll},
     thread,
 };
 
@@ -54,7 +54,9 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use super::{DELAY, after, counting_polls, in_both_modes, pattern};
 use crate::{
     Local, Mode, Runtime, Shared, SharedRuntime,
+    coop::{self, budgeted, spend},
     net::unix::{Incoming, UnixDatagram, UnixListener, UnixStream},
+    tests::core::counting_waker,
 };
 
 in_both_modes! {
@@ -1179,6 +1181,51 @@ in_both_modes! {
 
             assert_eq!(sent.unwrap(), 4);
             assert!(polls.get() <= 20, "the `send_to` was polled {} times", polls.get());
+        });
+    }
+}
+
+in_both_modes! {
+    /// A `send_to` spends the budget of the poll it is made in, and once that is gone it wakes its
+    /// task and sends nothing, as an operation that goes through `AsyncIo` does.
+    ///
+    /// It does not go through `AsyncIo`, as it waits for room on a timer and not for readiness,
+    /// so it counts for itself. The poll here is the test's own, which has a budget the way a
+    /// task's poll has, spent down to one operation: the send that takes it completes, and the
+    /// one after it yields. The datagram of that one is sent, in a poll with a budget of its own,
+    /// only after the receiver has been shown to hold the first alone.
+    fn a_send_to_spends_the_budget_and_yields_once_it_is_gone<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("budget");
+        let path = directory.socket("receiver");
+        let receiver = UnixDatagram::bind(&runtime, &path).unwrap();
+        let sender = UnixDatagram::unbound(&runtime).unwrap();
+        let (woken, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        budgeted(|| {
+            for _ in 1..coop::BUDGET {
+                spend();
+            }
+
+            let mut first = pin!(sender.send_to(b"first", &path));
+            assert!(matches!(first.as_mut().poll(&mut cx), Poll::Ready(Ok(5))));
+            assert_eq!(woken.count(), 0);
+
+            let mut second = pin!(sender.send_to(b"second", &path));
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(woken.count(), 1);
+        });
+
+        runtime.block_on(async {
+            let mut received = [0; 16];
+            let len = receiver.recv(&mut received).await.unwrap();
+            assert_eq!(&received[..len], b"first");
+            assert!(poll_immediate(receiver.recv(&mut received)).await.is_none());
+
+            assert_eq!(sender.send_to(b"second", &path).await.unwrap(), 6);
+            let len = receiver.recv(&mut received).await.unwrap();
+            assert_eq!(&received[..len], b"second");
         });
     }
 }

@@ -2095,7 +2095,7 @@ where
 }
 
 /// A counter and the waker that counts into it.
-fn counting_waker() -> (Arc<Counter>, Waker) {
+pub(super) fn counting_waker() -> (Arc<Counter>, Waker) {
     let counter = Arc::new(Counter::default());
     let waker = Waker::from(counter.clone());
 
@@ -2104,11 +2104,11 @@ fn counting_waker() -> (Arc<Counter>, Waker) {
 
 /// A waker that counts how often it has been woken.
 #[derive(Default)]
-struct Counter(AtomicUsize);
+pub(super) struct Counter(AtomicUsize);
 
 impl Counter {
     /// How often this waker has been woken.
-    fn count(&self) -> usize {
+    pub(super) fn count(&self) -> usize {
         self.0.load(Ordering::Acquire)
     }
 }

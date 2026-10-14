@@ -4,22 +4,27 @@
 //! spawns.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
-//! the `core` module, in both flavours wherever the test means the same in each. `AsyncIo`, the
-//! async handle of any source a runtime watches, is tested in the `async_io` module, in both
-//! flavours wherever the test means the same in each. An event and its listeners, which need no
-//! runtime, are tested in the `event` module. What the type system is to rule out — a local
-//! runtime's handles leaving their thread, a shared runtime taking a future or a source that could
-//! not follow it to another, a lock or a channel handing its value or its messages to a thread
-//! that could not own them, the future of blocking work doing the same with the value it resolves
-//! to, and an adapter of a blocking handle with its handle — can only be shown by code that does
-//! not compile, so it is shown here, by the doc tests of the items below. The broadcast channel,
-//! the MPMC channel and the locks, built on the event, are tested in the `broadcast`, `mpmc` and
-//! `lock` modules. Blocking work, which needs neither the runtime nor the event, is tested in the
-//! `unblock` module, and the filesystem access of the `fs` module, built on it, in the `fs`
-//! module. The sockets of the `net` module are tested in the `net` module, one family of them to a
-//! module there, in both flavours wherever the test means the same in each. The child processes of
-//! the `process` module, built on a runtime and on blocking work, are tested in the `process`
-//! module, in both flavours wherever the test means the same in each.
+//! the `core` module, in both flavours wherever the test means the same in each. The budget of I/O
+//! operations that a poll may complete, which keeps a task with a lot of ready I/O from holding up
+//! the others, and `unconstrained`, which lifts it for a future, are tested in the `coop` module at
+//! the level of the functions that keep it, in the `async_io` and `helper` modules at the level of
+//! the I/O and the `block_on` that use it, and in the `net::unix` module for a `send_to`, which
+//! counts for itself.
+//! `AsyncIo`, the async handle of any source a runtime watches, is tested in the `async_io`
+//! module, in both flavours wherever the test means the same in each. An event and its listeners,
+//! which need no runtime, are tested in the `event` module. What the type system is to rule out —
+//! a local runtime's handles leaving their thread, a shared runtime taking a future or a source
+//! that could not follow it to another, a lock or a channel handing its value or its messages to a
+//! thread that could not own them, the future of blocking work doing the same with the value it
+//! resolves to, and an adapter of a blocking handle with its handle — can only be shown by code
+//! that does not compile, so it is shown here, by the doc tests of the items below. The broadcast
+//! channel, the MPMC channel and the locks, built on the event, are tested in the `broadcast`,
+//! `mpmc` and `lock` modules. Blocking work, which needs neither the runtime nor the event, is
+//! tested in the `unblock` module, and the filesystem access of the `fs` module, built on it, in
+//! the `fs` module. The sockets of the `net` module are tested in the `net` module, one family of
+//! them to a module there, in both flavours wherever the test means the same in each. The child
+//! processes of the `process` module, built on a runtime and on blocking work, are tested in the
+//! `process` module, in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -30,6 +35,8 @@
 mod async_io;
 #[cfg(all(test, feature = "broadcast"))]
 mod broadcast;
+#[cfg(all(test, feature = "runtime"))]
+mod coop;
 #[cfg(all(test, feature = "runtime"))]
 mod core;
 #[cfg(all(test, feature = "event"))]
