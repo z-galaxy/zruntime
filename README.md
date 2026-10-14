@@ -52,7 +52,8 @@ The runtime, and what runs on it:
 
 What needs no runtime, and works under any executor:
 
-* **Blocking work and files**: [`unblock()`], [`Unblock`] and the [`fs`] module.
+* **Blocking work**: [`unblock()`] and [`Unblock`].
+* **Files**: the [`fs`] module.
 * **Events, locks and channels**: [`Event`], the [`lock`] module, [`mpmc`] and [`broadcast`].
 
 The runtime and [`Event`] are on by default. The rest is behind [cargo features](#cargo-features).
@@ -162,12 +163,12 @@ their turn then, and the reactor has its own once the batch of polls the task is
 task's next poll starts with a full budget. The future passed to [`Runtime::block_on`] or to the
 free [`block_on`] has the same budget, because the tasks run only between its polls.
 
-The sockets of the [`net`] module, [`AsyncIo`], [`Registration::poll_io`] and, on unix, the pipes to
-a child process spend the budget. Only an operation that completes counts: one that fails with
-`WouldBlock` spends nothing, and neither does waiting for readiness alone. The budget is for I/O
-alone, so a task that computes, or blocks, still holds the thread until its poll returns. A thread
-that is inside no poll by a runtime of this crate has no budget: a future polled there by another
-executor, or by plain code, never yields for it.
+The sockets of the [`net`] module, [`AsyncIo`], [`Registration::poll_io`], the operations of the
+[`fs`] module and, on unix, the pipes to a child process spend the budget. Only an operation that
+completes counts: one that fails with `WouldBlock` spends nothing, and neither does waiting for
+readiness alone. The budget is for I/O alone, so a task that computes, or blocks, still holds the
+thread until its poll returns. A thread that is inside no poll by a runtime of this crate has no
+budget: a future polled there by another executor, or by plain code, never yields for it.
 
 The budget belongs to the thread, not to the future, so a future that another executor polls
 inside a task shares what is left of the task's budget. An executor that blocks the thread until its
@@ -234,23 +235,39 @@ Running an operation through [`AsyncIo::read_with`], [`AsyncIo::write_with`] or 
 `AsyncWrite` impls counts against the budget that [Tasks](#tasks) describes. Waiting with
 [`AsyncIo::readable`] or [`AsyncIo::writable`] does not.
 
-`AsyncIo` is not for regular files: reading or writing one can block the thread, whatever its
-readiness says. Use [`Unblock`] or the [`fs`] module for files.
+`AsyncIo` is not for regular files: no poller can say whether a read or a write of one would wait
+for the disk, so either can block the thread. Use the [`fs`] module for files, which runs each
+operation on the thread that polls it (see [Files](#files)), or [`Unblock`], which keeps the thread
+free.
 
 For code that does its own polling, [`Runtime::register`] watches a source and returns a
 [`Registration`] to poll it through. Its [`Registration::poll_io`] spends the budget the same way.
 
-## Blocking work and files
+## Blocking work
 
 [`unblock()`] runs blocking work on a pool of threads, and returns a future of its result.
 [`Unblock`] wraps a blocking I/O handle, such as a file or the standard input. It implements the
 async I/O traits by running each operation on that pool.
 
-The [`fs`] module is async filesystem access, in the shape of `std::fs` and like `smol::fs`. It
-runs each operation on the same pool.
+Neither needs a runtime: they work under any executor. Neither is built on WASI, which has no
+thread to run the work on (see [WASI](#wasi)).
 
-None of these needs a runtime: they work under any executor. None of them is built on WASI, which
-has no thread to run the work on (see [WASI](#wasi)).
+## Files
+
+The [`fs`] module is async filesystem access, in the shape of `std::fs` and like `smol::fs`. It
+needs no runtime: it works under any executor, and on WASI (see [WASI](#wasi)).
+
+Unlike [`unblock()`], it runs each operation on the thread that polls its future, within that poll.
+Waiting for readiness would not help: a poller either cannot watch a regular file, or reports it as
+ready whether or not the disk has the data. Most operations are served from the cache of the OS and
+take microseconds. But one that misses the cache, one on a slow or network mount, and a single read
+or write of a large buffer block the thread while they run, and every task on it waits meanwhile.
+Each operation spends the budget that [Tasks](#tasks) describes, so a task in a loop of them lets
+the others run after 128 of them, but the budget does not cut a single operation short.
+
+That matters where other tasks must stay responsive while a large file, or one on a slow disk or
+mount, is read or written. There, run the `std::fs` call as [blocking work](#blocking-work)
+instead: through [`unblock()`], or through an [`Unblock`] around a `std::fs::File`.
 
 ## Child processes
 
@@ -320,9 +337,9 @@ WASI cannot start a thread, so there:
 
 * A runtime runs only while a thread is inside `block_on` on it. With the `helper` feature, no
   helper thread runs its work in between, as [`SharedRuntime::current`] details.
-* [`unblock()`], [`Unblock`] and the [`fs`] module are not built. Their work would have to run on
-  the thread that polls it, which would block every task on that thread until the work is done.
-  The documentation of each item says what could change that.
+* [`unblock()`] and [`Unblock`] are not built. Their work would have to run on the thread that
+  polls it, which would block every task on that thread until the work is done. The documentation
+  of each item says what could change that.
 
 No `cfg` tells a WASI target with threads, such as `wasm32-wasip1-threads`, from one without, so
 such a target is treated the same way. There, a wake from a thread of the program's own reaches a
@@ -333,6 +350,14 @@ The sockets of the [`net`] module work on `wasm32-wasip2`, where the host grants
 work there only on one that the host hands in, and the UDP socket not at all. WASI has no
 unix-domain sockets and no child processes, so the `unix` and `process` features build nothing
 there.
+
+The [`fs`] module works on both previews as it does elsewhere, with these differences:
+
+* A path reaches only the directories that the host lends the program. With wasmtime,
+  `wasmtime run --dir ./data::/data` lends the directory `./data` as `/data`.
+* WASI has no permissions, so `fs::set_permissions` and `File::set_permissions` fail with
+  `Unsupported`.
+* There is no `unix` or `windows` module of extensions.
 
 ## Combinators
 
@@ -399,7 +424,7 @@ To race a future against a timer, use [`Runtime::timeout`].
 * `mpmc`: the [`mpmc`] module. Implies `event`.
 * `broadcast`: the [`broadcast`] module. Implies `event`.
 * `unblock`: [`unblock()`] and [`Unblock`], except on WASI.
-* `fs`: the [`fs`] module, except on WASI. Implies `unblock` and `lock`.
+* `fs`: the [`fs`] module.
 * `tcp`: `TcpListener` and `TcpStream` in the [`net`] module. Implies `runtime`.
 * `udp`: `UdpSocket` in the [`net`] module. Implies `runtime`.
 * `unix`: the `net::unix` module, on unix only. Implies `runtime`.

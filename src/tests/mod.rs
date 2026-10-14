@@ -1,30 +1,30 @@
 //! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast and MPMC
-//! channels and the locks built on that event, of blocking work run on a pool of threads and the
-//! filesystem access built on it, of the sockets a runtime watches, and of the child processes it
-//! spawns.
+//! channels and the locks built on that event, of blocking work run on a pool of threads, of the
+//! filesystem access that runs on the thread that polls it, of the sockets a runtime watches, and
+//! of the child processes it spawns.
 //!
-//! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in
-//! the `core` module, in both flavours wherever the test means the same in each. The budget of I/O
+//! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in the
+//! `core` module, in both flavours wherever the test means the same in each. The budget of I/O
 //! operations that a poll may complete, which keeps a task with a lot of ready I/O from holding up
 //! the others, and `unconstrained`, which lifts it for a future, are tested in the `coop` module at
 //! the level of the functions that keep it, in the `async_io` and `helper` modules at the level of
-//! the I/O and the `block_on` that use it, and in the `net::unix` module for a `send_to`, which
-//! counts for itself.
-//! `AsyncIo`, the async handle of any source a runtime watches, is tested in the `async_io`
-//! module, in both flavours wherever the test means the same in each. An event and its listeners,
-//! which need no runtime, are tested in the `event` module. What the type system is to rule out —
-//! a local runtime's handles leaving their thread, a shared runtime taking a future or a source
-//! that could not follow it to another, a lock or a channel handing its value or its messages to a
-//! thread that could not own them, the future of blocking work doing the same with the value it
-//! resolves to, and an adapter of a blocking handle with its handle — can only be shown by code
-//! that does not compile, so it is shown here, by the doc tests of the items below. The broadcast
-//! channel, the MPMC channel and the locks, built on the event, are tested in the `broadcast`,
-//! `mpmc` and `lock` modules. Blocking work, which needs neither the runtime nor the event, is
-//! tested in the `unblock` module, and the filesystem access of the `fs` module, built on it, in
-//! the `fs` module. The sockets of the `net` module are tested in the `net` module, one family of
-//! them to a module there, in both flavours wherever the test means the same in each. The child
-//! processes of the `process` module, built on a runtime and on blocking work, are tested in the
-//! `process` module, in both flavours wherever the test means the same in each.
+//! the I/O and the `block_on` that use it, in the `fs` module for the filesystem operations, and in
+//! the `net::unix` module for a `send_to`, which counts for itself. `AsyncIo`, the async handle of
+//! any source a runtime watches, is tested in the `async_io` module, in both flavours wherever the
+//! test means the same in each. An event and its listeners, which need no runtime, are tested in
+//! the `event` module. What the type system is to rule out — a local runtime's handles leaving
+//! their thread, a shared runtime taking a future or a source that could not follow it to another,
+//! a lock or a channel handing its value or its messages to a thread that could not own them, the
+//! future of blocking work doing the same with the value it resolves to, and an adapter of a
+//! blocking handle with its handle — can only be shown by code that does not compile, so it is
+//! shown here, by the doc tests of the items below. The broadcast channel, the MPMC channel and the
+//! locks, built on the event, are tested in the `broadcast`, `mpmc` and `lock` modules. Blocking
+//! work, which needs neither the runtime nor the event, is tested in the `unblock` module, and the
+//! filesystem access of the `fs` module, which needs no runtime either, in the `fs` module. The
+//! sockets of the `net` module are tested in the `net` module, one family of them to a module
+//! there, in both flavours wherever the test means the same in each. The child processes of the
+//! `process` module, built on a runtime and on blocking work, are tested in the `process` module,
+//! in both flavours wherever the test means the same in each.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -978,8 +978,7 @@ struct UnblockIsSendAndSyncWhereItsHandleIsSend;
 /// What the `fs` module hands out may be sent to another thread and shared with one, and so may
 /// the futures of its operations, which is what a task that awaits them on a shared runtime, or
 /// under any executor whose tasks move between threads, needs of them. That includes the futures
-/// of a file's methods that wait for its writes in flight, which hold the guard of the file's lock
-/// across that wait.
+/// of a file's methods, which borrow the file.
 ///
 /// ```
 /// use std::path::Path;

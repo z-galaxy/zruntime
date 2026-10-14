@@ -1,16 +1,20 @@
-//! Tests of `zruntime::fs`, async access to the filesystem as blocking work.
+//! Tests of `zruntime::fs`, async access to the filesystem on the thread that polls it.
 //!
 //! Each test works in a directory of its own under the temporary directory of the OS, which goes
 //! with everything in it when the test ends, and drives the futures with the `block_on` of
-//! `futures`. They come in the order of what they pin down: that each function does what the
-//! function of std it runs does, and takes paths and bytes of any type that converts; that the
+//! `futures`, but for those of the budget, which drive theirs with the `block_on` of a runtime or
+//! poll them by hand. They come in the order of what they pin down: that each function does what
+//! the function of std it runs does, and takes paths and bytes of any type that converts; that the
 //! stream of a directory lists every entry, and that an entry knows what it is; that the builders
 //! of directories and of files set what they are told to, that their futures do not borrow them and
 //! do nothing before they are polled; that a file hands back what it was given, wherever it is
-//! sought to, and puts its position right where a write follows a read; that what looks at a file
+//! sought to, and that a write after a read lands where the reads got to; that what looks at a file
 //! as a whole sees every byte written before it, and that a file dropped right after a write loses
 //! none; that a file gives out its raw handle and prints; and, where the platform has them, what
-//! its extension traits add.
+//! its extension traits add. The last tests are those of the budget of operations that a poll may
+//! complete: that a task in a loop of them yields to the next one once the budget is spent, that a
+//! blocking executor that a task runs gets its operations done inside `unconstrained`, and that
+//! nothing yields outside a runtime.
 
 use std::{
     env,
@@ -19,7 +23,7 @@ use std::{
     process,
     sync::atomic::{AtomicUsize, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use futures::{
@@ -30,8 +34,12 @@ use ntest::timeout;
 
 use crate::fs::{self, DirBuilder, DirEntry, File, OpenOptions, ReadDir};
 
+#[cfg(feature = "runtime")]
+use super::async_io::{BUDGET, READS, note_progress};
 #[cfg(unix)]
 use crate::fs::unix::{self, DirBuilderExt, DirEntryExt, OpenOptionsExt, PermissionsExt};
+#[cfg(feature = "runtime")]
+use crate::{Local, Runtime, Shared, unconstrained};
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle};
 #[cfg(unix)]
@@ -39,12 +47,45 @@ use std::os::{
     fd::{AsFd, AsRawFd, OwnedFd},
     unix::{fs::MetadataExt, net::UnixStream},
 };
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(feature = "runtime")]
 use std::{
     future::Future,
-    pin::{Pin, pin},
+    pin::pin,
+    sync::Arc,
     task::{Context, Waker},
 };
+
+/// Writes the test that follows once per flavour: a module named after it, holding a `local` and
+/// a `shared` test that run its body with the type its parameter names standing for
+/// [`Local`] and for [`Shared`].
+///
+/// The body is written out once for each flavour rather than once over a mode parameter, as the
+/// `spawn` of each takes bounds of its own. What it uses has to meet both: futures that are `Send`.
+#[cfg(feature = "runtime")]
+macro_rules! in_both_modes {
+    ($(#[$attr:meta])* fn $name:ident<$mode:ident>() $body:block) => {
+        $(#[$attr])*
+        mod $name {
+            use super::*;
+
+            #[test]
+            #[timeout(15000)]
+            fn local() {
+                type $mode = Local;
+
+                $body
+            }
+
+            #[test]
+            #[timeout(15000)]
+            fn shared() {
+                type $mode = Shared;
+
+                $body
+            }
+        }
+    };
+}
 
 /// A path comes out of `canonicalize` with its dots resolved, as std resolves them.
 #[test]
@@ -470,8 +511,7 @@ fn the_metadata_of_an_entry_does_not_follow_a_link() {
     });
 }
 
-/// A stream of a directory lists every entry of it, more of them than one batch pulled from the
-/// directory at a time holds, and then ends.
+/// A stream of a directory lists every entry of it, files and directories alike, and then ends.
 #[test]
 #[timeout(15000)]
 fn read_dir_lists_every_entry() {
@@ -523,8 +563,8 @@ fn read_dir_fails_for_a_path_that_is_no_directory() {
     assert!(file.is_err());
 }
 
-/// An entry gives its name and its path, and, by blocking work, its type and its metadata. A clone
-/// of it is the same entry.
+/// An entry gives its name and its path, and its type and its metadata. A clone of it is the same
+/// entry.
 #[test]
 #[timeout(15000)]
 fn entries_know_their_path_name_type_and_metadata() {
@@ -775,18 +815,17 @@ fn write_overwrites_a_file_without_shortening_it() {
     assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "XYcdef");
 }
 
-/// A write to a file opened for reading is handed to the pool all the same, and the error comes
-/// from the flush.
+/// A write to a file opened for reading fails at the write, which is where the OS refuses it, and
+/// leaves the file as it was.
 #[test]
 #[timeout(15000)]
-fn a_write_to_a_read_only_file_fails_at_the_flush() {
+fn a_write_to_a_file_opened_for_reading_fails() {
     let dir = TempDir::new();
     std::fs::write(dir.join("file"), "text").unwrap();
 
     block_on(async {
         let mut file = File::open(dir.join("file")).await.unwrap();
-        file.write_all(b"x").await.unwrap();
-        assert!(file.flush().await.is_err());
+        assert!(file.write_all(b"x").await.is_err());
     });
 
     assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "text");
@@ -897,11 +936,11 @@ fn a_file_written_is_read_back() {
     });
 }
 
-/// A file of many times what one operation reads or writes round-trips: written by one large
-/// buffer and by small ones, and read through large buffers and small ones.
+/// A large file round-trips: written by one large buffer and by small ones, and read through large
+/// buffers and small ones.
 #[test]
 #[timeout(15000)]
-fn a_file_larger_than_one_operation_round_trips() {
+fn a_large_file_round_trips() {
     let dir = TempDir::new();
     let data = bytes(200_000);
 
@@ -981,7 +1020,7 @@ fn seeks_land_where_asked() {
     });
 }
 
-/// A seek from the current position counts the bytes read, and not the ones read ahead of them.
+/// The current position is where the reads got to: a seek from it counts the bytes read.
 #[test]
 #[timeout(15000)]
 fn the_current_position_is_where_the_reads_got_to() {
@@ -1001,8 +1040,7 @@ fn the_current_position_is_where_the_reads_got_to() {
     });
 }
 
-/// After a write, the position is at the end of the bytes written, whether or not the write is
-/// over.
+/// After a write, the position is at the end of the bytes written.
 #[test]
 #[timeout(15000)]
 fn the_position_after_a_write_is_the_end_of_the_bytes_written() {
@@ -1016,9 +1054,8 @@ fn the_position_after_a_write_is_the_end_of_the_bytes_written() {
     });
 }
 
-/// A write that follows a read goes where the reads got to, and not to where the read ahead of
-/// them left the position of the file: three bytes read, two bytes written, and the two are at
-/// offsets 3 and 4.
+/// A write that follows a read goes where the reads got to: three bytes read, two bytes written,
+/// and the two are at offsets 3 and 4.
 #[test]
 #[timeout(15000)]
 fn a_write_after_a_read_lands_where_the_reads_got_to() {
@@ -1082,38 +1119,36 @@ fn reads_and_writes_alternate_without_losing_the_position() {
     assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"0a2a4a6a8a");
 }
 
-/// A write also follows a read that was given up on before it ended, whether the pool had begun to
-/// read ahead or not.
+/// A read is over in the poll that begins it: a regular file is never waited on, so a read polled
+/// once is done, and the write that follows goes where it got to.
 #[test]
 #[timeout(15000)]
-fn a_write_after_a_read_given_up_on_lands_where_the_reads_got_to() {
+fn a_read_is_over_in_the_poll_that_begins_it() {
     let dir = TempDir::new();
     std::fs::write(dir.join("file"), "abcdefgh").unwrap();
 
-    let read = block_on(async {
+    block_on(async {
         let mut file = read_write(dir.join("file")).await;
         let mut buf = [0; 3];
-        // Polled once: the read is pending, or the pool was quick and it is over.
-        let read = match poll_immediate(file.read(&mut buf)).await {
-            Some(read) => read.unwrap(),
-            None => 0,
-        };
+        let read = poll_immediate(file.read(&mut buf)).await;
+        assert_eq!(read.unwrap().unwrap(), 3);
+        assert_eq!(&buf, b"abc");
+
         file.write_all(b"XY").await.unwrap();
-        file.flush().await.unwrap();
-        read
     });
 
-    let mut expected = b"abcdefgh".to_vec();
-    expected[read..read + 2].copy_from_slice(b"XY");
-    assert_eq!(std::fs::read(dir.join("file")).unwrap(), expected);
+    assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"abcXYfgh");
 }
 
-/// A file that cannot be sought, as a socket cannot, is written after a read all the same, and
-/// what was read ahead of the write is not lost to it.
+/// A file on a socket, which cannot be sought, is read and written in turn: each read gets the
+/// bytes that the peer sent next, and each write reaches the peer.
+///
+/// The peer sends before each read and the file replies before the peer reads, so that no read
+/// finds the socket empty and no write finds it full, which would block the thread for good.
 #[cfg(unix)]
 #[test]
 #[timeout(15000)]
-fn a_write_after_a_read_works_on_a_file_that_cannot_seek() {
+fn a_file_on_a_socket_is_read_and_written_in_turn() {
     let (mut peer, ours) = UnixStream::pair().unwrap();
     let mut file = File::from(OwnedFd::from(ours));
 
@@ -1121,7 +1156,7 @@ fn a_write_after_a_read_works_on_a_file_that_cannot_seek() {
         for round in 0..3u8 {
             let first = [b'a' + round; 4];
             let second = [b'm' + round; 4];
-            // Sent together, so that the read of the first half reads the second half ahead.
+            // Sent together, so that the second half waits in the socket while the file replies.
             io::Write::write_all(&mut peer, &[first, second].concat()).unwrap();
             let mut buf = [0; 4];
             file.read_exact(&mut buf).await.unwrap();
@@ -1139,7 +1174,7 @@ fn a_write_after_a_read_works_on_a_file_that_cannot_seek() {
     });
 }
 
-/// `sync_all` waits for the writes before it, so the file holds all of them once it is over.
+/// `sync_all` after a large write leaves the file holding every byte of it.
 #[test]
 #[timeout(15000)]
 fn sync_all_sees_every_byte_written() {
@@ -1158,7 +1193,7 @@ fn sync_all_sees_every_byte_written() {
     });
 }
 
-/// `sync_data` waits for the writes before it, as `sync_all` does.
+/// `sync_data` after a large write leaves the file holding every byte of it, as `sync_all` does.
 #[test]
 #[timeout(15000)]
 fn sync_data_sees_every_byte_written() {
@@ -1177,7 +1212,7 @@ fn sync_data_sees_every_byte_written() {
     });
 }
 
-/// `metadata` waits for the writes before it, so the length it reports includes every one.
+/// `metadata` after a large write reports a length that includes every byte of it.
 #[test]
 #[timeout(15000)]
 fn metadata_sees_every_byte_written() {
@@ -1192,8 +1227,8 @@ fn metadata_sees_every_byte_written() {
     });
 }
 
-/// `set_len` waits for the writes before it: none of them is still to come to lengthen a file that
-/// it cut short.
+/// `set_len` after a large write cuts the file to the length it is given: what was written past
+/// that is gone.
 #[test]
 #[timeout(15000)]
 fn set_len_comes_after_every_byte_written() {
@@ -1228,12 +1263,12 @@ fn set_len_extends_a_file_and_keeps_the_position() {
     assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"abcd\0\0");
 }
 
-/// What the reads read ahead of a `set_len` is dropped: the reads after it see the file as it is
-/// now, from the position the reads got to, so that they find nothing past a cut, and the zeros of
-/// a file cut and then extended again rather than the bytes it held before.
+/// The reads after a `set_len` see the file as it is now, from the position the reads got to, so
+/// that they find nothing past a cut, and the zeros of a file cut and then extended again rather
+/// than the bytes it held before.
 #[test]
 #[timeout(15000)]
-fn set_len_drops_what_the_reads_read_ahead() {
+fn reads_after_set_len_see_the_file_as_it_is() {
     let dir = TempDir::new();
     std::fs::write(dir.join("cut"), "abcdef").unwrap();
     std::fs::write(dir.join("regrown"), "abcdef").unwrap();
@@ -1257,7 +1292,7 @@ fn set_len_drops_what_the_reads_read_ahead() {
     });
 }
 
-/// What `set_len`, `sync_all` and `metadata` do between reads leaves the reads where they were.
+/// What `sync_all`, `sync_data` and `metadata` do between reads leaves the reads where they were.
 #[test]
 #[timeout(15000)]
 fn looking_at_a_file_does_not_disturb_the_reads() {
@@ -1278,95 +1313,11 @@ fn looking_at_a_file_does_not_disturb_the_reads() {
     });
 }
 
-/// `sync_all` does not end while a write before it is still going on.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// A file dropped right after a write, with no flush, still has every byte: the write went to the
+/// file when it was made.
 #[test]
 #[timeout(15000)]
-fn sync_all_waits_for_a_write_in_flight() {
-    let (file, mut peer) = file_with_a_blocked_write();
-    let mut sync = pin!(file.sync_all());
-
-    assert_pending_while_the_write_is_blocked(sync.as_mut());
-    release_the_write(&mut peer);
-
-    // The socket cannot be synced to a disk, which is of no interest: the order is.
-    let _ = block_on(sync);
-}
-
-/// `sync_data` does not end while a write before it is still going on.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[test]
-#[timeout(15000)]
-fn sync_data_waits_for_a_write_in_flight() {
-    let (file, mut peer) = file_with_a_blocked_write();
-    let mut sync = pin!(file.sync_data());
-
-    assert_pending_while_the_write_is_blocked(sync.as_mut());
-    release_the_write(&mut peer);
-
-    let _ = block_on(sync);
-}
-
-/// `set_len` does not start while a write before it is still going on.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[test]
-#[timeout(15000)]
-fn set_len_waits_for_a_write_in_flight() {
-    let (file, mut peer) = file_with_a_blocked_write();
-    let mut set_len = pin!(file.set_len(0));
-
-    assert_pending_while_the_write_is_blocked(set_len.as_mut());
-    release_the_write(&mut peer);
-
-    // The length of a socket cannot be set, which is of no interest: the order is.
-    let _ = block_on(set_len);
-}
-
-/// `metadata` does not start while a write before it is still going on.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[test]
-#[timeout(15000)]
-fn metadata_waits_for_a_write_in_flight() {
-    let (file, mut peer) = file_with_a_blocked_write();
-    let mut metadata = pin!(file.metadata());
-
-    assert_pending_while_the_write_is_blocked(metadata.as_mut());
-    release_the_write(&mut peer);
-
-    assert!(block_on(metadata).is_ok());
-}
-
-/// A flush does not end while a write before it is still going on, and ends once it is over.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[test]
-#[timeout(15000)]
-fn flush_waits_for_a_write_in_flight() {
-    let (mut file, mut peer) = file_with_a_blocked_write();
-    let mut flush = pin!(file.flush());
-
-    assert_pending_while_the_write_is_blocked(flush.as_mut());
-    release_the_write(&mut peer);
-
-    block_on(flush).unwrap();
-}
-
-/// A file dropped with a write in flight stays open until the write is over: the bytes reach
-/// the other end of a socket that was full when the file was dropped.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[test]
-#[timeout(15000)]
-fn a_file_dropped_with_a_write_in_flight_finishes_the_write() {
-    let (file, mut peer) = file_with_a_blocked_write();
-
-    drop(file);
-
-    release_the_write(&mut peer);
-}
-
-/// A file dropped right after a write, with no flush, still gets every byte once the pool is done.
-#[test]
-#[timeout(15000)]
-fn a_file_dropped_after_a_write_still_gets_every_byte() {
+fn a_file_dropped_after_a_write_still_has_every_byte() {
     let dir = TempDir::new();
     let data = bytes(1 << 20);
 
@@ -1376,15 +1327,6 @@ fn a_file_dropped_after_a_write_still_gets_every_byte() {
         drop(file);
     });
 
-    // The writes go in order, so the file is as long as the bytes once the last one is written.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::fs::metadata(dir.join("file")).unwrap().len() < data.len() as u64 {
-        assert!(
-            Instant::now() < deadline,
-            "the bytes written never all reached the file"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
     assert_eq!(std::fs::read(dir.join("file")).unwrap(), data);
 }
 
@@ -1404,7 +1346,7 @@ fn closing_a_file_flushes_it() {
     assert_eq!(std::fs::read(dir.join("file")).unwrap(), data);
 }
 
-/// A file changes its permissions, which do not wait for the writes before them.
+/// A file changes its own permissions.
 #[test]
 #[timeout(15000)]
 fn a_file_changes_its_own_permissions() {
@@ -1502,6 +1444,166 @@ fn create_fails_without_the_directory_of_the_file() {
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
 }
 
+#[cfg(feature = "runtime")]
+in_both_modes! {
+    /// A task that reads a byte at a time from a file gives the next task its turn once its budget
+    /// is spent, not once the last byte is read.
+    ///
+    /// A read from a regular file is always ready, so without the budget the reader would never
+    /// return `Pending`, and the task spawned right after it would first run when the reader was
+    /// done. The look is exact: the reader is stopped by the budget and by nothing else, as it has
+    /// more bytes to read than that.
+    fn a_task_reading_a_file_yields_to_the_next<M>() {
+        let dir = TempDir::new();
+        std::fs::write(dir.join("file"), bytes(READS)).unwrap();
+        let mut file = File::from(std::fs::File::open(dir.join("file")).unwrap());
+        let runtime = Runtime::<M>::new().unwrap();
+        let (reads, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let reader = {
+            let reads = reads.clone();
+            runtime.spawn("a reader", async move {
+                for _ in 0..READS {
+                    file.read_exact(&mut [0]).await.unwrap();
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        // Spawned right after the reader, so that it is next in the queue.
+        let looker = runtime.spawn("a looker", note_progress(reads.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            reader.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(reads.load(Ordering::SeqCst), READS);
+    }
+}
+
+#[cfg(feature = "runtime")]
+in_both_modes! {
+    /// A task that calls a function of the module over and over gives the next task its turn once
+    /// its budget is spent, as one that reads from a file does.
+    fn a_task_looping_over_a_function_yields_to_the_next<M>() {
+        let dir = TempDir::new();
+        let path = dir.join("file");
+        std::fs::write(&path, "").unwrap();
+        let runtime = Runtime::<M>::new().unwrap();
+        let (calls, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let caller = {
+            let calls = calls.clone();
+            runtime.spawn("a caller", async move {
+                for _ in 0..READS {
+                    fs::metadata(&path).await.unwrap();
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let looker = runtime.spawn("a looker", note_progress(calls.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            caller.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+        assert_eq!(calls.load(Ordering::SeqCst), READS);
+    }
+}
+
+#[cfg(feature = "runtime")]
+in_both_modes! {
+    /// A task that lists a directory gives the next task its turn once its budget is spent: the
+    /// stream of a directory spends one for each entry it yields.
+    fn a_task_listing_a_directory_yields_to_the_next<M>() {
+        let dir = TempDir::new();
+        for index in 0..3 * BUDGET {
+            std::fs::write(dir.join(format!("file-{index}")), "").unwrap();
+        }
+        let runtime = Runtime::<M>::new().unwrap();
+        let (listed, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let lister = {
+            let (listed, path) = (listed.clone(), dir.path().to_owned());
+            runtime.spawn("a lister", async move {
+                let mut entries = fs::read_dir(path).await.unwrap();
+                while let Some(entry) = entries.next().await {
+                    entry.unwrap();
+                    listed.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let looker = runtime.spawn("a looker", note_progress(listed.clone(), seen.clone()));
+
+        runtime.block_on(async {
+            lister.await.unwrap();
+            looker.await.unwrap();
+        });
+
+        // The first operation of the lister opens the directory, which leaves one fewer for the
+        // entries.
+        assert_eq!(seen.load(Ordering::SeqCst), BUDGET - 1);
+        assert_eq!(listed.load(Ordering::SeqCst), 3 * BUDGET);
+    }
+}
+
+#[cfg(feature = "runtime")]
+in_both_modes! {
+    /// A blocking executor of another crate that a task runs gets its `fs` operations done when it
+    /// runs them inside `unconstrained`.
+    ///
+    /// The task makes ten calls and then has `futures`'s `block_on` make the rest. That executor
+    /// shares the budget of the task's poll and polls again as soon as it is woken, inside that
+    /// poll, so once the budget was spent every call would turn it away for good; `unconstrained`
+    /// lifts the budget for the polls of the future it runs.
+    fn a_blocking_executor_that_a_task_runs_gets_its_fs_operations_done<M>() {
+        let dir = TempDir::new();
+        let path = dir.join("file");
+        std::fs::write(&path, "").unwrap();
+        let runtime = Runtime::<M>::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let calls = calls.clone();
+            runtime.spawn("a task", async move {
+                stat(&path, 10, &calls).await;
+                futures::executor::block_on(unconstrained(stat(&path, READS - 10, &calls)));
+            })
+        };
+
+        runtime.block_on(task).unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), READS);
+    }
+}
+
+/// A future that is polled outside any runtime has no budget: it makes all its operations in the
+/// one poll, whichever kind they are.
+///
+/// The poll here is made by the test, with a waker that does nothing, so that a future that
+/// yielded would be left without anything to wake it.
+#[cfg(feature = "runtime")]
+#[test]
+#[timeout(15000)]
+fn a_future_polled_outside_a_runtime_is_never_held_to_the_budget() {
+    let dir = TempDir::new();
+    std::fs::write(dir.join("file"), bytes(3 * BUDGET)).unwrap();
+    let mut file = File::from(std::fs::File::open(dir.join("file")).unwrap());
+    let mut calling = pin!(async {
+        for _ in 0..3 * BUDGET {
+            fs::metadata(dir.path()).await.unwrap();
+        }
+        for _ in 0..3 * BUDGET {
+            file.read_exact(&mut [0]).await.unwrap();
+        }
+    });
+
+    let polled = calling
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
+
+    assert!(polled.is_ready());
+}
+
 /// A scratch directory under the temporary directory of the OS, which goes with everything in it
 /// when the value is dropped.
 struct TempDir(PathBuf);
@@ -1557,43 +1659,13 @@ async fn position(file: &mut File) -> u64 {
     file.seek(SeekFrom::Current(0)).await.unwrap()
 }
 
-/// A file on a socket with a write in flight that cannot end, and the other end of the socket.
-///
-/// The buffer of the socket is made too small for the bytes of the write, and nobody reads from the
-/// other end, so the write blocks on the pool until the test reads.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn file_with_a_blocked_write() -> (File, UnixStream) {
-    let (ours, peer) = UnixStream::pair().unwrap();
-    socket2::SockRef::from(&ours)
-        .set_send_buffer_size(1)
-        .unwrap();
-    let mut file = File::from(OwnedFd::from(ours));
-
-    // Done as soon as the pool has the bytes, which it then cannot write all of.
-    block_on(file.write_all(&[0; 8192])).unwrap();
-
-    (file, peer)
-}
-
-/// Reads from the other end of the socket what [`file_with_a_blocked_write`] wrote, which lets the
-/// write end.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn release_the_write(peer: &mut UnixStream) {
-    io::Read::read_exact(peer, &mut [0; 8192]).unwrap();
-}
-
-/// Polls `future` twice, with a pause between, and fails the test if either poll finishes it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn assert_pending_while_the_write_is_blocked<F>(mut future: Pin<&mut F>)
-where
-    F: Future,
-{
-    let mut cx = Context::from_waker(Waker::noop());
-
-    assert!(future.as_mut().poll(&mut cx).is_pending());
-    // Long enough for the work of a future that did not wait to be done by the pool.
-    thread::sleep(Duration::from_millis(100));
-    assert!(future.as_mut().poll(&mut cx).is_pending());
+/// Calls `fs::metadata` for `path` `calls` times, and counts each call that is over in `done`.
+#[cfg(feature = "runtime")]
+async fn stat(path: &Path, calls: usize, done: &AtomicUsize) {
+    for _ in 0..calls {
+        fs::metadata(path).await.unwrap();
+        done.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// `len` bytes that are not all alike, so that bytes in the wrong place are noticed.

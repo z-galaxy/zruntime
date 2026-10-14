@@ -1,6 +1,6 @@
 [package]
 name = "zruntime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -45,9 +45,11 @@ lock = ["event"]
 # `Unblock`, which gives a blocking I/O handle the async I/O traits through it; needs no runtime.
 # Builds nothing on WASI, which cannot start a thread for the work.
 unblock = ["dep:futures-io", "dep:futures-core"]
-# The `fs` module: async access to the filesystem, as blocking work on `unblock`'s pool of threads;
-# needs no runtime. Builds nothing on WASI, as `unblock` builds nothing there.
-fs = ["unblock", "lock"]
+# The `fs` module: async access to the filesystem, with each operation run on the thread that polls
+# its future; needs no runtime. `futures-io` gives its file the async I/O traits, and `futures-core`
+# gives its stream of a directory's entries the `Stream` trait. Builds on WASI too, where it reaches
+# the directories that the host lends the program.
+fs = ["dep:futures-io", "dep:futures-core"]
 # The `net` module's TCP sockets: `TcpListener` and `TcpStream`. On `wasm32-wasip1`, which cannot
 # create a socket, they can only be made from a std socket that the host handed in.
 tcp = ["runtime", "dep:socket2", "rustix?/net"]

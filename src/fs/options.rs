@@ -2,8 +2,9 @@
 
 use std::{future::Future, io, path::Path};
 
-use super::{File, sealed::Sealed};
-use crate::unblock;
+#[cfg(any(unix, windows))]
+use super::sealed::Sealed;
+use super::{File, inline};
 
 /// A builder for opening a file: for reading, writing or both, and for what to do if the file does
 /// or does not exist.
@@ -42,7 +43,6 @@ use crate::unblock;
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
-#[doc = not_on_wasi!()]
 #[derive(Clone, Debug)]
 pub struct OpenOptions(std::fs::OpenOptions);
 
@@ -110,9 +110,9 @@ impl OpenOptions {
 
     /// Opens the file at `path` with the options of the builder.
     ///
-    /// Runs [`std::fs::OpenOptions::open`] as blocking work. The returned future does not borrow
-    /// the builder, so the builder can be changed or dropped right away. The future does nothing
-    /// until it is polled.
+    /// Runs [`std::fs::OpenOptions::open`] on the thread that polls the future. The returned future
+    /// does not borrow the builder, so the builder can be changed or dropped right away. The
+    /// future does nothing until it is polled.
     ///
     /// # Errors
     ///
@@ -125,7 +125,7 @@ impl OpenOptions {
         let options = self.0.clone();
         let path = path.as_ref().to_owned();
         async move {
-            let file = unblock(move || options.open(path)).await?;
+            let file = inline(|| options.open(path)).await?;
             Ok(File::from(file))
         }
     }
@@ -137,6 +137,7 @@ impl Default for OpenOptions {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Sealed for OpenOptions {}
 
 #[cfg(unix)]

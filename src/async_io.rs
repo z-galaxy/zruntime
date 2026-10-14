@@ -81,9 +81,10 @@ use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, coo
 /// # Regular files
 ///
 /// `AsyncIo` is not for regular files. On Linux and Android, the runtime cannot watch one, so
-/// waiting on one fails. Elsewhere, a regular file is always reported ready, and reading it blocks
-/// the thread, whatever its mode. `zruntime::Unblock` and `zruntime::fs` run each operation on a
-/// pool of threads instead.
+/// waiting on one fails. Elsewhere, its readiness says nothing of whether a read would wait for the
+/// disk, and reading it blocks the thread, whatever its mode. `zruntime::Unblock` runs each
+/// operation on a pool of threads instead, and `zruntime::fs` runs each on the thread that polls
+/// it, which it blocks for as long as the operation takes.
 ///
 /// # Example
 ///

@@ -7,7 +7,7 @@
 //! single task can starve the rest this way, though the ready queue is first-in first-out.
 //!
 //! So a runtime gives each poll it makes of a task, and of the future passed to `block_on`, a
-//! budget of [`BUDGET`] operations. Every I/O operation that completes spends one. Once the budget
+//! budget of `BUDGET` operations. Every I/O operation that completes spends one. Once the budget
 //! is gone, every operation that asks to run wakes its own task and returns `Pending` instead,
 //! however many futures of the task ask and however often, which puts the task at the back of the
 //! ready queue, behind the tasks that were there already. The poll that follows starts with a full
@@ -19,12 +19,18 @@
 //! executor or plain code, is not ours to interrupt, and has no one to run the other tasks in
 //! between, so an operation that finds no budget always proceeds and spends nothing.
 //!
+//! Only a runtime gives a poll a budget, but it is not the only thing that spends one: the
+//! operations of the `fs` module do too, and that module is built without a runtime. So the
+//! functions that check the budget and spend it are built for either, and the ones that set it for
+//! the runtime alone. Where there is no runtime, no thread has a budget, and every operation
+//! proceeds.
+//!
 //! A thread that is inside a poll has the budget of that poll, whoever polls the future in it. An
 //! executor of another crate that a task runs, such as `futures::executor::block_on`, asks for no
 //! budget of its own, and shares what is left of the task's. Once that is gone, an operation turns
 //! such an executor away as it would the task, and one that blocks until its future is done polls
 //! the future again as soon as it is woken, which is at once, inside the same poll of the task, and
-//! is turned away again, for good. Such an executor has to run its future inside [`unconstrained`],
+//! is turned away again, for good. Such an executor has to run its future inside `unconstrained`,
 //! which lifts the budget for the length of each poll of that future.
 //!
 //! Nothing here can tell that executor apart from a combinator, such as `select_all`, that polls
@@ -35,10 +41,10 @@
 
 use std::{
     cell::Cell,
-    future::poll_fn,
-    pin::pin,
     task::{Context, Poll},
 };
+#[cfg(feature = "runtime")]
+use std::{future::poll_fn, pin::pin};
 
 /// Runs `future` free of the budget of I/O operations that a runtime gives each poll of a task.
 ///
@@ -108,6 +114,7 @@ use std::{
 /// # #[cfg(not(unix))]
 /// # fn main() {}
 /// ```
+#[cfg(feature = "runtime")]
 pub async fn unconstrained<F>(future: F) -> F::Output
 where
     F: Future,
@@ -131,6 +138,7 @@ where
 /// leave this one behind. It is put back, rather than cleared, so that a poll made from inside
 /// another that is budgeted too, such as the free `block_on` called from inside the future of
 /// another call of it that holds no seat, ends with the budget of the poll it was made from.
+#[cfg(feature = "runtime")]
 pub(crate) fn budgeted<R>(poll: impl FnOnce() -> R) -> R {
     let _restore = Restore(LEFT.replace(Some(BUDGET)));
 
@@ -142,7 +150,7 @@ pub(crate) fn budgeted<R>(poll: impl FnOnce() -> R) -> R {
 ///
 /// An operation calls this before it runs, and [`spend`] once it has completed. A spent budget
 /// stays spent for the rest of the poll, so every operation that asks after that is turned away,
-/// however often it asks: one that has to run regardless runs inside [`unconstrained`].
+/// however often it asks: one that has to run regardless runs inside `unconstrained`.
 pub(crate) fn poll_proceed(cx: &mut Context<'_>) -> Poll<()> {
     if LEFT.get() != Some(0) {
         return Poll::Ready(());
@@ -172,17 +180,21 @@ pub(crate) fn spend() {
 /// Enough that the check costs next to nothing beside the operations it counts, and few enough that
 /// a task with a lot of ready I/O gives up the thread long before the tasks behind it notice.
 ///
-/// Named as a number in the documentation of `Registration::poll_io`, in the Tasks section of the
-/// README and in `AGENTS.md`, so that a change here is a change there too.
+/// Named as a number in the documentation of `Registration::poll_io` and of the `fs` module, in the
+/// Tasks and Files sections of the README and in `AGENTS.md`, so that a change here is a change
+/// there too.
+#[cfg(feature = "runtime")]
 pub(crate) const BUDGET: u8 = 128;
 
 /// Puts back the budget a thread had before a poll, when it is dropped: at the end of the poll, or
 /// as a panic unwinds out of it.
 ///
-/// [`budgeted`] sets a full budget for a poll of a runtime's, and [`unconstrained`] sets none for a
+/// `budgeted` sets a full budget for a poll of a runtime's, and `unconstrained` sets none for a
 /// poll of the future it runs, and each puts back what was there before through this.
+#[cfg(feature = "runtime")]
 struct Restore(Option<u8>);
 
+#[cfg(feature = "runtime")]
 impl Drop for Restore {
     fn drop(&mut self) {
         LEFT.set(self.0);
@@ -192,7 +204,7 @@ impl Drop for Restore {
 thread_local! {
     /// How many more operations the poll this thread is inside of may complete before the next one
     /// yields, and `None` on a thread that is inside no poll of a runtime of this crate, or inside
-    /// a poll of a future that [`unconstrained`] runs.
+    /// a poll of a future that `unconstrained` runs.
     ///
     /// A `Cell` of a `Copy` value in a thread-local with a constant initialiser has no destructor,
     /// so that it can always be reached: a thread whose locals are being destroyed can run a

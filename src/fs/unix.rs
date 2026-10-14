@@ -8,17 +8,16 @@
 
 use std::{io, path::Path};
 
-use super::sealed::Sealed;
-use crate::unblock;
+use super::{inline, sealed::Sealed};
 
 #[doc(no_inline)]
 pub use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 /// Makes `dst` a symbolic link to `src`.
 ///
-/// Runs [`std::os::unix::fs::symlink`] as blocking work. The link stores the path `src` as given. A
-/// relative `src` is read relative to the directory of the link, not the working directory of the
-/// process. `src` need not exist.
+/// Runs [`std::os::unix::fs::symlink`] on the thread that polls the future. The link stores the
+/// path `src` as given. A relative `src` is read relative to the directory of the link, not the
+/// working directory of the process. `src` need not exist.
 ///
 /// # Example
 ///
@@ -49,9 +48,7 @@ where
     P: AsRef<Path>,
     Q: AsRef<Path>,
 {
-    let src = src.as_ref().to_owned();
-    let dst = dst.as_ref().to_owned();
-    unblock(move || std::os::unix::fs::symlink(src, dst)).await
+    inline(|| std::os::unix::fs::symlink(src, dst)).await
 }
 
 /// Unix-specific extensions to [`DirBuilder`](super::DirBuilder).

@@ -24,7 +24,8 @@ can be notified from any thread.
   Implies `event`.
 * `unblock`: `unblock`, which runs blocking work on a pool of threads, and `Unblock`, which makes a
   blocking I/O handle async that way.
-* `fs`: the `fs` module, async filesystem access. Implies `unblock` and `lock`.
+* `fs`: the `fs` module, async filesystem access that runs each operation on the thread that
+  polls it.
 * `tcp`: `TcpListener` and `TcpStream` in the `net` module. Implies `runtime`.
 * `udp`: `UdpSocket` in the `net` module. Implies `runtime`.
 * `unix`: the `net::unix` module, on unix only. Implies `runtime`.

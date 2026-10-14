@@ -13,26 +13,24 @@ use std::{
 
 use futures_core::Stream;
 
-use super::{FileType, Metadata, sealed::Sealed};
-use crate::{Unblock, unblock};
+#[cfg(any(unix, windows))]
+use super::sealed::Sealed;
+use super::{FileType, Metadata, inline};
+use crate::coop;
 
 /// A stream of the entries of a directory, created by [`read_dir()`](super::read_dir).
 ///
 /// It yields an [`io::Result`] of a [`DirEntry`] for each entry, and ends after the last one. The
-/// directory is read as the stream is polled, so an error can occur in the middle. The entries are
-/// in no particular order. `.` and `..` are not among them.
-///
-/// The stream is an [`Unblock`] over the directory of std. It pulls up to 16 entries in one piece
-/// of blocking work and yields them one by one. So the directory is read slightly ahead of the
-/// entries the stream has yielded, and an entry created after that read may or may not appear. See
-/// [`read_dir()`](super::read_dir) for an example.
-#[doc = not_on_wasi!()]
-pub struct ReadDir(Unblock<std::fs::ReadDir>);
+/// directory is read as the stream is polled, one entry for each poll, so an error can occur in the
+/// middle, and an entry created while the stream is read may or may not appear. The entries are in
+/// no particular order. `.` and `..` are not among them. See [`read_dir()`](super::read_dir) for an
+/// example.
+pub struct ReadDir(std::fs::ReadDir);
 
 impl ReadDir {
     /// A stream of the entries of `dir`.
     pub(super) fn new(dir: std::fs::ReadDir) -> Self {
-        Self(Unblock::new(dir))
+        Self(dir)
     }
 }
 
@@ -40,7 +38,10 @@ impl Stream for ReadDir {
     type Item = io::Result<DirEntry>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let entry = ready!(Pin::new(&mut self.0).poll_next(cx));
+        ready!(coop::poll_proceed(cx));
+        let entry = self.0.next();
+        coop::spend();
+
         Poll::Ready(entry.map(|entry| entry.map(|entry| DirEntry(Arc::new(entry)))))
     }
 }
@@ -55,11 +56,10 @@ impl fmt::Debug for ReadDir {
 ///
 /// The name and the path of the entry are already known and are read without waiting. Its
 /// [metadata](DirEntry::metadata) and [type](DirEntry::file_type) can need disk access, so they are
-/// read as blocking work. On unix, the `DirEntryExt` trait of the `unix` module adds the inode
-/// number.
+/// `async` methods, which run on the thread that polls the future like the other operations of the
+/// module. On unix, the `DirEntryExt` trait of the `unix` module adds the inode number.
 ///
 /// Cloning an entry is cheap. The clones share the entry of std.
-#[doc = not_on_wasi!()]
 #[derive(Clone)]
 pub struct DirEntry(Arc<std::fs::DirEntry>);
 
@@ -77,26 +77,23 @@ impl DirEntry {
 
     /// Reads the metadata of the entry itself, without following a symbolic link.
     ///
-    /// Runs [`std::fs::DirEntry::metadata`] as blocking work. For a symbolic link, it describes the
-    /// link and not its target. To read the metadata of the target, call
+    /// Runs [`std::fs::DirEntry::metadata`] on the thread that polls the future. For a symbolic
+    /// link, it describes the link and not its target. To read the metadata of the target, call
     /// [`metadata`](super::metadata) with the [`path`](DirEntry::path) of the entry.
     ///
     /// # Errors
     ///
     /// Fails if the entry was removed after the directory was read.
     pub async fn metadata(&self) -> io::Result<Metadata> {
-        let entry = self.0.clone();
-        unblock(move || entry.metadata()).await
+        inline(|| self.0.metadata()).await
     }
 
     /// Reads the type of the entry (file, directory or symbolic link), without following a link.
     ///
-    /// Runs [`std::fs::DirEntry::file_type`] as blocking work. Most platforms return the type
-    /// together with the entry, which makes this a short piece of work. Not all do, so it always
-    /// runs as blocking work.
+    /// Runs [`std::fs::DirEntry::file_type`] on the thread that polls the future. Most platforms
+    /// return the type together with the entry, which makes this a short call. Not all do.
     pub async fn file_type(&self) -> io::Result<FileType> {
-        let entry = self.0.clone();
-        unblock(move || entry.file_type()).await
+        inline(|| self.0.file_type()).await
     }
 }
 
@@ -106,6 +103,7 @@ impl fmt::Debug for DirEntry {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Sealed for DirEntry {}
 
 #[cfg(unix)]
@@ -140,7 +138,6 @@ impl super::unix::DirEntryExt for DirEntry {
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
-#[doc = not_on_wasi!()]
 #[derive(Debug, Default)]
 pub struct DirBuilder {
     /// Whether the parents that are missing are made as well, and a directory that is there
@@ -169,16 +166,16 @@ impl DirBuilder {
 
     /// Creates the directory at `path` with the options of the builder.
     ///
-    /// Runs [`std::fs::DirBuilder::create`] as blocking work. The returned future does not borrow
-    /// the builder, so the builder can be changed or dropped right away. The future does nothing
-    /// until it is polled.
+    /// Runs [`std::fs::DirBuilder::create`] on the thread that polls the future. The returned
+    /// future does not borrow the builder, so the builder can be changed or dropped right away. The
+    /// future does nothing until it is polled.
     pub fn create<P>(&self, path: P) -> impl Future<Output = io::Result<()>> + use<P>
     where
         P: AsRef<Path>,
     {
         let builder = self.to_std();
         let path = path.as_ref().to_owned();
-        async move { unblock(move || builder.create(path)).await }
+        inline(move || builder.create(path))
     }
 
     /// The builder of std with the options of this one.
@@ -193,6 +190,7 @@ impl DirBuilder {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Sealed for DirBuilder {}
 
 #[cfg(unix)]
