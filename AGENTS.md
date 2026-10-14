@@ -241,8 +241,9 @@ a new one goes in the list of its job.
 src/
 ├── lib.rs        # Public API: Runtime, LocalRuntime, SharedRuntime, Registration, Readiness,
 │                 # Interest, AsyncIo, Source, Task, Sleep, Timeout, TimedOut, Interval,
-│                 # MissedTickBehavior, and the free spawn and spawn_local (runtime feature),
-│                 # Event, EventListener (event feature), and the free block_on (helper feature)
+│                 # MissedTickBehavior, and the free spawn, spawn_local and unconstrained
+│                 # (runtime feature), Event, EventListener (event feature), and the free
+│                 # block_on (helper feature)
 ├── async_io.rs   # [runtime feature] AsyncIo<T, M>: the async handle of any source the reactor
 │                 # can watch
 ├── event.rs      # [event feature] Event/EventListener: a notification tasks wait for, under
@@ -269,6 +270,8 @@ src/
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
+├── coop.rs       # [runtime feature] The budget of I/O operations one poll may complete before
+│                 # the next yields, kept in a thread-local, and unconstrained, which lifts it
 ├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, Timeout and Interval
 ├── poll/         # [runtime feature] The OS pollers: epoll.rs (Linux, Android), kqueue.rs (the
 │                 # BSDs), select.rs (Apple), generic.rs (poll(2), any other unix, and WASI),
@@ -277,12 +280,12 @@ src/
 ├── driver.rs     # [helper feature] the seat/helper-thread machinery, per-thread registries
 ├── unblock/      # [unblock feature] Blocking work on a pool of threads (pool.rs), and the
 │                 # Unblock adapter of a blocking I/O handle (io.rs), with no use of the runtime
-└── tests/        # core.rs: Local + Shared, runtime feature; event.rs: Event, event feature;
-                  # broadcast.rs: the broadcast channel, broadcast feature; mpmc.rs: the MPMC
-                  # channel, mpmc feature; lock/: the locks, lock feature; helper.rs: helper
-                  # feature; unblock/: unblock, its pool and Unblock, unblock feature; fs.rs: fs,
-                  # fs feature; net/: the sockets, each family under its own feature; process.rs:
-                  # child processes, process feature
+└── tests/        # core.rs: Local + Shared, runtime feature; coop.rs: the I/O budget, runtime
+                  # feature; event.rs: Event, event feature; broadcast.rs: the broadcast channel,
+                  # broadcast feature; mpmc.rs: the MPMC channel, mpmc feature; lock/: the locks,
+                  # lock feature; helper.rs: helper feature; unblock/: unblock, its pool and
+                  # Unblock, unblock feature; fs.rs: fs, fs feature; net/: the sockets, each
+                  # family under its own feature; process.rs: child processes, process feature
 ```
 
 The tests in `src/tests/` are the unit tests of the crate, one binary whose tests run side by side.
@@ -363,6 +366,66 @@ out of the pointer: on `Local` nothing else holds it by then, and on `Shared` it
 under way on another thread returns and the reactor lets go of the source it kept for that wait,
 which it does clear of every lock and before it wakes anyone.
 
+**Cooperative budget**: a poll runs until it returns, so a task whose I/O is always ready would hold
+the thread, and with it the other tasks and the reactor, for as long as its loop lasts. `coop.rs`
+limits that with a budget of `BUDGET` (128) I/O operations per poll, kept in the `LEFT`
+thread-local. `coop::budgeted` sets it for the length of one poll: in `Scheduler::run`, around a
+task's poll (which covers `run_batch` from `block_on`, from the seat and from the helper alike), and
+in `Core::block_on` and `driver::block_on`, around the poll of the future passed to them, which the
+tasks wait out as they wait out each other. Three places spend it, and they are the only three that
+run an I/O operation: `Registration::poll_io`, `AsyncIo::run_with` (the body of `read_with` and
+`write_with`) and `UnixDatagram::send_to`, which waits for room on a timer rather than for readiness
+(see `SEND_TO_INTERVAL`), so that neither of the first two can run its send. Each calls
+`poll_proceed` before the operation, which, once the budget is zero, wakes the task with
+`wake_by_ref` and returns `Pending` without running it, every time it is asked until the poll is
+over, and `spend` once the operation has completed, which is anything but `WouldBlock`. `run_with`
+and `send_to` retry an `Interrupted` call straight away, and that spends nothing; `poll_io` hands it
+back like any other result. The other sockets, the traits of `AsyncIo` and, on unix, the pipes to a
+child go through the first two. `readable`, `writable` and `Registration::ready` spend nothing, nor
+do the waits for a child's exit that use them, nor do the pipes on Windows, which are an `Unblock`.
+A yield puts the task at the back of the ready queue, behind the tasks queued before it, but the
+reactor is waited on only at the end of a batch (`Core::round`), and `Scheduler::run_batch` takes a
+task its own polls woke again within the same batch: a task alone in the queue runs up to `BATCH`
+times `BUDGET` operations before the reactor has its turn.
+
+The budget is per thread, not per task: a poll runs on one thread from its start to its end, so an
+operation finds it without being handed it, and a thread inside no poll by a runtime of this crate
+has `None`, for which `poll_proceed` always proceeds and `spend` does nothing, so that another
+executor is not held to a budget outside such a poll. Inside one it is: an executor of another crate
+that a task runs, such as `futures::executor::block_on`, never calls `budgeted`, so it shares what
+is left of the task's budget. Once that is gone, an executor that blocks until its future is done
+polls again at once, inside the same poll of the task, is turned away again, and spins for good. So
+it has to run its future inside `unconstrained`, public and re-exported at the crate root (tokio has
+the same as `tokio::task::unconstrained`): each poll it makes of its future sets `LEFT` to `None`
+and puts the old value back through `Restore`, so that the operations of that future neither wait on
+the budget nor spend it, and the poll around it goes on with what it had left. It is an `async fn`,
+where tokio's returns a type of its own, `Unconstrained`: such a type would have to pin the future
+it runs structurally, which takes `unsafe` code, a dependency such as `pin-project-lite`, or a box
+on every call. No rule in `poll_proceed` can let such an executor through by itself, because a waker
+does not identify a future. `select_all` polls many leaf futures with one waker, the task's, within
+one poll; a blocking executor polls one leaf again and again with one waker, its own, within one
+poll; and `poll_proceed` sees the same in both: operations that ask inside one poll, one after
+another, each with a waker that the refusal before it woke. A cap on how many operations a poll may
+turn away, or any other heuristic on what `poll_proceed` sees, lets the operations of the combinator
+through along with those of the executor: with such a cap at `BUDGET`, a task that has `select_all`
+poll `BUDGET + 1` readers of a source that is always ready would read as much in one poll as nine
+budgets allow, and `a_task_that_selects_over_more_readers_than_its_budget_yields_to_the_next` in
+`src/tests/async_io.rs` would fail. Keying the budget on the task's waker fails the same way: a
+combinator that wraps the waker (`FuturesUnordered`, `Shared`) would have its futures let through.
+`LEFT` is a `Cell<Option<u8>>` with a constant initialiser, so it has no destructor, like the
+`driven` record and the `Remote` marker (see "Spawning without a runtime handle"): a `block_on` run
+from the destructor of another thread-local can still reach it, and is budgeted like any other.
+`budgeted` puts the old value back, through the drop guard `Restore`, instead of clearing it, so
+that a poll made from inside another that is budgeted too ends with what was left of the poll it
+came from. The one case of that is the free `block_on` called from inside the future of another call
+of it that holds no seat (`leave_the_outer_call`): a `Runtime::block_on` called from a task, or from
+inside the future of any `block_on`, panics. It puts the old value back as a panic unwinds too: the
+scheduler's poll sits inside `catch_unwind`, and a caller can catch a panic out of `block_on`, and a
+budget left behind by either would belong to no poll, and would turn away the operations of the
+plain code after it for good, though it has no tasks to give the thread to. The number is named in
+the documentation of `Registration::poll_io`, in the README's Tasks section and here, so a change to
+`BUDGET` is a change in each.
+
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
 `Task::cancel` cancels it and hands back a future that resolves once the task's future is gone:
@@ -436,6 +499,8 @@ neither kind of wait takes the place of the other. A stream implements `futures-
 - `src/async_io.rs`: `AsyncIo<T, M>`, the async handle of any source the reactor can watch, built on
   a `Registration` and the `Ptr<T>` of the source it shares with the reactor
 - `src/scheduler.rs`: Task storage and polling
+- `src/coop.rs`: The budget of I/O operations one poll may complete before the next yields, which
+  the scheduler and the `block_on`s set, `poll_io` and `AsyncIo` spend, and `unconstrained` lifts
 - `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
