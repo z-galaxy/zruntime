@@ -181,7 +181,8 @@ pub(crate) fn spend() {
 /// a task with a lot of ready I/O gives up the thread long before the tasks behind it notice.
 ///
 /// Named as a number in the documentation of `Registration::poll_io` and of the `fs` module, in the
-/// Tasks section of the README and in `AGENTS.md`, so that a change here is a change there too.
+/// Tasks and Files sections of the README and in `AGENTS.md`, so that a change here is a change
+/// there too.
 #[cfg(feature = "runtime")]
 pub(crate) const BUDGET: u8 = 128;
 

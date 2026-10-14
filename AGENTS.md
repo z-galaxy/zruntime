@@ -59,10 +59,16 @@ and `futures-core`'s `Stream` by running each operation on it as such work. Both
 and work under any executor. Neither is built on WASI, which cannot start a thread for the work.
 
 A non-default `fs` feature, which adds `futures-io` and `futures-core` dependencies, gives
-`zruntime::fs`: async access to the filesystem in the shape of `std::fs`, as smol has in
-`smol::fs` (the async-fs crate), with each operation run on the thread that polls its future, within
-that poll, and a `File` that holds std's file. It needs no runtime and works under any executor. It
-is not built on WASI.
+`zruntime::fs`: async access to the filesystem in the shape of `std::fs`, as smol has in `smol::fs`
+(the async-fs crate), with each operation run on the thread that polls its future, within that poll,
+and a `File` that holds std's file. No poller can say when a regular file is ready (epoll refuses to
+watch one, `poll(2)` reports it as always ready, kqueue as ready while its position is short of its
+end, and Winsock's `select` watches only sockets), so there is nothing to wait for: an operation
+that misses the OS cache, runs on a slow or network mount or moves a large buffer blocks the thread,
+and every task on it, while it runs. The module's documentation says so, and points to `unblock` for
+work that must not block. Each operation spends the cooperative budget (see "Cooperative budget").
+The module needs no runtime and works under any executor. It builds on WASI too, with a few
+differences that the WASI paragraph below lists.
 
 A non-default `tcp` feature, which implies `runtime` and adds the `socket2` dependency, gives the
 `zruntime::net` module's TCP sockets, `TcpListener` and `TcpStream`, as smol has in `smol::net`.
@@ -105,16 +111,22 @@ a thread, so nothing in the crate starts one there: `driver::spawn_helper` start
 runtime with a seat runs only inside `block_on` on it. It checks `cfg!(target_os = "wasi")`, so that
 the threads' side of the code still builds there; no `cfg` tells `wasm32-wasip1-threads` apart, so
 it gets the same treatment. Blocking work would have to run on the thread that polls it, blocking
-every task on that thread, so the `unblock` and `fs` features build nothing on WASI: each of their
-public items has a `WASI` section in its documentation, from the `not_on_wasi!` macro of its module,
-that says why and what could change it. `std::thread::park` returns at once on WASI, so nothing
-reachable there may wait in a park for another thread. The `tcp` and `udp` sockets work on
-preview 2; preview 1 cannot create a socket, so socket2, which does not build for it, is no
-dependency there, and the constructors that create one fail with `Unsupported` (a TCP socket's
-`from_std` takes one the host handed in). Preview 1 has no UDP at all: std fails every operation of
-its UDP socket there, so `UdpSocket::from_std` fails too. The `unix` and `process` features build
-nothing on WASI. `ci/wasi` is a crate of its own that runs the runtime, the shared runtimes and the
-sockets on both previews under wasmtime.
+every task on that thread, so the `unblock` feature builds nothing on WASI: each of its public items
+has a `WASI` section in its documentation, from the `not_on_wasi!` macro of its module, that says
+why and what could change it. The `fs` feature builds there, as it needs no thread of its own (it
+runs each operation on the thread that polls it everywhere), and works on both previews, with these
+differences: a path reaches only the directories the host lends the program (`wasmtime run --dir`);
+`set_permissions` and `File::set_permissions` fail with `Unsupported`, WASI having no permissions;
+there is no `unix` or `windows` module; and `File` has its `AsFd`, `AsRawFd` and `From<OwnedFd>`
+impls there as on unix. `std::thread::park` returns at once on WASI, so nothing reachable there may
+wait in a park for another thread. The `tcp` and `udp` sockets work on preview 2; preview 1 cannot
+create a socket, so socket2, which does not build for it, is no dependency there, and the
+constructors that create one fail with `Unsupported` (a TCP socket's `from_std` takes one the host
+handed in). Preview 1 has no UDP at all: std fails every operation of its UDP socket there, so
+`UdpSocket::from_std` fails too. The `unix` and `process` features build nothing on WASI. `ci/wasi`
+is a crate of its own that runs the runtime, the shared runtimes, the `fs` module and the sockets on
+both previews under wasmtime, with a host directory lent to it as `/data` for the files of the `fs`
+module.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -188,12 +200,15 @@ cargo clippy --all-features --target wasm32-wasip1 -- -D warnings
 cargo clippy --all-features --target wasm32-wasip2 -- -D warnings
 cargo clippy --no-default-features --features tcp --target wasm32-wasip1 -- -D warnings
 
-# Run the runtime, the shared runtimes and the sockets on WASI under wasmtime, as CI does: the
-# sockets need preview 2 and the network
+# Run the runtime, the shared runtimes, the filesystem module and the sockets on WASI under
+# wasmtime, as CI does: the filesystem module works in a host directory that `--dir` lends as
+# `/data`, and the sockets need preview 2 and the network
 cargo build --target wasm32-wasip1 --manifest-path ci/wasi/Cargo.toml
 cargo build --target wasm32-wasip2 --manifest-path ci/wasi/Cargo.toml
-wasmtime run ci/wasi/target/wasm32-wasip1/debug/zruntime-wasi-check.wasm
-wasmtime run -S inherit-network ci/wasi/target/wasm32-wasip2/debug/zruntime-wasi-check.wasm
+data=$(mktemp -d)
+wasmtime run --dir "$data"::/data ci/wasi/target/wasm32-wasip1/debug/zruntime-wasi-check.wasm
+wasmtime run -S inherit-network --dir "$data"::/data \
+    ci/wasi/target/wasm32-wasip2/debug/zruntime-wasi-check.wasm
 
 # Check cross-platform compatibility
 cargo check --all-features --target x86_64-pc-windows-gnu
@@ -254,8 +269,8 @@ src/
 │                 # built on Event, with no use of the runtime
 ├── mpmc.rs       # [mpmc feature] The async multi-producer multi-consumer channel, each
 │                 # message to one receiver, built on Event, with no use of the runtime
-├── fs/           # [fs feature] Async filesystem access, built on unblock and Unblock, with no
-│                 # use of the runtime
+├── fs/           # [fs feature] Async filesystem access, each operation run within the poll of
+│                 # its future, with no use of the runtime
 ├── lock/         # [lock feature] Mutex, RwLock, Semaphore, Barrier and OnceCell, built on Event,
 │                 # with no use of the runtime
 ├── log.rs        # [runtime feature] Logging through `tracing`, or nothing without it
@@ -270,8 +285,9 @@ src/
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
-├── coop.rs       # [runtime feature] The budget of I/O operations one poll may complete before
-│                 # the next yields, kept in a thread-local, and unconstrained, which lifts it
+├── coop.rs       # [runtime, fs features] The budget of I/O operations one poll may complete
+│                 # before the next yields, kept in a thread-local, and unconstrained, which lifts
+│                 # it; fs spends it with no runtime
 ├── time.rs       # [runtime feature] The timers a runtime hands out: Sleep, Timeout and Interval
 ├── poll/         # [runtime feature] The OS pollers: epoll.rs (Linux, Android), kqueue.rs (the
 │                 # BSDs), select.rs (Apple), generic.rs (poll(2), any other unix, and WASI),
@@ -372,21 +388,26 @@ limits that with a budget of `BUDGET` (128) I/O operations per poll, kept in the
 thread-local. `coop::budgeted` sets it for the length of one poll: in `Scheduler::run`, around a
 task's poll (which covers `run_batch` from `block_on`, from the seat and from the helper alike), and
 in `Core::block_on` and `driver::block_on`, around the poll of the future passed to them, which the
-tasks wait out as they wait out each other. Three places spend it, and they are the only three that
+tasks wait out as they wait out each other. Four places spend it, and they are the only four that
 run an I/O operation: `Registration::poll_io`, `AsyncIo::run_with` (the body of `read_with` and
-`write_with`) and `UnixDatagram::send_to`, which waits for room on a timer rather than for readiness
-(see `SEND_TO_INTERVAL`), so that neither of the first two can run its send. Each calls
-`poll_proceed` before the operation, which, once the budget is zero, wakes the task with
-`wake_by_ref` and returns `Pending` without running it, every time it is asked until the poll is
-over, and `spend` once the operation has completed, which is anything but `WouldBlock`. `run_with`
-and `send_to` retry an `Interrupted` call straight away, and that spends nothing; `poll_io` hands it
-back like any other result. The other sockets, the traits of `AsyncIo` and, on unix, the pipes to a
-child go through the first two. `readable`, `writable` and `Registration::ready` spend nothing, nor
-do the waits for a child's exit that use them, nor do the pipes on Windows, which are an `Unblock`.
-A yield puts the task at the back of the ready queue, behind the tasks queued before it, but the
-reactor is waited on only at the end of a batch (`Core::round`), and `Scheduler::run_batch` takes a
-task its own polls woke again within the same batch: a task alone in the queue runs up to `BATCH`
-times `BUDGET` operations before the reactor has its turn.
+`write_with`), `UnixDatagram::send_to`, which waits for room on a timer rather than for readiness
+(see `SEND_TO_INTERVAL`), so that neither of the first two can run its send, and the `fs` module,
+whose files no reactor can wait on, in `fs::inline` (the future of each function or method that
+makes a single call), `poll_inline` in `fs/file.rs` (a read, a write or a seek of a `File`) and
+`ReadDir::poll_next`. Each calls `poll_proceed` before the operation, which, once the budget is
+zero, wakes the task with `wake_by_ref` and returns `Pending` without running it, every time it is
+asked until the poll is over, and `spend` once the operation has completed. For the first three that
+is anything but `WouldBlock`, which they wait out on the reactor or, for `send_to`, on a timer; the
+`fs` places have nothing to wait on, so they spend on every result, `WouldBlock` included.
+`run_with`, `send_to` and `poll_inline` retry an `Interrupted` call straight away, and that spends
+nothing; `poll_io` hands it back like any other result. The other sockets, the traits of `AsyncIo`
+and, on unix, the pipes to a child go through the first two. `readable`, `writable` and
+`Registration::ready` spend nothing, nor do the waits for a child's exit that use them, nor do the
+pipes on Windows, which are an `Unblock`. A yield puts the task at the back of the ready queue,
+behind the tasks queued before it, but the reactor is waited on only at the end of a batch
+(`Core::round`), and `Scheduler::run_batch` takes a task its own polls woke again within the same
+batch: a task alone in the queue runs up to `BATCH` times `BUDGET` operations before the reactor has
+its turn.
 
 The budget is per thread, not per task: a poll runs on one thread from its start to its end, so an
 operation finds it without being handed it, and a thread inside no poll by a runtime of this crate
@@ -423,8 +444,17 @@ inside the future of any `block_on`, panics. It puts the old value back as a pan
 scheduler's poll sits inside `catch_unwind`, and a caller can catch a panic out of `block_on`, and a
 budget left behind by either would belong to no poll, and would turn away the operations of the
 plain code after it for good, though it has no tasks to give the thread to. The number is named in
-the documentation of `Registration::poll_io`, in the README's Tasks section and here, so a change to
-`BUDGET` is a change in each.
+the documentation of `Registration::poll_io` and of the `fs` module, in the README's Tasks and Files
+sections and here, so a change to `BUDGET` is a change in each.
+
+`coop.rs` is also built for `fs` without the runtime (`any(feature = "runtime", feature = "fs")`).
+That does not break "must not reach into the runtime": the module is a thread-local and four
+functions (`budgeted`, `unconstrained`, `poll_proceed` and `spend`), and names no type of the
+runtime, its scheduler or its reactor. `poll_proceed` and `spend`, the two that `fs` calls, are
+built for either feature; `budgeted`, `unconstrained`, `Restore` and `BUDGET`, which set a budget or
+lift it, for `runtime` alone. With no runtime nothing sets `LEFT`, so it is `None` on every thread,
+`poll_proceed` always proceeds and `spend` does nothing: every `fs` operation runs, whatever
+executor polls it.
 
 **Cooperative cancellation**: dropping a `Task` cancels it; `Task::detach` lets it run to
 completion unobserved; `Task::is_finished` tells, without polling it, whether it has ended.
@@ -469,14 +499,15 @@ neither kind of wait takes the place of the other. A stream implements `futures-
 - **Features**: `runtime` and `event` each build without the other. Nothing in `event.rs` may reach
   into the runtime, and a test of the runtime that uses an `Event` is gated with
   `#[cfg(feature = "event")]` (`cargo test --no-default-features --features runtime` builds the
-  tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach
-  into the runtime; nor may `unblock` or `fs`, which need neither. `unblock` and `fs` build nothing
-  on WASI. `tcp`, `udp` and `unix` imply `runtime`, and
-  `unix` builds nothing on Windows or WASI. `process` implies `runtime` and `unblock`, and builds
-  nothing on WASI. CI builds and tests everything with every feature on, tests `runtime` alone
-  (for what `spawn` does without `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`,
-  `lock`, `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone, on the host and on both
-  WASI targets.
+  tests without it). `broadcast`, `mpmc` and `lock` imply `event` and, like it, must not reach into
+  the runtime; nor may `unblock` or `fs`, which need neither (`fs` spends the budget kept by `coop`,
+  which is built without the runtime when only `fs` is on: see "Cooperative budget"). `unblock`
+  builds nothing on WASI, and `fs` builds there. `tcp`, `udp` and `unix` imply `runtime`, and `unix`
+  builds nothing on Windows or WASI. `process` implies `runtime` and `unblock`, and builds nothing
+  on WASI. CI builds and tests everything with every feature on, tests `runtime` alone (for what
+  `spawn` does without `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`, `lock`,
+  `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone, on the host and on both WASI
+  targets.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
   Tests, doc examples and benchmarks take `block_on`, the combinators and the I/O extension traits
   from the `futures` dev-dependency (no default features; `std` and `executor`), the crate the
@@ -499,8 +530,9 @@ neither kind of wait takes the place of the other. A stream implements `futures-
 - `src/async_io.rs`: `AsyncIo<T, M>`, the async handle of any source the reactor can watch, built on
   a `Registration` and the `Ptr<T>` of the source it shares with the reactor
 - `src/scheduler.rs`: Task storage and polling
-- `src/coop.rs`: The budget of I/O operations one poll may complete before the next yields, which
-  the scheduler and the `block_on`s set, `poll_io` and `AsyncIo` spend, and `unconstrained` lifts
+- `src/coop.rs`: [runtime, fs features] The budget of I/O operations one poll may complete before
+  the next yields, which the scheduler and the `block_on`s set, `poll_io`, `AsyncIo` and the `fs`
+  module spend, and `unconstrained` lifts
 - `src/time.rs`: The timers a runtime hands out, each built on a deadline its reactor keeps
 - `src/event.rs`: `Event`/`EventListener`, a queue of listeners in a slab behind one mutex, and an
   atomic word beside it that lets a notification that would reach nobody skip the mutex
@@ -509,9 +541,10 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   `OnceCell`, built on `Event` too
 - `src/unblock/`: [unblock feature] `unblock`, blocking work on a pool of threads (`pool.rs`), and
   `Unblock`, the async adapter of a blocking I/O handle built on it (`io.rs`)
-- `src/fs/`: [fs feature] Async filesystem access: the free functions (`mod.rs`), `File` on
-  `Unblock` (`file.rs`), `ReadDir`/`DirEntry`/`DirBuilder` (`dir.rs`), `OpenOptions`
-  (`options.rs`), and the platform extension traits (`unix.rs`, `windows.rs`)
+- `src/fs/`: [fs feature] Async filesystem access: the free functions, and `inline`, which runs
+  each of them within the poll of its future and spends the budget (`mod.rs`), `File` on std's
+  file (`file.rs`), `ReadDir`/`DirEntry`/`DirBuilder` (`dir.rs`), `OpenOptions` (`options.rs`), and
+  the platform extension traits (`unix.rs`, `windows.rs`)
 - `src/net/connect.rs`: [tcp, unix features] The non-blocking connect, and Winsock's check of one
 - `src/process/`: [process feature] Async child processes: `Command` and `Child`, and the `WAITS`
   pool that the waits for children run on (`mod.rs`), the pipes to a child (`stdio.rs`), and the
