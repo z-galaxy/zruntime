@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0 - 2026-10-14
+
+### ✨ Added
+- Build the fs module on WASI.
+- Build the TCP and UDP sockets on WASI.
+- Run the reactor on WASI.
+
+### 💥 Breaking
+- Have the fs feature no longer turn on unblock and lock.
+
+### 👷 CI
+- Run the fs module on WASI in CI.
+- Lint and run zruntime on WASI in CI.
+
+### ♻️ Changed
+- Run the operations of fs on the thread that polls them.
+- Yield from a poll after 128 I/O operations.
+- Build nothing for the process feature on WASI.
+- Start no helper thread on WASI.
+- Build no blocking work on WASI.
+
+### 📝 Documentation
+- Show the belt drive logo in the README and API docs.
+- Replace the Shuttle logo with a belt drive.
+- Document fs on the thread that polls it, and on WASI.
+- Document the cooperative budget.
+- Have docs.rs build the documentation for WASI too.
+- Document the support of WASI.
+
 ## 0.1.0 - 2026-10-13
 
 ### ✨ Added
