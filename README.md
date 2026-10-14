@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img alt="zruntime logo" src="https://raw.githubusercontent.com/z-galaxy/zruntime/ea4838abe428518349fb90cad0e71d097bd65e96/data/logo.svg">
+  <img alt="zruntime logo" src="https://raw.githubusercontent.com/z-galaxy/zruntime/f7ba9e0ca073c3d2981bbb443a74ad62a863255e/data/logo.svg">
 </p>
 
 <h1 align="center">zruntime</h1>
