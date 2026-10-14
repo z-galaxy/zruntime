@@ -16,4 +16,5 @@ zruntime = { path = "../..", default-features = false, features = [
     "helper",
     "tcp",
     "udp",
+    "fs",
 ] }
