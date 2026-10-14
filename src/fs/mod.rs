@@ -42,7 +42,13 @@
 //!
 //! # WASI
 //!
-//! The module is not built on WASI.
+//! The module works on WASI as it does elsewhere, with these differences:
+//!
+//! * A path reaches only the directories that the host lends the program, its "preopened"
+//!   directories. With wasmtime, `wasmtime run --dir` lends one.
+//! * WASI has no permissions, so [`set_permissions`] and [`File::set_permissions`] fail with
+//!   [`Unsupported`](io::ErrorKind::Unsupported).
+//! * There is no `unix` or `windows` module of extensions.
 //!
 //! # Dropping a future
 //!
@@ -126,25 +132,6 @@
 //!
 //! [`async-fs`]: https://crates.io/crates/async-fs
 
-/// The `WASI` section of the documentation of each item of the module, which is not built on WASI.
-macro_rules! not_on_wasi {
-    () => {
-        "\n\n# WASI\n\n\
-        Not available on WASI. The module runs each operation through `std::fs` as blocking \
-        work, on a pool of threads, and `wasm32-wasip1` and `wasm32-wasip2` cannot start a \
-        thread. Running the operation on the thread that polls its future instead would block \
-        that thread, and every task on it, until the operation is done, which is no async at \
-        all.\n\n\
-        A WASI target with threads could run the module as it is, once it can be told apart \
-        from one without: `wasm32-wasip1-threads` can start threads, but no `cfg` sets it apart \
-        from `wasm32-wasip1`. Without threads, the module would need a backend of its own on \
-        WASI's filesystem interface. On `wasm32-wasip2`, that interface reads and writes a file \
-        through streams that can be waited on without blocking, but its operations on paths \
-        and metadata, such as opening a file, reading a directory or renaming, block until \
-        they are done. WASI 0.3 makes those async too."
-    };
-}
-
 mod dir;
 mod file;
 mod options;
@@ -175,7 +162,6 @@ use crate::coop;
 /// # Errors
 ///
 /// Fails if `path`, or any directory on the way to it, does not exist.
-#[doc = not_on_wasi!()]
 pub async fn canonicalize<P>(path: P) -> io::Result<PathBuf>
 where
     P: AsRef<Path>,
@@ -189,7 +175,6 @@ where
 /// Runs [`std::fs::copy`] on the thread that polls the future. An existing `dst` is overwritten. If
 /// `dst` is the same file as `src`, it is likely to be truncated. To copy between two open
 /// [`File`]s, use an async copy that reads and writes through them, such as `futures::io::copy`.
-#[doc = not_on_wasi!()]
 pub async fn copy<P, Q>(src: P, dst: Q) -> io::Result<u64>
 where
     P: AsRef<Path>,
@@ -206,7 +191,6 @@ where
 ///
 /// Fails if the parent of `path` does not exist, or if `path` already exists. To create missing
 /// parents and accept an existing directory, use [`create_dir_all`].
-#[doc = not_on_wasi!()]
 pub async fn create_dir<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -218,7 +202,6 @@ where
 ///
 /// Runs [`std::fs::create_dir_all`] on the thread that polls the future. It is not an error if the
 /// directory already exists, or if another thread or process creates it in the meantime.
-#[doc = not_on_wasi!()]
 pub async fn create_dir_all<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -230,7 +213,6 @@ where
 ///
 /// Runs [`std::fs::hard_link`] on the thread that polls the future. Both names refer to the same
 /// file. Most operating systems allow this only for two names on the same filesystem.
-#[doc = not_on_wasi!()]
 pub async fn hard_link<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -243,7 +225,6 @@ where
 ///
 /// Runs [`std::fs::metadata`] on the thread that polls the future. To read the metadata of a link
 /// itself, use [`symlink_metadata`].
-#[doc = not_on_wasi!()]
 pub async fn metadata<P>(path: P) -> io::Result<Metadata>
 where
     P: AsRef<Path>,
@@ -257,7 +238,6 @@ where
 /// the file where it can, so it reads a file in a call or two. That makes it cheaper than opening
 /// a [`File`] and reading that, which takes a call per chunk read. To read text, use
 /// [`read_to_string`].
-#[doc = not_on_wasi!()]
 pub async fn read<P>(path: P) -> io::Result<Vec<u8>>
 where
     P: AsRef<Path>,
@@ -303,7 +283,6 @@ where
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
-#[doc = not_on_wasi!()]
 pub async fn read_dir<P>(path: P) -> io::Result<ReadDir>
 where
     P: AsRef<Path>,
@@ -316,7 +295,6 @@ where
 ///
 /// Runs [`std::fs::read_link`] on the thread that polls the future. The path it returns is the one
 /// stored in the link. It can be relative to the directory of the link, and can lead nowhere.
-#[doc = not_on_wasi!()]
 pub async fn read_link<P>(path: P) -> io::Result<PathBuf>
 where
     P: AsRef<Path>,
@@ -332,7 +310,6 @@ where
 /// # Errors
 ///
 /// Fails with [`InvalidData`](io::ErrorKind::InvalidData) if the file is not valid UTF-8.
-#[doc = not_on_wasi!()]
 pub async fn read_to_string<P>(path: P) -> io::Result<String>
 where
     P: AsRef<Path>,
@@ -344,7 +321,6 @@ where
 ///
 /// Runs [`std::fs::remove_dir`] on the thread that polls the future. To remove a directory together
 /// with its contents, use [`remove_dir_all`].
-#[doc = not_on_wasi!()]
 pub async fn remove_dir<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -357,7 +333,6 @@ where
 /// Runs [`std::fs::remove_dir_all`] on the thread that polls the future. A large directory takes a
 /// while to remove, and the thread is held meanwhile. If the removal fails part of the way, what
 /// was not yet removed stays where it is.
-#[doc = not_on_wasi!()]
 pub async fn remove_dir_all<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -369,7 +344,6 @@ where
 ///
 /// Runs [`std::fs::remove_file`] on the thread that polls the future. It removes a name. For a
 /// symbolic link, that is the link and not its target.
-#[doc = not_on_wasi!()]
 pub async fn remove_file<P>(path: P) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -385,7 +359,6 @@ where
 /// # Errors
 ///
 /// Fails, for example, if `src` and `dst` are on different filesystems.
-#[doc = not_on_wasi!()]
 pub async fn rename<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -397,8 +370,8 @@ where
 /// Changes the permissions of the file or directory at `path` to `perm`.
 ///
 /// Runs [`std::fs::set_permissions`] on the thread that polls the future. To change only some of
-/// the permissions, start from the ones that [`metadata`] reads.
-#[doc = not_on_wasi!()]
+/// the permissions, start from the ones that [`metadata`] reads. WASI has no permissions, so there
+/// it fails with [`Unsupported`](io::ErrorKind::Unsupported).
 pub async fn set_permissions<P>(path: P, perm: Permissions) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -410,7 +383,6 @@ where
 ///
 /// Runs [`std::fs::symlink_metadata`] on the thread that polls the future. To read the metadata of
 /// what a link points at, use [`metadata`].
-#[doc = not_on_wasi!()]
 pub async fn symlink_metadata<P>(path: P) -> io::Result<Metadata>
 where
     P: AsRef<Path>,
@@ -422,7 +394,6 @@ where
 /// its contents if it does.
 ///
 /// Runs [`std::fs::write`] on the thread that polls the future.
-#[doc = not_on_wasi!()]
 pub async fn write<P, C>(path: P, contents: C) -> io::Result<()>
 where
     P: AsRef<Path>,
@@ -438,6 +409,7 @@ where
 /// supertrait, and sits in a module nobody outside can reach, so that nobody outside can implement
 /// it: the types of this module that it is implemented for are the only ones the extension traits
 /// are meant for.
+#[cfg(any(unix, windows))]
 pub(crate) mod sealed {
     /// Marks a type of this module that an extension trait is implemented for.
     pub trait Sealed {}

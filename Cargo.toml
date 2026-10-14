@@ -47,7 +47,8 @@ lock = ["event"]
 unblock = ["dep:futures-io", "dep:futures-core"]
 # The `fs` module: async access to the filesystem, with each operation run on the thread that polls
 # its future; needs no runtime. `futures-io` gives its file the async I/O traits, and `futures-core`
-# gives its stream of a directory's entries the `Stream` trait. Builds nothing on WASI.
+# gives its stream of a directory's entries the `Stream` trait. Builds on WASI too, where it reaches
+# the directories that the host lends the program.
 fs = ["dep:futures-io", "dep:futures-core"]
 # The `net` module's TCP sockets: `TcpListener` and `TcpStream`. On `wasm32-wasip1`, which cannot
 # create a socket, they can only be made from a std socket that the host handed in.

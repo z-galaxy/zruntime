@@ -13,7 +13,9 @@ use std::{
 
 use futures_core::Stream;
 
-use super::{FileType, Metadata, inline, sealed::Sealed};
+#[cfg(any(unix, windows))]
+use super::sealed::Sealed;
+use super::{FileType, Metadata, inline};
 use crate::coop;
 
 /// A stream of the entries of a directory, created by [`read_dir()`](super::read_dir).
@@ -23,7 +25,6 @@ use crate::coop;
 /// middle, and an entry created while the stream is read may or may not appear. The entries are in
 /// no particular order. `.` and `..` are not among them. See [`read_dir()`](super::read_dir) for an
 /// example.
-#[doc = not_on_wasi!()]
 pub struct ReadDir(std::fs::ReadDir);
 
 impl ReadDir {
@@ -59,7 +60,6 @@ impl fmt::Debug for ReadDir {
 /// module. On unix, the `DirEntryExt` trait of the `unix` module adds the inode number.
 ///
 /// Cloning an entry is cheap. The clones share the entry of std.
-#[doc = not_on_wasi!()]
 #[derive(Clone)]
 pub struct DirEntry(Arc<std::fs::DirEntry>);
 
@@ -103,6 +103,7 @@ impl fmt::Debug for DirEntry {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Sealed for DirEntry {}
 
 #[cfg(unix)]
@@ -137,7 +138,6 @@ impl super::unix::DirEntryExt for DirEntry {
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
-#[doc = not_on_wasi!()]
 #[derive(Debug, Default)]
 pub struct DirBuilder {
     /// Whether the parents that are missing are made as well, and a directory that is there
@@ -190,6 +190,7 @@ impl DirBuilder {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Sealed for DirBuilder {}
 
 #[cfg(unix)]

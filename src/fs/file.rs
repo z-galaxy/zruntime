@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
@@ -46,9 +46,9 @@ use crate::coop;
 ///
 /// # Raw handles
 ///
-/// On unix, the file implements `AsFd` and `AsRawFd`. On Windows, it implements `AsHandle` and
-/// `AsRawHandle`. They give the raw descriptor or handle, for calls that std or the OS has and this
-/// type does not. The file keeps no state of its own, so what is done through them, such as a
+/// On unix and WASI, the file implements `AsFd` and `AsRawFd`. On Windows, it implements `AsHandle`
+/// and `AsRawHandle`. They give the raw descriptor or handle, for calls that std or the OS has and
+/// this type does not. The file keeps no state of its own, so what is done through them, such as a
 /// seek, is what its next read or write finds.
 ///
 /// # Example
@@ -88,7 +88,6 @@ use crate::coop;
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
-#[doc = not_on_wasi!()]
 pub struct File(std::fs::File);
 
 impl File {
@@ -185,7 +184,8 @@ impl File {
 
     /// Changes the permissions of the file to `perm`.
     ///
-    /// Runs [`std::fs::File::set_permissions`] on the thread that polls the future.
+    /// Runs [`std::fs::File::set_permissions`] on the thread that polls the future. WASI has no
+    /// permissions, so there it fails with [`Unsupported`](io::ErrorKind::Unsupported).
     pub async fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         inline(|| self.0.set_permissions(perm)).await
     }
@@ -204,7 +204,7 @@ impl From<std::fs::File> for File {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl From<OwnedFd> for File {
     fn from(fd: OwnedFd) -> Self {
         Self::from(std::fs::File::from(fd))
@@ -218,14 +218,14 @@ impl From<OwnedHandle> for File {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl AsFd for File {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl AsRawFd for File {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()

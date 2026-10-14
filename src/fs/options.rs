@@ -2,7 +2,9 @@
 
 use std::{future::Future, io, path::Path};
 
-use super::{File, inline, sealed::Sealed};
+#[cfg(any(unix, windows))]
+use super::sealed::Sealed;
+use super::{File, inline};
 
 /// A builder for opening a file: for reading, writing or both, and for what to do if the file does
 /// or does not exist.
@@ -41,7 +43,6 @@ use super::{File, inline, sealed::Sealed};
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
-#[doc = not_on_wasi!()]
 #[derive(Clone, Debug)]
 pub struct OpenOptions(std::fs::OpenOptions);
 
@@ -136,6 +137,7 @@ impl Default for OpenOptions {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Sealed for OpenOptions {}
 
 #[cfg(unix)]
