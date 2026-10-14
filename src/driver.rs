@@ -18,6 +18,18 @@
 //! operation runs each of them on its own thread rather than behind a thread of the runtime's
 //! own.
 //!
+//! On WASI, no helper is ever started, as nothing in the crate starts a thread there: WASI without
+//! threads, `wasm32-wasip1` and `wasm32-wasip2`, cannot start one, and no `cfg` tells a WASI target
+//! with threads, such as `wasm32-wasip1-threads`, from one without, so such a target is treated the
+//! same way. The seat is left free where a helper would take it, and the work waits for the next
+//! `block_on` on its runtime: a runtime with a seat runs, as one made by `Runtime::new` does, only
+//! while a thread is inside `block_on` on it. Nor does anything hold it in between, as a
+//! helper holds the runtime it runs: one that no handle holds goes, with the work on it, as soon as
+//! no `block_on` drives it. With the helper never up, what wakes or waits for it finds none, and
+//! the rest of the seat works as it does anywhere: on a single thread, a `block_on` finds the seat
+//! free or panics where its thread is in it already, and on a target with threads, one finds it
+//! taken only by another thread's `block_on`, and parks until that call frees it.
+//!
 //! Which runtime a thread is in the seat of is written down in the one place every runtime keeps
 //! that record, the marker and the record of the runtime itself that [`set_driving`] writes, so
 //! that a wake on that thread spares itself the write that would break a wait the thread is not
@@ -272,6 +284,9 @@ fn stop_waiting_for(inner: &Arc<Core<Shared>>) {
 /// the work, and a thread in the seat either sees it in the round it is in or finds it where it
 /// decides whether to leave, which it does under this very lock. A thread inside `block_on`
 /// takes the seat on the next turn of its loop and finds the work then.
+///
+/// On WASI, where [`spawn_helper`] starts nothing, this starts no helper either, and the work waits
+/// for the next `block_on` on `inner`.
 pub(crate) fn ensure_helper(inner: &Arc<Core<Shared>>) {
     let Some(seat) = &inner.seat else {
         return;
@@ -470,6 +485,14 @@ where
         }
         match &*driving {
             Some(driving) => driving.round(&signal.woken, &mut failed_waits),
+            // On WASI without threads, a park returns at once, and the next turn polls again. No
+            // seat is ever found taken there: no helper is up, and the one thread there is would
+            // have been turned away on entering this call, had it been in the seat. So this is
+            // reached only while `resolve` names no runtime, and the turn after the poll that
+            // brings one into being takes its seat. A future that waits meanwhile for what no
+            // poll of it and no runtime this thread drives can bring, such as a task of a runtime
+            // nobody is inside `block_on` on, waits for good, as a park would have it wait with
+            // nobody to wake it, though it spins rather than sleeps.
             None => {
                 if !signal.woken.load(Ordering::Acquire) {
                     thread::park();
@@ -484,6 +507,9 @@ where
 ///
 /// Unlike [`ensure_helper`], this pays no heed to the caller being inside `block_on`: it is for
 /// the places where a thread that was running the work, or was about to, stops being able to.
+///
+/// On WASI, where [`spawn_helper`] starts nothing, the work is left for the next `block_on` on
+/// `inner`.
 fn hand_over(inner: &Arc<Core<Shared>>, seat: &mut Seat) {
     if !matches!(
         seat.holder,
@@ -498,7 +524,16 @@ fn hand_over(inner: &Arc<Core<Shared>>, seat: &mut Seat) {
 }
 
 /// Starts the helper thread. Under the seat lock, which `seat` is the guard of.
+///
+/// On WASI, starts nothing and leaves the seat free: no helper is ever up there (see the module
+/// documentation), so the work waits for the next `block_on` on `inner`.
 fn spawn_helper(inner: &Arc<Core<Shared>>, seat: &mut Seat) {
+    // The one place a helper is started, and so the one place it is kept from starting. A `cfg!`
+    // rather than a `#[cfg]`, so that the helper's side of the seat is still built on WASI, never
+    // run, rather than having each item of it left out there one by one.
+    if cfg!(target_os = "wasi") {
+        return;
+    }
     let inner = inner.clone();
     thread::Builder::new()
         .name(THREAD_NAME.into())

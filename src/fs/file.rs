@@ -135,6 +135,7 @@ use crate::{Unblock, lock::Mutex, unblock};
 /// .unwrap();
 /// # std::fs::remove_dir_all(&dir).unwrap();
 /// ```
+#[doc = not_on_wasi!()]
 pub struct File {
     /// The file, for the operations that are not reads, writes or seeks, and for the raw handle.
     /// The adapter holds the same file, in an [`ArcFile`], to run its operations on.

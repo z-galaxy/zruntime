@@ -35,7 +35,7 @@ use std::{
 
 use crate::{runtime::Core, scheduler::TaskWaker};
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::{AsFd as AsSource, BorrowedFd as BorrowedSource};
 #[cfg(windows)]
 use std::os::windows::io::{AsSocket as AsSource, BorrowedSocket as BorrowedSource};
@@ -468,7 +468,7 @@ pub(crate) mod sealed {
     }
 
     /// The descriptor of `source`.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     fn borrow_source<S>(source: &S) -> BorrowedSource<'_>
     where
         S: AsSource + ?Sized,

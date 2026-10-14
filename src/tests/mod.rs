@@ -47,7 +47,7 @@ mod mpmc;
     any(feature = "tcp", feature = "udp", all(feature = "unix", unix))
 ))]
 mod net;
-#[cfg(all(test, feature = "process"))]
+#[cfg(all(test, feature = "process", not(target_os = "wasi")))]
 mod process;
 #[cfg(all(test, feature = "unblock"))]
 mod unblock;
@@ -1331,7 +1331,7 @@ struct LocalUnixSocketsStayOnTheirThread;
 /// sent_and_shared::<ChildStderr<Shared>>();
 /// sent_and_shared::<Command>();
 /// ```
-#[cfg(all(doctest, feature = "process"))]
+#[cfg(all(doctest, feature = "process", not(target_os = "wasi")))]
 struct LocalChildrenStayOnTheirThread;
 
 /// Yields to the executor once: the first poll wakes the task and returns `Pending`, so that the

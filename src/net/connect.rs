@@ -1,7 +1,7 @@
 //! Connecting a stream socket without ever waiting in the kernel.
 
 use std::io;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::{AsFd as AsSource, OwnedFd as Owned};
 #[cfg(windows)]
 use std::os::windows::io::{AsSocket as AsSource, OwnedSocket as Owned};
@@ -89,7 +89,7 @@ where
 
 /// Whether `error` says the kernel is still working on the connection.
 fn is_in_progress(error: &io::Error) -> bool {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     {
         rustix::io::Errno::from_io_error(error) == Some(rustix::io::Errno::INPROGRESS)
     }
@@ -109,6 +109,10 @@ fn is_in_progress(error: &io::Error) -> bool {
 /// `select`, which puts the socket in `writefds` once the connection is made and in `exceptfds`
 /// once it has failed, and in neither while it is still under way.
 ///
+/// WASI is asked as unix is, and wasi-libc answers the two questions as unix does, with one
+/// addition: while the connection is under way, `SO_ERROR` holds `EINPROGRESS`. That is no reason
+/// for a failure, but one more mark of a connection that is still under way.
+///
 /// A unix connection can settle in between the two questions. One that fails there leaves its
 /// reason in `SO_ERROR` after the first question found none, and leaves the socket with no peer
 /// for the second: Linux and FreeBSD say so with `ENOTCONN`, but macOS answers `getpeername` on a
@@ -125,11 +129,13 @@ fn outcome<S>(socket: &S) -> io::Result<()>
 where
     S: AsSource,
 {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     {
         let socket = SockRef::from(socket);
 
         match socket.take_error()? {
+            #[cfg(target_os = "wasi")]
+            Some(e) if is_in_progress(&e) => Err(io::ErrorKind::WouldBlock.into()),
             Some(e) => Err(e),
             None => match socket.peer_addr() {
                 Ok(_) => Ok(()),

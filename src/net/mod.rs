@@ -53,6 +53,25 @@
 //! On Windows, a runtime watches at most 1023 sockets at a time. A server there can hold at most
 //! that many sockets on one runtime, its listener included.
 //!
+//! # Limits on WASI
+//!
+//! WASI has no unix-domain sockets, so the `unix` module is not there. Whether a program may use
+//! the network at all is for the host to say, and where it does not, the TCP and UDP operations
+//! that need it fail with the host's refusal.
+//!
+//! On `wasm32-wasip2`, the sockets work as they do on unix. The runtime watches them with
+//! `poll(2)`, and a connect does not block the thread.
+//!
+//! `wasm32-wasip1` cannot create a socket: `TcpStream::connect` and `TcpListener::bind` fail there
+//! with [`Unsupported`](std::io::ErrorKind::Unsupported). What the TCP sockets can do there is run
+//! on one that the host opened before the program started and handed in as a file descriptor. Make
+//! a std socket from the descriptor, for example with `FromRawFd::from_raw_fd`, and pass it to
+//! `TcpStream::from_std` or `TcpListener::from_std`.
+//!
+//! UDP is not available on `wasm32-wasip1` at all: every operation of std's UDP socket fails there
+//! with `Unsupported`, so `UdpSocket::bind` and `UdpSocket::from_std` do too, even on a socket that
+//! the host handed in.
+//!
 //! [`futures-io`]: https://docs.rs/futures-io
 //! [`futures`]: https://docs.rs/futures
 //! [`LocalRuntime`]: crate::LocalRuntime
@@ -62,12 +81,18 @@
 
 #[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
 use std::io;
-#[cfg(all(unix, any(feature = "tcp", feature = "unix")))]
+#[cfg(any(
+    all(any(unix, target_os = "wasi"), feature = "tcp"),
+    all(unix, feature = "unix")
+))]
 use std::os::fd::AsFd as AsSource;
 #[cfg(all(windows, feature = "tcp"))]
 use std::os::windows::io::AsSocket as AsSource;
 
-#[cfg(any(feature = "tcp", all(feature = "unix", unix)))]
+#[cfg(any(
+    all(feature = "tcp", not(all(target_os = "wasi", target_env = "p1"))),
+    all(feature = "unix", unix)
+))]
 mod connect;
 #[cfg(feature = "tcp")]
 mod tcp;

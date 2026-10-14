@@ -1,17 +1,12 @@
 //! [`AsyncIo`]: a non-blocking I/O handle that waits for its readiness on a runtime, and the I/O
 //! traits it implements.
 
-#[cfg(all(
-    unix,
-    any(
-        feature = "tcp",
-        feature = "udp",
-        feature = "unix",
-        feature = "process"
-    )
+#[cfg(any(
+    all(any(unix, target_os = "wasi"), any(feature = "tcp", feature = "udp")),
+    all(unix, any(feature = "unix", feature = "process"))
 ))]
 use std::os::fd::AsFd as AsSource;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(all(windows, any(feature = "tcp", feature = "udp")))]
 use std::os::windows::io::AsSocket as AsSource;
@@ -416,7 +411,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<T, M> AsFd for AsyncIo<T, M>
 where
     M: Mode,
@@ -427,7 +422,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 impl<T, M> AsRawFd for AsyncIo<T, M>
 where
     M: Mode,
@@ -571,7 +566,7 @@ where
 }
 
 /// Switches `io` to non-blocking mode.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn set_nonblocking<T>(io: &T) -> io::Result<()>
 where
     T: AsFd,
