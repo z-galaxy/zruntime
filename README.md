@@ -151,6 +151,33 @@ Both return a [`Task`], a handle to the task:
 * [`Task::detach`] lets the task run on without a handle.
 * [`Task::is_finished`] tells whether the task has ended, without taking its output.
 
+Tasks take turns, in the order they were woken. A task keeps the thread until its poll returns,
+and the poll of a task whose I/O is always ready, such as a loop that reads from a socket that
+already holds the bytes, would never return `Pending` on its own. It would hold up every other
+task, and the reactor, for as long as the loop lasts. So a runtime gives every poll a budget of 128
+I/O operations, and each operation that completes spends one. Once the budget is gone, the next
+operation, and every one after it in that poll, wakes its own task and returns `Pending` instead of
+running. That puts the task at the back of the queue: the tasks that were woken before it have
+their turn then, and the reactor has its own once the batch of polls the task is in is over. The
+task's next poll starts with a full budget. The future passed to [`Runtime::block_on`] or to the
+free [`block_on`] has the same budget, because the tasks run only between its polls.
+
+The sockets of the [`net`] module, [`AsyncIo`], [`Registration::poll_io`] and, on unix, the pipes to
+a child process spend the budget. Only an operation that completes counts: one that fails with
+`WouldBlock` spends nothing, and neither does waiting for readiness alone. The budget is for I/O
+alone, so a task that computes, or blocks, still holds the thread until its poll returns. A thread
+that is inside no poll by a runtime of this crate has no budget: a future polled there by another
+executor, or by plain code, never yields for it.
+
+The budget belongs to the thread, not to the future, so a future that another executor polls
+inside a task shares what is left of the task's budget. An executor that blocks the thread until its
+future is done, such as `futures::executor::block_on`, polls again as soon as an operation that
+yielded has woken it, inside the same poll of the task, where the operation yields again. Once the
+budget is spent, such an executor spins, and never gets its future done. So it has to run its
+future inside [`unconstrained`], which lifts the budget for each poll of that future and leaves the
+task's budget as it was. The task then holds the thread, and every other task, until the future is
+done. Awaiting the future in the task, or spawning it, lets the other tasks run meanwhile.
+
 ## Timers
 
 * [`Runtime::sleep`] waits for a duration, and [`Runtime::sleep_until`] waits until a deadline.
@@ -203,11 +230,15 @@ runtime and the source, and switches the source to non-blocking mode.
 Any number of tasks can wait through the four methods at once, but only one task per direction
 through the `AsyncRead` and `AsyncWrite` impls.
 
+Running an operation through [`AsyncIo::read_with`], [`AsyncIo::write_with`] or the `AsyncRead` and
+`AsyncWrite` impls counts against the budget that [Tasks](#tasks) describes. Waiting with
+[`AsyncIo::readable`] or [`AsyncIo::writable`] does not.
+
 `AsyncIo` is not for regular files: reading or writing one can block the thread, whatever its
 readiness says. Use [`Unblock`] or the [`fs`] module for files.
 
 For code that does its own polling, [`Runtime::register`] watches a source and returns a
-[`Registration`] to poll it through.
+[`Registration`] to poll it through. Its [`Registration::poll_io`] spends the budget the same way.
 
 ## Blocking work and files
 
@@ -404,6 +435,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`SharedRuntime::current`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.current
 [`block_on`]: https://docs.rs/zruntime/latest/zruntime/fn.block_on.html
+[`unconstrained`]: https://docs.rs/zruntime/latest/zruntime/fn.unconstrained.html
 [`Runtime::spawn`]: https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.spawn
 [`spawn`]: https://docs.rs/zruntime/latest/zruntime/fn.spawn.html
 [`spawn_local`]: https://docs.rs/zruntime/latest/zruntime/fn.spawn_local.html
@@ -427,6 +459,8 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`Runtime::register`]:
     https://docs.rs/zruntime/latest/zruntime/struct.Runtime.html#method.register
 [`Registration`]: https://docs.rs/zruntime/latest/zruntime/struct.Registration.html
+[`Registration::poll_io`]:
+    https://docs.rs/zruntime/latest/zruntime/struct.Registration.html#method.poll_io
 [`AsyncIo`]: https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html
 [`AsyncIo::new`]: https://docs.rs/zruntime/latest/zruntime/struct.AsyncIo.html#method.new
 [`AsyncIo::readable`]:

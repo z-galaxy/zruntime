@@ -51,7 +51,7 @@ use std::{
 };
 
 use crate::{
-    Shared,
+    Shared, coop,
     mode::sealed::Sealed as _,
     runtime::{Core, drives, drives_a_runtime, lock, set_driving},
 };
@@ -474,7 +474,9 @@ where
         // that follows, and with a swap, so that the poll sees what the wakes before it were
         // for.
         signal.woken.swap(false, Ordering::AcqRel);
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+        // Budgeted like a task, because the tasks run only between its polls: see
+        // `Core::block_on`.
+        if let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx)) {
             return output;
         }
         // Looked for again, because the poll may have been what brought the runtime into being,

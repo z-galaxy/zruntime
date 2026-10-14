@@ -61,7 +61,7 @@ use std::{
 };
 
 use crate::{
-    Local, Mode, Shared,
+    Local, Mode, Shared, coop,
     log::error,
     mode::sealed::Lock,
     runtime::{Core, Remote},
@@ -163,9 +163,10 @@ where
         // The queue entry this was taken off is spent by the wrapper's poll, which marks the task
         // unqueued before it polls the task's own future (see [`task`]). The wrapper catches the
         // panics of the task's own future, so what is caught here is what lies outside that: the
-        // wake of whoever joins the task, say.
+        // wake of whoever joins the task, say. The poll has a budget of I/O operations, so that a
+        // task with a lot of ready I/O gives the others their turn (see the `coop` module).
         let polled = catch_unwind(AssertUnwindSafe(|| {
-            Pin::new(&mut future).poll(&mut Context::from_waker(&waker))
+            coop::budgeted(|| Pin::new(&mut future).poll(&mut Context::from_waker(&waker)))
         }));
         let ended = match polled {
             Ok(Poll::Ready(())) => true,

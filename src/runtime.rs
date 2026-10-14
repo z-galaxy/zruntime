@@ -36,7 +36,7 @@ use std::{
 };
 
 use crate::{
-    Mode, Shared, log::error, mode::sealed::Lock, poll::Poller, reactor::Reactor,
+    Mode, Shared, coop, log::error, mode::sealed::Lock, poll::Poller, reactor::Reactor,
     scheduler::Scheduler,
 };
 
@@ -100,7 +100,9 @@ where
             // Lowered before the poll, so that a wake during it is seen by the round that
             // follows, and with a swap, so that the poll sees what the wakes before it were for.
             signal.woken.swap(false, Ordering::AcqRel);
-            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            // Budgeted like a task, because the tasks run only between its polls: with a lot of
+            // ready I/O in it, it would hold them up for as long as a task would hold up the rest.
+            if let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx)) {
                 return output;
             }
             this.round(&signal.woken, &mut failed_waits);

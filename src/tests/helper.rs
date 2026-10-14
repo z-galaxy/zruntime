@@ -6,7 +6,7 @@
 use std::{
     cell::RefCell,
     future::{Future, Pending, pending, poll_fn},
-    io::{self, Write},
+    io::{self, Read, Write},
     mem::MaybeUninit,
     pin::{Pin, pin},
     sync::{
@@ -23,15 +23,19 @@ use futures::{executor::block_on, future::poll_immediate};
 use ntest::timeout;
 use socket2::SockRef;
 
-use super::{core::pair, yield_now};
-#[cfg(feature = "event")]
-use crate::{Event, EventListener};
+use super::{
+    async_io::{BUDGET, READS, note_progress, tcp_pair_holding},
+    core::pair,
+    yield_now,
+};
 use crate::{
-    Interest, Interval, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task, Timeout,
-    driver,
+    AsyncIo, Interest, Interval, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task,
+    Timeout, driver,
     mode::sealed::Sealed as _,
     runtime::{Core, lock},
 };
+#[cfg(feature = "event")]
+use crate::{Event, EventListener};
 
 /// What a handle is shared as: a task handle and a registration live in state that several threads
 /// reach, a runtime handle is cloned into the tasks it spawns, and a timer, a timeout or an
@@ -787,6 +791,36 @@ fn block_on_waits_for_readiness_on_its_own_thread() {
     assert_eq!(read.unwrap(), 1);
     assert!(!runtime.helper_running());
     writer.join().unwrap();
+}
+
+/// The future of a `block_on` that sits in the seat has a budget of I/O operations as a task has:
+/// a task spawned from it runs after its budget's worth of reads, though the future itself would
+/// read on to the end. It is the tasks that the thread in the seat runs between the polls of the
+/// future, so a future that does not return would hold them all up.
+#[test]
+#[timeout(15000)]
+fn the_future_of_block_on_yields_to_the_tasks_after_the_budget() {
+    let runtime = runtime();
+    let (near, _far) = tcp_pair_holding(READS);
+    let (reads, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+
+    drive(&runtime, async {
+        // Registered and spawned from inside, so that the thread in the seat runs the task itself
+        // rather than a helper that the first piece of work from outside would start.
+        let near = AsyncIo::new(&runtime, near).unwrap();
+        let looker = runtime.spawn("a looker", note_progress(reads.clone(), seen.clone()));
+        for _ in 0..READS {
+            near.read_with(|mut stream| stream.read(&mut [0]))
+                .await
+                .unwrap();
+            reads.fetch_add(1, Ordering::SeqCst);
+        }
+        looker.await.unwrap();
+    });
+
+    assert_eq!(seen.load(Ordering::SeqCst), BUDGET);
+    assert_eq!(reads.load(Ordering::SeqCst), READS);
+    assert!(!runtime.helper_running());
 }
 
 #[test]

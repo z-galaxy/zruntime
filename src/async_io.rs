@@ -14,6 +14,7 @@ use std::os::windows::io::AsSocket as AsSource;
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::{
     fmt,
+    future::poll_fn,
     io::{self, IoSlice, IoSliceMut, Read, Write},
     pin::Pin,
     task::{Context, Poll},
@@ -25,7 +26,7 @@ use windows_sys::Win32::Networking::WinSock::{
     FIONBIO, SOCKET, SOCKET_ERROR, WSAGetLastError, ioctlsocket,
 };
 
-use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, mode, reactor};
+use crate::{Interest, Local, Mode, Readiness, Registration, Runtime, Source, coop, mode, reactor};
 
 /// An async I/O handle: a source that the runtime watches for readiness. Like `smol::Async`.
 ///
@@ -242,24 +243,17 @@ where
     ///
     /// Any number of tasks can do this at once on one handle.
     ///
+    /// Before it runs `operation`, this may yield to the other tasks, as
+    /// [`Registration::poll_io`] describes, if the poll it is in has completed its share of I/O
+    /// operations already.
+    ///
     /// # Cancel safety
     ///
-    /// Dropping the future gives up the wait, and never leaves an operation half done: each call of
-    /// `operation` runs to its end before the future can be dropped.
-    pub async fn read_with<R>(
-        &self,
-        mut operation: impl FnMut(&T) -> io::Result<R>,
-    ) -> io::Result<R> {
-        loop {
-            match operation(&self.io) {
-                // A call the kernel interrupted is made again straight away: that is not a
-                // readiness question, so it never reaches the reactor.
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                result => return result,
-            }
-            self.readable().await?;
-        }
+    /// Dropping the future gives up the wait, or the yield before an operation, and never leaves an
+    /// operation half done: each call of `operation` runs to its end before the future can be
+    /// dropped.
+    pub async fn read_with<R>(&self, operation: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
+        self.run_with(Interest::Readable, operation).await
     }
 
     /// Runs `operation` on the source until it no longer fails with
@@ -274,24 +268,17 @@ where
     ///
     /// Any number of tasks can do this at once on one handle.
     ///
+    /// Before it runs `operation`, this may yield to the other tasks, as
+    /// [`Registration::poll_io`] describes, if the poll it is in has completed its share of I/O
+    /// operations already.
+    ///
     /// # Cancel safety
     ///
-    /// Dropping the future gives up the wait, and never leaves an operation half done: each call of
-    /// `operation` runs to its end before the future can be dropped.
-    pub async fn write_with<R>(
-        &self,
-        mut operation: impl FnMut(&T) -> io::Result<R>,
-    ) -> io::Result<R> {
-        loop {
-            match operation(&self.io) {
-                // A call the kernel interrupted is made again straight away: that is not a
-                // readiness question, so it never reaches the reactor.
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                result => return result,
-            }
-            self.writable().await?;
-        }
+    /// Dropping the future gives up the wait, or the yield before an operation, and never leaves an
+    /// operation half done: each call of `operation` runs to its end before the future can be
+    /// dropped.
+    pub async fn write_with<R>(&self, operation: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
+        self.run_with(Interest::Writable, operation).await
     }
 
     /// The polling version of [`read_with`](AsyncIo::read_with), for implementing poll-based
@@ -299,7 +286,9 @@ where
     ///
     /// Runs `operation` on the source. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
     /// this arranges for the waker of `cx` to be woken once the source is readable, and returns
-    /// [`Poll::Pending`].
+    /// [`Poll::Pending`]. It also returns `Pending`, after waking the task, without running
+    /// `operation`, if the poll it is in has completed its share of I/O operations already: see
+    /// [`Registration::poll_io`].
     ///
     /// Unlike `read_with`, this keeps only one waiting task for reading. A second task that waits
     /// replaces the first one, which is then never woken. See [`Registration::poll_io`].
@@ -316,7 +305,9 @@ where
     ///
     /// Runs `operation` on the source. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
     /// this arranges for the waker of `cx` to be woken once the source is writable, and returns
-    /// [`Poll::Pending`].
+    /// [`Poll::Pending`]. It also returns `Pending`, after waking the task, without running
+    /// `operation`, if the poll it is in has completed its share of I/O operations already: see
+    /// [`Registration::poll_io`].
     ///
     /// Unlike `write_with`, this keeps only one waiting task for writing. A second task that waits
     /// replaces the first one, which is then never woken. See [`Registration::poll_io`].
@@ -373,6 +364,33 @@ where
     ))]
     pub(crate) fn runtime(&self) -> Runtime<M> {
         self.registration.runtime()
+    }
+
+    /// Runs `operation` on the source until it no longer fails with `WouldBlock`, waiting for the
+    /// source to be ready for `interest` in between: [`read_with`](AsyncIo::read_with) and
+    /// [`write_with`](AsyncIo::write_with).
+    async fn run_with<R>(
+        &self,
+        interest: Interest,
+        mut operation: impl FnMut(&T) -> io::Result<R>,
+    ) -> io::Result<R> {
+        loop {
+            // Asked before the operation, not after it: a yield here costs nothing, while one
+            // after an operation that completed would hold its result back.
+            poll_fn(coop::poll_proceed).await;
+            match operation(&self.io) {
+                // A call the kernel interrupted is made again straight away: that is not a
+                // readiness question, so it never reaches the reactor, and it spends nothing.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                result => {
+                    coop::spend();
+
+                    return result;
+                }
+            }
+            self.registration.ready(interest).await?;
+        }
     }
 
     /// Runs `operation` on the source while it is ready for `interest`: see

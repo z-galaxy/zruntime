@@ -20,6 +20,8 @@
 mod async_io;
 #[cfg(feature = "broadcast")]
 pub mod broadcast;
+#[cfg(feature = "runtime")]
+mod coop;
 #[cfg(feature = "helper")]
 mod driver;
 #[cfg(feature = "event")]
@@ -71,6 +73,8 @@ use std::{
 
 #[cfg(feature = "runtime")]
 pub use async_io::AsyncIo;
+#[cfg(feature = "runtime")]
+pub use coop::unconstrained;
 #[cfg(feature = "event")]
 pub use event::{Event, EventListener};
 #[cfg(feature = "runtime")]

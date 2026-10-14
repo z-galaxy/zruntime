@@ -33,12 +33,12 @@ use std::{
     io, mem,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, Waker, ready},
     time::{Duration, Instant},
 };
 
 use crate::{
-    Interest, Local, Mode,
+    Interest, Local, Mode, coop,
     log::error,
     mode::sealed::Lock,
     poll::{self, Directions, Poller, RawSource},
@@ -333,15 +333,37 @@ where
     /// This never spins while the source is not ready. Since the source is non-blocking, as
     /// [`Runtime::register`](crate::Runtime#method.register) requires, it never blocks the thread
     /// either.
+    ///
+    /// Nor does it let a source that is always ready keep the thread from the other tasks. A poll
+    /// of a task, or of the future passed to `block_on`, may complete 128 I/O operations
+    /// through this and through [`AsyncIo`](crate::AsyncIo), which counts them the same way.
+    /// The next one yields, and so does every one after it until the poll is over: this wakes the
+    /// task itself and returns [`Poll::Pending`] without running `operation`, which sends the task
+    /// to the back of the queue. The tasks queued before it have their turn then, and the reactor
+    /// has its own once the batch of polls the task is in is over. An `operation` that fails with
+    /// `WouldBlock` is not counted.
+    ///
+    /// The budget belongs to the thread, not to the future. Whatever is polled inside the poll of
+    /// a task shares what is left of the task's budget, a blocking executor of another crate
+    /// included. Such an executor polls again as soon as it is woken, inside the same poll of the
+    /// task, where its operation yields again, so once the budget is spent it never gets its
+    /// operation done. Its future has to run inside [`unconstrained`](crate::unconstrained),
+    /// which lifts the budget for each poll of it. Polled there, or outside the poll of any runtime
+    /// of this crate, this has no limit.
     pub fn poll_io<T>(
         &self,
         cx: &mut Context<'_>,
         interest: Interest,
         mut operation: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
+        ready!(coop::poll_proceed(cx));
         match operation() {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            result => return Poll::Ready(result),
+            result => {
+                coop::spend();
+
+                return Poll::Ready(result);
+            }
         }
 
         // Cloned before the lock is taken: a waker's clone is somebody else's code, which is not
