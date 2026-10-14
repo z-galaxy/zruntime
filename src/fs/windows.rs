@@ -7,38 +7,33 @@
 
 use std::{io, path::Path};
 
-use super::sealed::Sealed;
-use crate::unblock;
+use super::{inline, sealed::Sealed};
 
 #[doc(no_inline)]
 pub use std::os::windows::fs::MetadataExt;
 
 /// Makes `dst` a symbolic link to the directory `src`.
 ///
-/// Runs [`std::os::windows::fs::symlink_dir`] as blocking work. To link to a file, use
-/// [`symlink_file`].
+/// Runs [`std::os::windows::fs::symlink_dir`] on the thread that polls the future. To link to a
+/// file, use [`symlink_file`].
 pub async fn symlink_dir<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
     Q: AsRef<Path>,
 {
-    let src = src.as_ref().to_owned();
-    let dst = dst.as_ref().to_owned();
-    unblock(move || std::os::windows::fs::symlink_dir(src, dst)).await
+    inline(|| std::os::windows::fs::symlink_dir(src, dst)).await
 }
 
 /// Makes `dst` a symbolic link to the file `src`.
 ///
-/// Runs [`std::os::windows::fs::symlink_file`] as blocking work. To link to a directory, use
-/// [`symlink_dir`].
+/// Runs [`std::os::windows::fs::symlink_file`] on the thread that polls the future. To link to a
+/// directory, use [`symlink_dir`].
 pub async fn symlink_file<P, Q>(src: P, dst: Q) -> io::Result<()>
 where
     P: AsRef<Path>,
     Q: AsRef<Path>,
 {
-    let src = src.as_ref().to_owned();
-    let dst = dst.as_ref().to_owned();
-    unblock(move || std::os::windows::fs::symlink_file(src, dst)).await
+    inline(|| std::os::windows::fs::symlink_file(src, dst)).await
 }
 
 /// Windows-specific extensions to [`OpenOptions`](super::OpenOptions).

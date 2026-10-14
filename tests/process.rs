@@ -1,9 +1,9 @@
 //! A test of the child processes that fills the pool of threads that all blocking work shares, and
 //! so is a binary of its own.
 //!
-//! The pool is the one `zruntime::unblock` hands work to, which `Unblock`, `fs` and the pipes of a
-//! child on Windows use as well. The test holds every thread of it for as long as it needs, and any
-//! other test in the same process that had blocking work to run would wait for it to let them go.
+//! The pool is the one `zruntime::unblock` hands work to, which `Unblock` and the pipes of a child
+//! on Windows use as well. The test holds every thread of it for as long as it needs, and any other
+//! test in the same process that had blocking work to run would wait for it to let them go.
 //! The unit tests of the crate are one binary, whose tests run side by side, so none of them can do
 //! that. A file under `tests/` is a binary of its own, and Cargo runs the binaries one after
 //! another, never side by side. This one holds the single test: a second would run beside it, and

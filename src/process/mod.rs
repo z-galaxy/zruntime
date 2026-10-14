@@ -84,9 +84,8 @@
 //! for them, or turning `reap_on_drop` off keeps threads from being held for long.
 //!
 //! The threads are named `zruntime child wait`. The pool is separate from the one behind
-//! [`unblock()`](crate::unblock()), which all other blocking work shares, including the `fs`
-//! module. However many children are dropped, and however long they run, that work never waits
-//! behind them.
+//! [`unblock()`](crate::unblock()), which all other blocking work shares. However many children
+//! are dropped, and however long they run, that work never waits behind them.
 //!
 //! Windows leaves no zombie, so there is nothing to collect there, and `reap_on_drop` does
 //! nothing.

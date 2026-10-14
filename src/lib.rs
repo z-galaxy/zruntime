@@ -20,7 +20,7 @@
 mod async_io;
 #[cfg(feature = "broadcast")]
 pub mod broadcast;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", all(feature = "fs", not(target_os = "wasi"))))]
 mod coop;
 #[cfg(feature = "helper")]
 mod driver;
