@@ -334,6 +334,91 @@ where
         M::block_on(&self.core, future)
     }
 
+    /// Has the thread that runs this runtime poll for up to `limit` before it goes to sleep for
+    /// want of work. A runtime starts with a `limit` of [`Duration::ZERO`], which is no polling,
+    /// and setting that again turns the polling off.
+    ///
+    /// A thread that has run out of work sleeps in a wait of the OS, and the next piece of work has
+    /// to wake it. Where work comes in at short intervals, those sleeps and wake-ups cost latency
+    /// and CPU time on both sides, most of all on a virtual machine, where waking an idle virtual
+    /// CPU is dear. With a `limit`, the thread first asks the OS again and again, without sleeping,
+    /// whether a source is ready, and goes to sleep only if nothing has come within `limit`. A
+    /// timer that falls due sooner ends the wait, as it would have anyway. Work that comes in that
+    /// time is found at once, and whoever sent it has no wake-up to make.
+    ///
+    /// The thread that polls is whichever runs the runtime at the time: the one inside
+    /// [`block_on`](Self::block_on) and, with the `helper` feature, the helper thread of a runtime
+    /// from `SharedRuntime::current` where no thread is inside `block_on` on it. Call this on a
+    /// [`SharedRuntime`] from any thread, and on a [`LocalRuntime`] from its own. It takes effect
+    /// from the next wait on: one that is under way, polling or asleep, carries on as it began.
+    ///
+    /// The limit belongs to the runtime. One from `SharedRuntime::current` is dropped once its last
+    /// handle, and the last work built on it, are gone, and the next call creates a new one, which
+    /// does not poll: keep the handle that this is called on for as long as the limit is to hold.
+    ///
+    /// # When it polls
+    ///
+    /// Polling that finds nothing is CPU time spent for nothing, and a thread that has gone idle
+    /// would spend it before every sleep. So the thread polls only while the work it waits for has
+    /// been coming in fast. It remembers, for each of its last eight waits, whether the wait
+    /// lasted no longer than `limit`, the polling and the sleep after it together: whether polling
+    /// for `limit` would have caught what ended it, or did. It polls before a wait if it remembers
+    /// at least one that did. A wait that has no sleep in it, because a task is ready or the future
+    /// passed to `block_on` has been woken, is not counted. So:
+    ///
+    /// * A runtime that has not seen a short wait does not poll. That is a new one, and one that
+    ///   this was just called on, as each call starts the memory over.
+    /// * A busy runtime polls before every wait.
+    /// * One that has gone idle stops after eight long waits, so a burst of work wastes no more
+    ///   than eight times `limit` of CPU time on polling that found nothing.
+    /// * Short waits and long ones in turn keep it polling before every wait, the long ones
+    ///   included, where it finds nothing. A stream of requests whose replies come back within
+    ///   `limit`, with longer gaps between the requests, makes such waits.
+    ///
+    /// # Cost
+    ///
+    /// While the thread polls it uses a whole CPU, which no other thread gets, and it keeps that
+    /// CPU out of the deep idle states that save power: busy polling costs energy and, on a
+    /// machine shared with other work, throughput. Where the thread that sends it work needs the
+    /// same CPU, polling holds that work up. It pays where the next piece of work usually
+    /// comes within `limit` of the last, as for a server under load, and most on a virtual
+    /// machine, where waking an idle virtual CPU is dear. Where work comes less often than that,
+    /// polling finds nothing, and the thread stops after eight waits, unless some of its waits
+    /// keep coming in under `limit`, as quick replies to requests that come further apart do.
+    /// What it gains and what it costs depend on the machine as much as on the work, so measure
+    /// it where the program runs.
+    ///
+    /// A `limit` of some tens of microseconds, such as 20 µs, is the range to try. A wait that
+    /// polls costs up to `limit` of CPU time, and a runtime whose waits keep coming in under it
+    /// polls through all of them, so the longer the limit, the nearer the thread comes to using a
+    /// whole CPU for good. Measure before raising it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use zruntime::LocalRuntime;
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// // Poll for up to 20 µs before sleeping, once the waits have been that short.
+    /// runtime.set_busy_poll(Duration::from_micros(20));
+    ///
+    /// runtime.block_on(async {
+    ///     // A tick every 10 µs: waits as short as that are what the polling is for.
+    ///     let mut interval = runtime.interval(Duration::from_micros(10));
+    ///     for _ in 0..3 {
+    ///         interval.tick().await;
+    ///     }
+    /// });
+    ///
+    /// // And off again.
+    /// runtime.set_busy_poll(Duration::ZERO);
+    /// ```
+    pub fn set_busy_poll(&self, limit: Duration) {
+        self.core.reactor.set_busy_poll(limit);
+    }
+
     /// A future that completes once `duration` has passed. Dropping it cancels the timer.
     ///
     /// A `duration` too long for the clock to represent, such as `Duration::MAX`, gives a sleep

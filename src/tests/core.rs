@@ -1,6 +1,7 @@
 //! Tests of a runtime driven by nothing but the `block_on` calls made on it: the tasks, timers
 //! and registrations it runs on the thread inside such a call, the wakes that reach that thread
-//! from others, and the rules on who may drive it.
+//! from others, the polling that thread may do before it sleeps, and the rules on who may drive
+//! it.
 //!
 //! Most of these run in both flavours, through [`in_both_modes`]; the ones that only mean
 //! something in one flavour — a local task holding an `Rc`, a second thread asking to drive a
@@ -1371,6 +1372,185 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// Busy polling is off unless it is asked for, and a limit of zero turns it off again. Each
+    /// call starts over from what the runtime knows of how long its waits last, whatever the
+    /// limit: it spins once it has seen a short wait, and not before.
+    fn busy_polling_is_set_through_the_runtime<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let reactor = &runtime.core.reactor;
+        assert!(!reactor.would_spin());
+
+        busy_polling(&runtime);
+        assert!(reactor.would_spin());
+
+        // The same limit again forgets the waits seen so far.
+        runtime.set_busy_poll(Duration::from_secs(10));
+        assert!(!reactor.would_spin());
+
+        busy_polling(&runtime);
+        assert!(reactor.would_spin());
+
+        // From inside the runtime this time, as a program that sets it where it starts its work.
+        runtime.block_on(async { runtime.set_busy_poll(Duration::ZERO) });
+        assert!(!reactor.would_spin());
+    }
+}
+
+/// The limit of a shared runtime can be set from another thread while the thread that drives it
+/// sleeps in a wait, which neither waits for the wait to end nor ends it.
+///
+/// A lock held across the wait would have the call wait for it, and the call would return only
+/// once the 500 ms of the wait were up.
+#[test]
+#[timeout(15000)]
+fn the_limit_is_set_from_another_thread_while_a_wait_sleeps() {
+    let runtime = SharedRuntime::new().unwrap();
+    let started = Instant::now();
+    let setter = {
+        let runtime = runtime.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            runtime.set_busy_poll(Duration::from_micros(20));
+
+            started.elapsed()
+        })
+    };
+
+    runtime.block_on(runtime.sleep(Duration::from_millis(500)));
+
+    assert!(setter.join().unwrap() < Duration::from_millis(400));
+    assert!(started.elapsed() >= Duration::from_millis(500));
+}
+
+in_both_modes! {
+    /// A timer ends a wait that spins at its deadline, though the limit is far longer: the spin is
+    /// bounded by the time left until the nearest timer, and the timer is due when it ends.
+    fn a_busy_wait_ends_at_the_nearest_deadline<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        busy_polling(&runtime);
+        let started = Instant::now();
+
+        runtime.block_on(runtime.sleep(Duration::from_millis(20)));
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+}
+
+in_both_modes! {
+    /// A wake of the future from another thread ends a wait that spins, as it ends one that sleeps
+    /// (see `a_wake_from_another_thread_ends_the_wait`).
+    ///
+    /// The limit is 10 s, so a wake that did not end the spin would leave the thread polling for
+    /// all that time.
+    fn a_wake_from_another_thread_ends_a_busy_wait<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        busy_polling(&runtime);
+        let wakers = Arc::new(Mutex::new(None::<Waker>));
+        let started = Instant::now();
+        let waker_thread = {
+            let wakers = wakers.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                let waker = wakers.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })
+        };
+
+        runtime.block_on(async {
+            let mut polled = false;
+            poll_fn(|cx| {
+                if polled {
+                    return Poll::Ready(());
+                }
+                polled = true;
+                *wakers.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx.waker().clone());
+
+                Poll::Pending
+            })
+            .await
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        waker_thread.join().unwrap();
+    }
+}
+
+in_both_modes! {
+    /// A wake of a task from another thread ends a wait that spins: the task is queued, which
+    /// writes the wake-up the spin looks for.
+    fn a_task_woken_from_another_thread_ends_a_busy_wait<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        busy_polling(&runtime);
+        // Whether the task is to finish, and the waker to wake it with, behind one lock: a wake
+        // that comes before the task has stored its waker finds the task finished instead.
+        let state = Arc::new(Mutex::new((false, None::<Waker>)));
+        let task = {
+            let state = state.clone();
+            M::spawn(
+                &runtime,
+                "a task woken from another thread",
+                poll_fn(move |cx| {
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if state.0 {
+                        return Poll::Ready(());
+                    }
+                    state.1 = Some(cx.waker().clone());
+
+                    Poll::Pending
+                }),
+            )
+        };
+        let started = Instant::now();
+        let waker_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let waker = {
+                let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.0 = true;
+                state.1.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+
+        runtime.block_on(task).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        waker_thread.join().unwrap();
+    }
+}
+
+in_both_modes! {
+    /// The readiness of a source ends a wait that spins, and the read that follows it finds the
+    /// byte.
+    fn readiness_ends_a_busy_wait<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        busy_polling(&runtime);
+        let (source, mut peer) = pair();
+        let registration = M::register(&runtime, source.clone()).unwrap();
+        let started = Instant::now();
+        // Written from another thread once the read below is waiting, so that the byte is one the
+        // wait reports rather than one the first attempt to read finds for itself.
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            peer.write_all(&[7]).unwrap();
+        });
+
+        let read = runtime.block_on(read_one(&registration, &source));
+
+        assert_eq!(read.unwrap(), 1);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        writer.join().unwrap();
+    }
+}
+
+in_both_modes! {
     /// A runtime that goes with tasks still on it drops their futures and fails their handles,
     /// whether they were polled before it went or never were.
     fn dropping_the_runtime_fails_pending_handles<M>() {
@@ -1885,6 +2065,31 @@ fn read_ready_byte(source: &TestSource) -> u8 {
     assert_eq!((&*socket).read(&mut byte).unwrap(), 1);
 
     byte[0]
+}
+
+/// Turns busy polling on for `runtime`, with a limit no wait of a test comes near, and has the
+/// runtime wait until its next wait spins.
+///
+/// Spinning takes a short wait first, and so a wait of 1 ms, which is short against a limit of
+/// 10 s, whatever else the runtime has to do. One whose timer has come due by the time the
+/// reactor looks at it is a wait that cannot sleep, which counts for nothing, and the runtime
+/// waits again.
+fn busy_polling<M>(runtime: &Runtime<M>)
+where
+    M: Mode,
+{
+    runtime.set_busy_poll(Duration::from_secs(10));
+
+    runtime.block_on(async {
+        for _ in 0..100 {
+            if runtime.core.reactor.would_spin() {
+                return;
+            }
+            runtime.sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    assert!(runtime.core.reactor.would_spin());
 }
 
 /// The message a panic carried, which is a string for a panic made from a string literal or a

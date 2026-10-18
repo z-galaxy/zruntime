@@ -128,7 +128,8 @@ where
     /// One wait on the reactor: bounded by no time at all where a task is ready or `at_once`
     /// says the caller has something of its own to get back to, so that the round after it polls
     /// what is ready, and by nothing where neither holds, so that the thread sleeps until a
-    /// source, a deadline or a notification has something for it.
+    /// source, a deadline or a notification has something for it: after a spin, where the runtime
+    /// busy-polls and the reactor finds it likely to pay (see [`Reactor::wait`]).
     ///
     /// `failed_waits` counts the failures in a row, for the pause that keeps a wait which fails
     /// every time from becoming a spin; every waiter retries its own operation and sees its own
