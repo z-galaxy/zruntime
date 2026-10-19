@@ -9,6 +9,13 @@
 //! `zruntime::block_on`. Every id sends one message and receives it before it is timed, so that
 //! what the channel allocates lazily on its first use is allocated by then.
 //!
+//! A timed call of a `ping-*` id runs [`PINGS`] pairs, and its throughput is in messages.
+//! CodSpeed's CPU simulation times a single call of each id, which starts with nothing in the
+//! simulated cache. A call of one pair, a few hundred instructions, would cost mostly the cache
+//! lines it touches, and move with where they lie, as where the stack starts moves with the size of
+//! the environment. A call of many pays for those lines once, and costs what its instructions do.
+//! The `burst-*` ids are long enough as they are.
+//!
 //! - `ping-bounded1` times one `send(..).await` and one `recv().await` on a channel with room for
 //!   one message, with one `block_on` around the pair: the uncontended path, and so the cost of a
 //!   channel whose receivers keep up with its senders. The message is received before the next is
@@ -45,20 +52,22 @@ fn channel_benches(c: &mut Criterion) {
     group.finish();
 }
 
-/// Times sending one message and receiving it, on a channel of capacity `cap` (unbounded if
-/// `None`), all on a single thread.
+/// Times sending one message and receiving it, [`PINGS`] times, on a channel of capacity `cap`
+/// (unbounded if `None`), all on a single thread.
 fn ping(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, cap: Option<usize>) {
-    group.throughput(Throughput::Elements(1));
+    group.throughput(Throughput::Elements(PINGS));
 
     let (s, r) = channel::new(cap);
     let mut n = 0u64;
     group.bench_function(id, |b| {
         b.iter(|| {
-            block_on(async {
-                s.send(n).await.unwrap();
-                assert_eq!(r.recv().await.unwrap(), n);
-            });
-            n += 1;
+            for _ in 0..PINGS {
+                block_on(async {
+                    s.send(n).await.unwrap();
+                    assert_eq!(r.recv().await.unwrap(), n);
+                });
+                n += 1;
+            }
         })
     });
 }
@@ -83,6 +92,11 @@ fn burst(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, cap: Option<usize>)
 
 /// How many messages the `burst-*` ids send, and then receive.
 const BURST: u64 = 1024;
+
+/// How many times a timed call of a `ping-*` id sends a message and receives it: enough that the
+/// call costs what its instructions do, rather than the cache lines it touches (see the module
+/// documentation).
+const PINGS: u64 = 100;
 
 criterion_group!(benches, channel_benches);
 criterion_main!(benches);
