@@ -3,7 +3,8 @@
 //! A reactor holds every source registered on it and every timer taken from it, and the thread
 //! driving the runtime hands it that thread through [`Reactor::wait`]: one wait on the platform's
 //! poller, bounded by the nearest deadline, and then the wakes for whatever that wait found ready
-//! and for whatever timer has come due.
+//! and for whatever timer has come due. Where the runtime was asked to busy-poll, the wait is
+//! preceded by a spin (see [`BusyPoll`]).
 //!
 //! The poller watches each source in the directions the reactor last told it to, and is told of a
 //! change rather than handed every source on each wait, so that a wait costs what the sources
@@ -25,6 +26,11 @@
 //! straight back here to register a source, to ask for a timer or to let either go. The flag that
 //! spares a `notify` its write while a wake-up is on its way needs no lock: it is an atomic of the
 //! runtime's remote.
+//!
+//! The state of busy polling is behind a lock of its own, a third. The limit is set from whichever
+//! thread the caller is on, and the history is the driving thread's: the lock is taken briefly
+//! before the wait and after it, never across it, and never while either of the other two is
+//! held, so that a limit can be set while the driving thread is in the middle of a wait.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -52,6 +58,8 @@ where
 {
     sources: M::Lock<Sources<M>>,
     timers: M::Lock<Timers>,
+    /// When a wait spins before it sleeps, and for how long.
+    busy_poll: M::Lock<BusyPoll>,
     /// The poller a wait is made on, and the flag that says a wake-up is on its way to it.
     remote: Arc<Remote>,
 }
@@ -73,12 +81,14 @@ where
                 retired: Vec::new(),
             }),
             timers: Lock::new(Timers::default()),
+            busy_poll: Lock::new(BusyPoll::default()),
             remote,
         }
     }
 
-    /// One wait on the poller, bounded by `at_most` and by the nearest deadline, then the wakes
-    /// for what it found ready and for the timers that are due.
+    /// One wait on the poller, bounded by `at_most` and by the nearest deadline, and preceded by a
+    /// spin where the runtime busy-polls and the spin is likely to pay; then the wakes for what it
+    /// found ready and for the timers that are due.
     pub(crate) fn wait(&self, at_most: Option<Duration>) -> io::Result<()> {
         {
             let mut sources = self.sources.lock();
@@ -90,7 +100,7 @@ where
         }
         let timeout = self.timeout(at_most);
 
-        let ready = match self.remote.poller.wait(timeout) {
+        let ready = match self.wait_on_poller(timeout) {
             Ok(ready) => ready,
             Err(e) => {
                 self.end_wait();
@@ -160,6 +170,16 @@ where
         Ok(())
     }
 
+    /// Has each wait from the next one on spin for up to `limit` before it sleeps, or, with a
+    /// `limit` of zero, not spin at all. The runtime starts over from what it knows of how long
+    /// its waits last: it spins once it has seen a wait that lasted no longer than `limit`.
+    ///
+    /// Callable from any thread, the driving one or not: a wait under way, spin or sleep, carries
+    /// on as it began.
+    pub(crate) fn set_busy_poll(&self, limit: Duration) {
+        self.busy_poll.lock().set_limit(limit);
+    }
+
     /// How long a wait may last: no longer than `at_most`, than until the nearest deadline, or
     /// than [`poll::MAX_TIMEOUT`], and without limit where none of those bounds it.
     fn timeout(&self, at_most: Option<Duration>) -> Option<Duration> {
@@ -177,6 +197,89 @@ where
         };
 
         timeout.map(|timeout| timeout.min(poll::MAX_TIMEOUT))
+    }
+
+    /// One wait on the poller, after a spin where the runtime busy-polls and [`BusyPoll`] says
+    /// that the spin is likely to pay.
+    ///
+    /// The spin asks the poller what the wait would, whether a source is ready, again and again
+    /// and with a timeout of zero, so that the thread does not go to sleep, and need waking, when
+    /// work comes in at short intervals. Only if nothing came while the spin lasted does the wait
+    /// go on as it would have without one, for what is left of its timeout.
+    ///
+    /// A wait is timed from the start of the spin to the end of the sleep after it, and the
+    /// history is told how long it lasted, so that a runtime that does not spin yet, or no more,
+    /// finds out when its waits come to be short. A wait that fails is not told: it says nothing
+    /// of how long work takes to come in.
+    fn wait_on_poller(&self, timeout: Option<Duration>) -> io::Result<Vec<poll::Ready>> {
+        let poller = &self.remote.poller;
+        // No sleep to spare, and nothing for the history to learn from: it keeps how long the
+        // waits that could sleep lasted.
+        if timeout == Some(Duration::ZERO) {
+            return poller.wait(timeout);
+        }
+        let (on, spin) = {
+            let busy_poll = self.busy_poll.lock();
+            (busy_poll.is_on(), busy_poll.spin_for(timeout))
+        };
+        // The default, which reads no clock and keeps nothing.
+        if !on {
+            return poller.wait(timeout);
+        }
+
+        let started = Instant::now();
+        let spun = if spin.is_zero() {
+            None
+        } else {
+            self.spin(started, spin)?
+        };
+        let ready = match spun {
+            Some(ready) => ready,
+            // The spin ran out, or there was none: the wait goes on for what is left of its
+            // timeout, which is none at all where the timeout was what the spin ran out against.
+            // A wait without a timeout stays one.
+            None => {
+                poller.wait(timeout.map(|timeout| timeout.saturating_sub(started.elapsed())))?
+            }
+        };
+        self.busy_poll.lock().record(started.elapsed());
+
+        Ok(ready)
+    }
+
+    /// Asks the poller what is ready, again and again and without sleeping, until `spin` has
+    /// passed since `started`. Gives back what it found as soon as it finds a source ready or a
+    /// wake-up on its way to this thread, which is what would have ended a sleep; `None` where
+    /// the time ran out first.
+    ///
+    /// Each pass is a system call, so the loop needs no pause or hint of its own. Nor does it
+    /// reconcile the sources between passes, as `wait` did before it began: this thread runs
+    /// nothing meanwhile, so nothing here goes stale, and what other threads change reaches the
+    /// poller all the same. A poller that keeps what it watches in the kernel sees a change at
+    /// once. One that copies its list as a wait starts copies it afresh on every pass, and the
+    /// `notify` a change to it makes raises the flag below, as it breaks a sleep.
+    ///
+    /// That flag, `Remote::wake_pending`, is what tells that a wake-up is on its way, and the
+    /// poller is not asked about it. Every `notify` that reaches the poller raises it first, and
+    /// every reason to break a sleep is a `notify`: a task queued, the future of `block_on` woken,
+    /// a source armed where the poller sees the change only in the wait after the one under way,
+    /// the seat asked for. A pass that finds the wake-up written takes it out of the channel and
+    /// reports nothing for it, but the flag stays up until `wait` lowers it, which is after the
+    /// spin, so the check that follows the pass sees it. A check that sees the flag before the
+    /// write has landed ends the spin with the byte still on its way, which ends the next wait at
+    /// once, as it does after a wait that ended some other way (see the end of `wait`). Nothing is
+    /// lost by that: what the caller of `notify` had to say it said before it raised the flag, and
+    /// the driving thread looks at all of it afresh in the rounds that follow.
+    fn spin(&self, started: Instant, spin: Duration) -> io::Result<Option<Vec<poll::Ready>>> {
+        loop {
+            let ready = self.remote.poller.wait(Some(Duration::ZERO))?;
+            if !ready.is_empty() || self.remote.wake_pending.load(Ordering::Acquire) {
+                return Ok(Some(ready));
+            }
+            if started.elapsed() >= spin {
+                return Ok(None);
+            }
+        }
     }
 
     /// Ends a wait that failed: lets go, clear of every lock, of the sources whose registrations
@@ -222,6 +325,12 @@ where
         let no_sources = self.sources.lock().states.is_empty();
 
         no_sources && self.timers.lock().pending.is_empty()
+    }
+
+    /// Whether a wait with no timeout would spin before it sleeps.
+    #[cfg(test)]
+    pub(crate) fn would_spin(&self) -> bool {
+        !self.busy_poll.lock().spin_for(None).is_zero()
     }
 }
 
@@ -960,6 +1069,76 @@ impl Waiters {
 struct Timers {
     pending: BTreeMap<(Instant, u64), Waker>,
     next_id: u64,
+}
+
+/// When a wait spins before it sleeps, and for how long: the limit the runtime was given, and a
+/// history of its latest waits to say whether a spin is likely to pay.
+///
+/// A thread that has run out of work sleeps in the poller's wait, and the next piece of work has
+/// to wake it. Where work comes in at short intervals, polling without sleeping for a moment
+/// first finds it with no sleep and no wake-up to pay for on either side. Where it does not, that
+/// moment is CPU time spent for nothing, and it would be spent before every sleep of a thread
+/// that has gone idle, which a mostly idle runtime makes after nearly every piece of work. So a
+/// wait spins only where what came before it says that a spin would have caught what ended the
+/// wait.
+///
+/// The history keeps one bit for each of the latest eight waits that could sleep, the latest in
+/// the lowest bit. A bit is set where its wait, the spin and the sleep after it together, lasted
+/// no longer than the limit: where a spin of the limit would have caught what ended it, or did.
+/// A wait spins if the limit is above zero and at least one bit is set. So:
+///
+/// * A runtime does not spin until it has seen a short wait, and a fresh one has not.
+/// * A busy one spins before every wait.
+/// * One that has gone idle stops after eight long waits, which bounds what a burst of work can
+///   waste on spins to eight times the limit.
+/// * A pattern of short and long waits in turn, as a stream of requests and replies makes, keeps it
+///   spinning, as the short ones keep a bit set.
+///
+/// A wait that cannot sleep, because a task is ready or the future of `block_on` has been woken,
+/// has no sleep to save by a spin and says nothing about how long work takes to come in, and so is
+/// not counted. Neither is one that failed. A new limit starts the history over: its bits say how
+/// the waits compared with the old one.
+#[derive(Default)]
+struct BusyPoll {
+    /// The longest a wait spins, and zero where the runtime does not busy-poll.
+    limit: Duration,
+    /// One bit for each of the latest eight waits that could sleep: set for a wait that lasted no
+    /// longer than `limit`. The latest is the lowest bit.
+    history: u8,
+}
+
+impl BusyPoll {
+    /// Whether the runtime busy-polls, and so times its waits.
+    fn is_on(&self) -> bool {
+        !self.limit.is_zero()
+    }
+
+    /// Spins for up to `limit` from now on, or, with a `limit` of zero, spins no more, and forgets
+    /// the history.
+    fn set_limit(&mut self, limit: Duration) {
+        self.limit = limit;
+        self.history = 0;
+    }
+
+    /// How long a wait that may last up to `timeout` spins before it sleeps: nothing where the
+    /// runtime does not busy-poll or has seen no short wait lately, and otherwise the limit, cut
+    /// to the timeout where the wait would be over by then anyway. A wait without a timeout,
+    /// `None`, is not cut.
+    fn spin_for(&self, timeout: Option<Duration>) -> Duration {
+        if !self.is_on() || self.history == 0 {
+            return Duration::ZERO;
+        }
+
+        timeout.map_or(self.limit, |timeout| self.limit.min(timeout))
+    }
+
+    /// Notes that a wait that could sleep lasted `waited`, from its start to its end.
+    fn record(&mut self, waited: Duration) {
+        if !self.is_on() {
+            return;
+        }
+        self.history = (self.history << 1) | u8::from(waited <= self.limit);
+    }
 }
 
 #[cfg(test)]
@@ -1968,6 +2147,367 @@ mod tests {
         assert!(Lock::lock(&reactor.sources).retired.is_empty());
     }
 
+    /// A runtime does not busy-poll unless it is asked to: the limit is zero, so no wait is timed,
+    /// spun for or kept in the history.
+    #[test]
+    #[timeout(15000)]
+    fn busy_polling_is_off_by_default() {
+        let mut busy_poll = BusyPoll::default();
+
+        assert!(!busy_poll.is_on());
+        busy_poll.record(SHORT);
+        assert_eq!(busy_poll.history, 0);
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+        assert_eq!(busy_poll.spin_for(Some(LONG)), Duration::ZERO);
+    }
+
+    /// A limit spins for nothing until a wait has been short, and for the limit after one.
+    #[test]
+    #[timeout(15000)]
+    fn a_limit_spins_only_once_a_wait_has_been_short() {
+        let mut busy_poll = on();
+        assert!(busy_poll.is_on());
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+
+        busy_poll.record(LONG);
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+        busy_poll.record(SHORT);
+        assert_eq!(busy_poll.spin_for(None), LIMIT);
+    }
+
+    /// A wait as long as the limit is a short one, as a spin of the limit would have caught what
+    /// ended it, and one a moment longer is not.
+    #[test]
+    #[timeout(15000)]
+    fn a_wait_as_long_as_the_limit_is_a_short_one() {
+        let mut as_long = on();
+        as_long.record(LIMIT);
+        let mut longer = on();
+        longer.record(LIMIT + Duration::from_nanos(1));
+
+        assert_eq!(as_long.spin_for(None), LIMIT);
+        assert_eq!(longer.spin_for(None), Duration::ZERO);
+    }
+
+    /// A spin is cut to the timeout of its wait, which is over by then anyway; a wait with no
+    /// timeout is not cut, and one that cannot sleep spins for nothing.
+    #[test]
+    #[timeout(15000)]
+    fn a_spin_is_cut_to_the_timeout_of_its_wait() {
+        let mut busy_poll = on();
+        busy_poll.record(SHORT);
+
+        assert_eq!(busy_poll.spin_for(Some(SHORT)), SHORT);
+        assert_eq!(busy_poll.spin_for(Some(LIMIT)), LIMIT);
+        assert_eq!(busy_poll.spin_for(Some(LONG)), LIMIT);
+        assert_eq!(busy_poll.spin_for(None), LIMIT);
+        assert_eq!(busy_poll.spin_for(Some(Duration::ZERO)), Duration::ZERO);
+    }
+
+    /// The history keeps eight waits: one that has gone idle spins before each of the eight long
+    /// waits after its last short one, and not before the ninth.
+    #[test]
+    #[timeout(15000)]
+    fn eight_long_waits_stop_the_spinning() {
+        let mut busy_poll = on();
+        busy_poll.record(SHORT);
+
+        for _ in 0..u8::BITS {
+            assert_eq!(busy_poll.spin_for(None), LIMIT);
+            busy_poll.record(LONG);
+        }
+
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+    }
+
+    /// However many short waits come first, and however few, a burst of work wastes no more than
+    /// eight spins of the limit on a runtime that goes idle after it.
+    #[test]
+    #[timeout(15000)]
+    fn a_burst_wastes_no_more_than_eight_spins() {
+        for burst in [1, 8, 100] {
+            let mut busy_poll = on();
+            for _ in 0..burst {
+                busy_poll.record(SHORT);
+            }
+
+            let mut wasted = Duration::ZERO;
+            for _ in 0..100 {
+                wasted += busy_poll.spin_for(None);
+                busy_poll.record(LONG);
+            }
+
+            assert_eq!(wasted, 8 * LIMIT, "{burst} short waits");
+        }
+    }
+
+    /// Short waits and long ones in turn keep the spinning going, as a stream of requests and
+    /// replies makes them, and so do seven long ones in a row between two short ones.
+    #[test]
+    #[timeout(15000)]
+    fn short_and_long_waits_in_turn_keep_the_spinning_going() {
+        let mut turns = on();
+        turns.record(SHORT);
+        let mut sevens = on();
+        sevens.record(SHORT);
+
+        for _ in 0..100 {
+            assert_eq!(turns.spin_for(None), LIMIT);
+            turns.record(LONG);
+            assert_eq!(turns.spin_for(None), LIMIT);
+            turns.record(SHORT);
+
+            for _ in 0..7 {
+                assert_eq!(sevens.spin_for(None), LIMIT);
+                sevens.record(LONG);
+            }
+            assert_eq!(sevens.spin_for(None), LIMIT);
+            sevens.record(SHORT);
+        }
+    }
+
+    /// A short wait after the spinning stopped starts it again: the waits are timed whether or
+    /// not they were spun for.
+    #[test]
+    #[timeout(15000)]
+    fn a_short_wait_starts_the_spinning_again() {
+        let mut busy_poll = on();
+        busy_poll.record(SHORT);
+        for _ in 0..u8::BITS {
+            busy_poll.record(LONG);
+        }
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+
+        busy_poll.record(SHORT);
+
+        assert_eq!(busy_poll.spin_for(None), LIMIT);
+    }
+
+    /// A new limit starts the history over: the bits say how the waits compared with the old one.
+    #[test]
+    #[timeout(15000)]
+    fn a_new_limit_forgets_the_history() {
+        let mut busy_poll = on();
+        busy_poll.record(SHORT);
+        let longer = LIMIT * 2;
+
+        busy_poll.set_limit(longer);
+
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+        busy_poll.record(SHORT);
+        assert_eq!(busy_poll.spin_for(None), longer);
+    }
+
+    /// A limit of zero turns the polling off, and then keeps nothing, not even a wait that took no
+    /// time at all.
+    #[test]
+    #[timeout(15000)]
+    fn a_limit_of_zero_turns_the_polling_off() {
+        let mut busy_poll = on();
+        busy_poll.record(SHORT);
+        assert_eq!(busy_poll.spin_for(None), LIMIT);
+
+        busy_poll.set_limit(Duration::ZERO);
+        busy_poll.record(Duration::ZERO);
+
+        assert!(!busy_poll.is_on());
+        assert_eq!(busy_poll.history, 0);
+        assert_eq!(busy_poll.spin_for(None), Duration::ZERO);
+    }
+
+    /// No wait is timed unless busy polling is on.
+    #[test]
+    #[timeout(15000)]
+    fn a_wait_is_not_counted_unless_busy_polling_is_on() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+
+        reactor.wait(Some(Duration::from_millis(1))).unwrap();
+
+        assert_eq!(history(reactor), 0);
+    }
+
+    /// A wait that could sleep is counted, and one that cannot is not: a task ready or a future
+    /// woken, which is what a timeout of zero comes of, says nothing of how long work takes.
+    #[test]
+    #[timeout(15000)]
+    fn only_a_wait_that_could_sleep_is_counted() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        reactor.set_busy_poll(Duration::from_secs(10));
+
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(history(reactor), 0);
+        assert!(!reactor.would_spin());
+
+        reactor.wait(Some(Duration::from_millis(1))).unwrap();
+        assert_eq!(history(reactor), 0b1);
+        assert!(reactor.would_spin());
+
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(history(reactor), 0b1);
+    }
+
+    /// A wait that lasts longer than the limit is counted as a long one, behind the short one that
+    /// had it spin.
+    #[test]
+    #[timeout(15000)]
+    fn a_wait_longer_than_the_limit_is_counted_as_a_long_one() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        busy_polling(reactor, Duration::from_millis(20));
+        let short = history(reactor);
+
+        // Spins for the limit, then sleeps for the rest of its timeout.
+        reactor.wait(Some(Duration::from_millis(60))).unwrap();
+
+        assert_eq!(history(reactor), short << 1);
+    }
+
+    /// A spin ends at a wake-up that is on its way, whether or not it has reached the channel.
+    ///
+    /// The flag is up and nothing has been written, as it is between a `notify` raising the flag
+    /// and writing. A sleep looks at the channel alone and would wait for good, so that the wait
+    /// ends at all is what says the spin looks at the flag.
+    #[test]
+    #[timeout(15000)]
+    fn a_spin_ends_at_a_wake_up_that_is_on_its_way() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        busy_polling(reactor, Duration::from_secs(10));
+        runtime
+            .core
+            .remote
+            .wake_pending
+            .store(true, Ordering::Release);
+
+        let started = Instant::now();
+        reactor.wait(None).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            !runtime.core.remote.wake_pending(),
+            "the wait took the flag down"
+        );
+    }
+
+    /// A spin ends at a wake-up from another thread, whose write a pass of the spin takes out of
+    /// the channel.
+    #[test]
+    #[timeout(15000)]
+    fn a_spin_ends_at_a_wake_up_from_another_thread() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        busy_polling(reactor, Duration::from_secs(10));
+        let breaker = {
+            let runtime = runtime.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                runtime.core.remote.notify();
+            })
+        };
+
+        let started = Instant::now();
+        reactor.wait(None).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            !runtime.core.remote.wake_pending(),
+            "the wait took the flag down"
+        );
+        breaker.join().unwrap();
+    }
+
+    /// A spin ends at a source that is ready, and the waiter of it is woken as a sleep would
+    /// have it.
+    #[test]
+    #[timeout(15000)]
+    fn a_spin_ends_at_a_source_that_is_ready() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        busy_polling(reactor, Duration::from_secs(10));
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source.clone()).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(read_one(&registration, &source, &mut cx).is_pending());
+        // The wake-up that arming the source wrote, taken out of the channel so that the wait
+        // below can only end on the source.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            peer.write_all(&[7]).unwrap();
+        });
+
+        let started = Instant::now();
+        reactor.wait(None).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(counter.count(), 1);
+        writer.join().unwrap();
+    }
+
+    /// A spin is bounded by the nearest deadline, and the timer comes due when it ends, though
+    /// the limit is far longer.
+    #[test]
+    #[timeout(15000)]
+    fn a_spin_ends_at_the_nearest_deadline() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        busy_polling(reactor, Duration::from_secs(10));
+        let (counter, waker) = counting_waker();
+        let mut sleep = pin!(runtime.sleep(Duration::from_millis(20)));
+        assert!(
+            sleep
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        let started = Instant::now();
+        // The first wait may end on the wake-up that storing the deadline wrote, and find
+        // nothing due. The one after it is bounded by the deadline alone.
+        while counter.count() == 0 {
+            reactor.wait(None).unwrap();
+        }
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(counter.count(), 1);
+        assert!(reactor.is_idle());
+    }
+
+    /// A wait goes on once its spin has run out, and ends at what the sleep after it finds, far
+    /// later than the spin did.
+    #[test]
+    #[timeout(15000)]
+    fn a_wait_goes_on_once_the_spin_has_run_out() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        busy_polling(reactor, Duration::from_millis(10));
+        let (source, mut peer) = pair();
+        let registration = runtime.register(source.clone()).unwrap();
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(read_one(&registration, &source, &mut cx).is_pending());
+        // The wake-up that arming the source wrote, taken out of the channel so that the wait
+        // below can only end on the source.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        let started = Instant::now();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            peer.write_all(&[7]).unwrap();
+        });
+
+        reactor.wait(None).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(counter.count(), 1);
+        // A long wait, behind the short ones that had it spin.
+        assert_eq!(history(reactor) & 1, 0);
+        assert_ne!(history(reactor), 0);
+        writer.join().unwrap();
+    }
+
     /// A runtime of the test's own, whose reactor the test waits on as the thread driving it
     /// would. Shared, so that a test can hand it to a thread of its own.
     fn runtime() -> SharedRuntime {
@@ -2098,11 +2638,42 @@ mod tests {
         state.armed
     }
 
+    /// The history of `reactor`'s waits, a bit for each of the latest eight that could sleep.
+    fn history(reactor: &Reactor<Shared>) -> u8 {
+        Lock::lock(&reactor.busy_poll).history
+    }
+
+    /// Has `reactor` busy-poll for up to `limit`, and waits on it until the next wait would spin,
+    /// which takes one that could sleep and lasted no longer than `limit`.
+    fn busy_polling(reactor: &Reactor<Shared>, limit: Duration) {
+        reactor.set_busy_poll(limit);
+        while !reactor.would_spin() {
+            reactor.wait(Some(Duration::from_micros(100))).unwrap();
+        }
+    }
+
+    /// The rule with busy polling on for [`LIMIT`] and no history.
+    fn on() -> BusyPoll {
+        let mut busy_poll = BusyPoll::default();
+        busy_poll.set_limit(LIMIT);
+
+        busy_poll
+    }
+
     /// The readable direction alone.
     const READABLE: Directions = Directions {
         readable: true,
         writable: false,
     };
+
+    /// The limit of the rule's tests.
+    const LIMIT: Duration = Duration::from_micros(20);
+
+    /// A wait that is over before [`LIMIT`] is.
+    const SHORT: Duration = Duration::from_micros(5);
+
+    /// A wait that outlasts [`LIMIT`].
+    const LONG: Duration = Duration::from_millis(5);
 
     /// A source that records that it has been dropped.
     struct Tracked {

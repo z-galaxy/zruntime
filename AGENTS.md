@@ -284,7 +284,8 @@ src/
 │                 # (elsewhere, behind a pidfd on Linux)
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
-├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers
+├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers, and spins
+│                 # before a wait where the runtime busy-polls (BusyPoll)
 ├── coop.rs       # [runtime, fs features] The budget of I/O operations one poll may complete
 │                 # before the next yields, kept in a thread-local, and unconstrained, which lifts
 │                 # it; fs spends it with no runtime
@@ -366,6 +367,45 @@ way (a poller that keeps what it watches in the kernel) or only the next one (on
 `poll/list.rs` list and copies it as a wait starts). For the latter, arming breaks the wait under
 way, and a source whose registration goes while a wait runs is kept in `Sources::retired`, so
 that its descriptor stays open, until that wait returns.
+
+**Busy polling (opt-in)**: `Runtime::set_busy_poll(limit)` has the thread driving a runtime ask
+the poller for what is ready, again and again and without sleeping, for up to `limit` before a
+wait that would put it to sleep, so that work arriving at short intervals is found with no sleep
+and no wake-up to pay for on either side, which are dear on virtual machines most of all. It is
+off by default (a `limit` of `Duration::ZERO`, which also turns it off again), because a spin that
+finds nothing is CPU time spent for nothing. It lives in the reactor and not in a poller, so that
+every poller has it: epoll, kqueue, `select`, `poll(2)`, Winsock and WASI's `poll(2)`.
+`Reactor::wait_on_poller` takes the place of the call to `Poller::wait`, and for a wait that could
+sleep (a timeout other than `Some(Duration::ZERO)`, which is what a ready task or a woken
+`block_on` future comes to) and where `BusyPoll::spin_for` says so, it first calls
+`Poller::wait(Some(Duration::ZERO))` in a loop, each pass a system call. The loop ends when a pass
+reports a source ready, when `Remote::wake_pending` is up, or when `limit`, cut to the wait's own
+timeout, has passed since it began. Only in the last case does the wait go on, as `Poller::wait`
+with what is left of its timeout (`None` stays `None`). Every other step of `Reactor::wait` stays
+around it: the reconcile and `Sources::waiting` before, `end_wait` on an error, the flag lowered
+after, then the wakes and the timers. `wake_pending` is the signal because it is exactly what
+would have ended a sleep that no source ended: every `notify` that reaches the poller raises it
+first, and every reason to break a wait — a task queued, the `block_on` future woken, a source
+armed where the poller is not `LIVE`, the seat wanted — is a `notify`. A pass that finds the
+wake-up written takes it out of the channel and reports nothing for it, but the flag stays up
+until `wait` lowers it, after the spin. A flag read before the write has landed ends the spin with
+the byte still on its way, which ends the next wait at once, as it does after a wait that ended
+some other way. No reconcile runs between the passes, as nothing on the driving thread changes the
+sources meanwhile: what other threads change reaches a `LIVE` poller at once, and one that is not
+copies its list afresh on every pass and has the change break a sleep through the same `notify`,
+which raises the flag.
+
+The rule is `BusyPoll`: a `u8` history with one bit for each of the last eight waits that could
+sleep, the spin and the sleep after it together, set where the wait lasted no longer than the
+limit, because a spin of the limit would have caught what ended it, or did. A wait spins if the
+limit is above zero and a bit is set. So a runtime that has seen no short wait does not spin, a
+busy one spins, one that has gone idle stops after eight long waits, which bounds what a burst of
+work wastes on spins to eight times the limit, and short waits and long ones in turn keep it
+spinning. Waits that cannot sleep are not counted, nor are failed ones, and a new limit clears the
+history, whose bits say how the waits compared with the old one. The state is an `M::Lock<BusyPoll>`
+of the reactor, taken briefly before a wait and after it and never across it: the limit is written
+from any thread on a `Shared` runtime, the history by the driving thread alone. The tests that need
+a wait to spin prime the history first and ask `Reactor::would_spin`, which only tests have.
 
 **`AsyncIo`, the handle of a source**: `AsyncIo<T, M>` is a `Registration` and the mode's `Ptr<T>`
 (`Rc`/`Arc`) of the source, of which the reactor holds a clone through the sealed
@@ -526,7 +566,7 @@ neither kind of wait takes the place of the other. A stream implements `futures-
 - `src/mode.rs`: The sealed `Mode` trait behind `Local`/`Shared`
 - `src/runtime.rs`: `Core<M>`, the scheduler + reactor + driving state `Runtime<M>` owns
 - `src/driver.rs`: [helper feature] the free `block_on` and the seat/helper-thread machinery
-- `src/reactor.rs`: I/O readiness and timers
+- `src/reactor.rs`: I/O readiness and timers, and the busy polling before a wait (`BusyPoll`)
 - `src/async_io.rs`: `AsyncIo<T, M>`, the async handle of any source the reactor can watch, built on
   a `Registration` and the `Ptr<T>` of the source it shares with the reactor
 - `src/scheduler.rs`: Task storage and polling

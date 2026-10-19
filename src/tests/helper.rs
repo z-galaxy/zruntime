@@ -860,6 +860,47 @@ fn a_wake_from_another_thread_ends_the_wait_block_on_is_in() {
     waker_thread.join().unwrap();
 }
 
+/// A wake from another thread ends the wait that spins in the seat of `block_on`, as it ends one
+/// that sleeps.
+///
+/// The limit is 10 s, so a wake that did not end the spin would leave the thread polling for all
+/// that time.
+#[test]
+#[timeout(15000)]
+fn a_wake_from_another_thread_ends_the_busy_wait_block_on_is_in() {
+    let runtime = runtime();
+    busy_polling(&runtime);
+    let wakers = Arc::new(Mutex::new(None::<Waker>));
+    let started = Instant::now();
+    let waker_thread = {
+        let wakers = wakers.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            if let Some(waker) = lock(&wakers).take() {
+                waker.wake();
+            }
+        })
+    };
+
+    drive(&runtime, async {
+        let mut polled = false;
+        poll_fn(|cx| {
+            if polled {
+                return Poll::Ready(());
+            }
+            polled = true;
+            *lock(&wakers) = Some(cx.waker().clone());
+
+            Poll::Pending
+        })
+        .await
+    });
+
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    waker_thread.join().unwrap();
+}
+
 #[test]
 #[timeout(15000)]
 fn work_left_behind_by_block_on_goes_to_a_helper() {
@@ -947,6 +988,50 @@ fn a_block_on_takes_the_seat_from_the_helper() {
 
     assert!(watcher.join().unwrap());
     assert_eq!(ran_on, thread::current().id());
+}
+
+/// A `block_on` takes the seat from a helper that is spinning, whose spin the call ends by asking
+/// for the seat, and the helper retires out of one when its last task is cancelled.
+///
+/// Nothing bounds the helper's wait but its limit of 10 s: the task it keeps waits for good, with
+/// no timer and no source. So what takes less than a second, in the call and in the retirement,
+/// is the spin ending on the wake-up each of them writes.
+#[test]
+#[timeout(15000)]
+fn a_block_on_takes_the_seat_from_a_helper_that_busy_polls() {
+    let runtime = runtime();
+    runtime.set_busy_poll(Duration::from_secs(10));
+    let (announce, announced) = mpsc::channel();
+    // Waits for the helper's next wait to spin, which takes a short wait, and then for good.
+    let held = runtime.spawn("a task that never finishes", {
+        let runtime = runtime.clone();
+        async move {
+            while !runtime.inner().reactor.would_spin() {
+                runtime.sleep(Duration::from_millis(1)).await;
+            }
+            announce.send(()).unwrap();
+            pending::<()>().await
+        }
+    });
+    announced.recv().unwrap();
+    // Long enough for the helper to reach the wait it spins in.
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+
+    // Which thread runs the task is for the two to settle between them: the helper may still run
+    // the batch it woke for before it gives the seat up. What the call cannot do without the
+    // helper's spin ending is get the task run at all.
+    let answer = drive(&runtime, async {
+        runtime.spawn("an answer", async { 42 }).await
+    })
+    .unwrap();
+
+    assert_eq!(answer, 42);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // The helper took the seat back as the call left, and spins again; cancelling the task is
+    // what tells it that it has nothing left to wait for.
+    drop(held);
+    assert!(helper_gone(&runtime));
 }
 
 #[cfg(feature = "event")]
@@ -1773,6 +1858,27 @@ where
     let inner = runtime.inner().clone();
 
     driver::block_on(driver::Target::Own, &move || Some(inner.clone()), future)
+}
+
+/// Turns busy polling on for `runtime`, with a limit no wait of a test comes near, and has a
+/// `block_on` on it wait until the runtime's next wait spins.
+///
+/// Spinning takes a short wait first, and so a wait of 1 ms, which is short against a limit of
+/// 10 s. One whose timer has come due by the time the reactor looks at it is a wait that cannot
+/// sleep, which counts for nothing, and the runtime waits again.
+fn busy_polling(runtime: &SharedRuntime) {
+    runtime.set_busy_poll(Duration::from_secs(10));
+
+    drive(runtime, async {
+        for _ in 0..100 {
+            if runtime.inner().reactor.would_spin() {
+                return;
+            }
+            runtime.sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    assert!(runtime.inner().reactor.would_spin());
 }
 
 /// A task of `runtime`'s that never finishes, spawned from outside `block_on` and waited for
