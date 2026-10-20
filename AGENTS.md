@@ -103,6 +103,16 @@ program that lets go of, or waits for, many long-running children never fill the
 rest of the blocking work shares. It builds nothing on WASI, which has no child
 processes.
 
+A non-default `signal` feature, which implies `runtime` and adds `libc` and `errno` on unix, for
+`sigaction`, which rustix has no call for, and for the C library's `errno`, which a handler puts
+back as it found it, and `windows-sys`'s `Win32_Foundation` and `Win32_System_Console` features on
+Windows, gives `zruntime::signal`: `Signals`, a stream of the signals of a set on a
+`Runtime` of either flavour, like `tokio::signal` and the async-signal crate, and `Signal`, the
+signals it can listen for. On unix those are `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`,
+`SIGUSR2`, `SIGCHLD` and `SIGWINCH`, and on Windows the console's Ctrl-C, which is
+`Signal::Interrupt` as `SIGINT` is, and Ctrl-Break. It builds nothing on WASI, which has no
+signals. "Signals" below describes how it works.
+
 The crate builds for WASI, `wasm32-wasip1` and `wasm32-wasip2`, too. There the runtime waits on
 `poll(2)` (`src/poll/generic.rs`), whose `notify` raises a flag that ends the next wait rather than
 writing to a pipe, which WASI lacks, and bounds a wait with no limit by `MAX_TIMEOUT`, which WASI
@@ -123,10 +133,10 @@ wait in a park for another thread. The `tcp` and `udp` sockets work on preview 2
 create a socket, so socket2, which does not build for it, is no dependency there, and the
 constructors that create one fail with `Unsupported` (a TCP socket's `from_std` takes one the host
 handed in). Preview 1 has no UDP at all: std fails every operation of its UDP socket there, so
-`UdpSocket::from_std` fails too. The `unix` and `process` features build nothing on WASI. `ci/wasi`
-is a crate of its own that runs the runtime, the shared runtimes, the `fs` module and the sockets on
-both previews under wasmtime, with a host directory lent to it as `/data` for the files of the `fs`
-module.
+`UdpSocket::from_std` fails too. The `unix`, `process` and `signal` features build nothing on
+WASI. `ci/wasi` is a crate of its own that runs the runtime, the shared runtimes, the `fs` module
+and the sockets on both previews under wasmtime, with a host directory lent to it as `/data` for
+the files of the `fs` module.
 
 It is a single crate at the repository root — not a workspace.
 
@@ -170,9 +180,9 @@ RUSTFLAGS="--cfg zruntime_kqueue" cargo clippy --all-targets --all-features \
 cargo clippy --no-default-features --features lock,broadcast,mpmc \
     --target wasm32-unknown-unknown -- -D warnings
 
-# Check the runtime, Event, the two channels, the locks, unblock, fs, each family of socket and
-# the child processes built alone: `--all-features` cannot show that each builds without the
-# others, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
+# Check the runtime, Event, the two channels, the locks, unblock, fs, each family of socket, the
+# child processes and the signals built alone: `--all-features` cannot show that each builds
+# without the others, and leaves out the no-op `error!` in `log.rs` that replaces `tracing`'s
 cargo check --no-default-features --features runtime
 cargo check --no-default-features --features event
 cargo check --no-default-features --features broadcast
@@ -184,6 +194,7 @@ cargo check --no-default-features --features tcp
 cargo check --no-default-features --features udp
 cargo check --no-default-features --features unix
 cargo check --no-default-features --features process
+cargo check --no-default-features --features signal
 
 # Run what needs no runtime (Event, the locks, the two channels, unblock) under Miri, as CI does;
 # the runtime's poller on Linux keeps a timerfd, which Miri does not run, and fs reaches the
@@ -282,6 +293,10 @@ src/
 │                 # Child, and the pool that the waits for children run on; stdio.rs, the pipes;
 │                 # exit/, the wait for a child's exit: kqueue.rs (Apple, the BSDs), pool.rs
 │                 # (elsewhere, behind a pidfd on Linux)
+├── signal/       # [signal feature, not on WASI] Async signals: mod.rs, Signals, Signal and the
+│                 # registry of listeners that every runtime shares; unix.rs, the handler, the
+│                 # pipe it wakes the listeners through, and sigaction; windows.rs, the console's
+│                 # handler routine
 ├── runtime.rs    # [runtime feature] Core<M>: scheduler + reactor + driving state of a Runtime<M>
 ├── scheduler.rs  # [runtime feature] Holds spawned tasks and hands them out to be polled
 ├── reactor.rs    # [runtime feature] Watches registered I/O sources and keeps timers, and spins
@@ -302,13 +317,18 @@ src/
                   # broadcast feature; mpmc.rs: the MPMC channel, mpmc feature; lock/: the locks,
                   # lock feature; helper.rs: helper feature; unblock/: unblock, its pool and
                   # Unblock, unblock feature; fs.rs: fs, fs feature; net/: the sockets, each
-                  # family under its own feature; process.rs: child processes, process feature
+                  # family under its own feature; process.rs: child processes, process feature;
+                  # signal.rs: the handlers, called as the OS would, signal feature
 ```
 
 The tests in `src/tests/` are the unit tests of the crate, one binary whose tests run side by side.
 `tests/process.rs`, at the repository root, is an integration test and a binary of its own
 [process feature]: its one test holds every thread of the pool that all blocking work shares, which
 would stall any other test that ran beside it, so no other test goes in that file.
+`tests/signal.rs` is one too [signal feature, on unix]: its tests send the process real signals,
+whose handling is set for the process as a whole, and so would reach the unit tests, some of which
+spawn children whose exits send `SIGCHLD`. Its own tests run side by side, so each sends signals
+that no other test of the file sends or listens for, and only while it listens for them.
 
 ### Key Design Patterns
 
@@ -528,6 +548,40 @@ direction: a socket serves one waiting reader and one waiting writer at a time t
 neither kind of wait takes the place of the other. A stream implements `futures-io`'s traits for
 `&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`.
 
+**Signals (the `signal` feature)**: what handles a signal is set for the process as a whole, so one
+registry serves every runtime and every listener: `REGISTRY` in `src/signal/mod.rs`, a `Mutex` of
+each `Signals` (its set, the signals that arrived for it and are not handed out yet, and the waker
+of its last poll) and of the platform's `Handlers`. The first listener of a signal takes it over,
+and the last one to be dropped gives it back. On unix, taking over sets zruntime's handler with
+`sigaction` (`SA_RESTART`; the handler from before is kept, and not called: while a listener
+listens, the signal does nothing else), and giving back sets the kept action again, unless the
+action is no longer zruntime's, as other code that set its own since may hand the signal on to
+zruntime's. The handler does only what is async-signal-safe: it sets the signal's bit in `ARRIVED`,
+an `AtomicU32`, and writes a byte to a pipe where it found no bit set (`PIPE`, made once with
+`poll::pipe::pipe` and never closed). Each `Signals` watches a duplicate of the pipe's read end
+through an `AsyncIo`, as a runtime watches a descriptor through one registration at a time. A poll
+first hands out what has arrived: where the pipe is readable, it empties it, takes every bit out of
+`ARRIVED` and hands the signals to all their listeners, under the registry's lock from before the
+pipe is emptied, so that a listener cannot look at what it has waiting while a signal of a kind it
+has waiting is between the pipe and the listeners, to have it come after the one it joins. Only then
+does it take from its own listener. The creation of a listener hands out what has arrived the same
+way (`unix::arrived`), to the listeners there are and before it is added, as a signal that arrived
+before a listener was created is not for it. Every taking of the bits so follows an emptying of the
+pipe, which holds a few bytes at most; should it fill, the handler's write fails and loses nothing,
+as the bytes in it wake a listener all the same. The handler saves `errno` before the write and
+puts it back after it, through the `errno` crate: a write through the C library, which rustix
+makes on most platforms but Linux, sets it where it fails, and the interrupted code may be about to
+read it. A signal that lands on a thread waiting in a poller ends the wait with `EINTR`, which every
+unix poller takes as a wait that found nothing. On Windows, taking
+over adds a console handler routine once, which is never removed: the console calls it on a thread
+of its own, where it hands the event to the listeners there and then, and returns `TRUE` only where
+one listens, so that an event that nothing listens for goes on to the default routine, which ends
+the process. Wherever signals are handed out, the wakers of their listeners are woken clear of the
+lock, through `wake`: every one of them even where one before it panics, as `Event` does, the first
+panic raised again after, but disposed of in the console's routine, out of which a panic that
+unwound would end the process, and, as a listener is created, only once it is in its `Signals`,
+which such a panic then drops, giving back what it took over.
+
 ## Development Guidelines
 
 - **MSRV**: 1.88.0
@@ -544,10 +598,10 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   which is built without the runtime when only `fs` is on: see "Cooperative budget"). `unblock`
   builds nothing on WASI, and `fs` builds there. `tcp`, `udp` and `unix` imply `runtime`, and `unix`
   builds nothing on Windows or WASI. `process` implies `runtime` and `unblock`, and builds nothing
-  on WASI. CI builds and tests everything with every feature on, tests `runtime` alone (for what
-  `spawn` does without `helper`), and checks `runtime`, `event`, `broadcast`, `mpmc`, `lock`,
-  `unblock`, `fs`, `tcp`, `udp`, `unix` and `process` each alone, on the host and on both WASI
-  targets.
+  on WASI. `signal` implies `runtime`, and builds nothing on WASI. CI builds and tests everything
+  with every feature on, tests `runtime` alone (for what `spawn` does without `helper`), and checks
+  `runtime`, `event`, `broadcast`, `mpmc`, `lock`, `unblock`, `fs`, `tcp`, `udp`, `unix`, `process`
+  and `signal` each alone, on the host and on both WASI targets.
 - **Testing**: The test suite needs no external services (no D-Bus, no network beyond loopback).
   Tests, doc examples and benchmarks take `block_on`, the combinators and the I/O extension traits
   from the `futures` dev-dependency (no default features; `std` and `executor`), the crate the
@@ -591,3 +645,7 @@ neither kind of wait takes the place of the other. A stream implements `futures-
   wait for a child's exit (`exit/`), which the reactor watches through a kqueue of the child's own
   on Apple's platforms and the BSDs (`kqueue.rs`) and a pidfd on Linux, and a thread of the `WAITS`
   pool runs elsewhere (`pool.rs`)
+- `src/signal/`: [signal feature] Async signals: `Signals`, `Signal` and the registry of listeners
+  that every runtime shares (`mod.rs`), the handler that marks a signal arrived, the pipe it wakes
+  the listeners through and the `sigaction`s that take a signal over and give it back on unix
+  (`unix.rs`), and the console's handler routine on Windows (`windows.rs`)
