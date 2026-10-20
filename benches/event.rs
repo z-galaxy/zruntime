@@ -6,9 +6,18 @@
 //! `mutex/4-threads`, the mutex taken by four contending threads, is in `contention.rs`, as only
 //! the clock can measure it.
 //!
+//! Each id but `wake-all/100` repeats what it times within one timed call, [`OPS`] times or, for
+//! `listen` and `wake-one`, [`LISTENERS_PER_BATCH`] times, and its throughput is in those
+//! repetitions. CodSpeed's CPU simulation times a single call of each id, which starts with nothing
+//! in the simulated cache. A call of a few dozen instructions, such as one notification sent to
+//! nobody, then costs mostly the cache lines it touches: one line more or less, as where the stack
+//! starts moves with the size of the environment, moves its time by more than the 10% that CodSpeed
+//! reports as a change. A call that repeats it pays for those lines once, and costs what its
+//! instructions do.
+//!
 //! `listen` times taking a listener, alone, on an event whose shared state is already allocated:
-//! what every wait starts with. The listeners are taken a batch at a time and dropped once the
-//! batch has been timed, so the event's queue holds a batch of them at most.
+//! what every wait starts with. The listeners a call takes are dropped once it has been timed, so
+//! the event's queue holds a batch of them at most.
 //!
 //! `listen-drop` times taking a listener and dropping it at once, on an event whose shared state
 //! is already allocated: the common case of a listener whose wait never has to happen because the
@@ -33,10 +42,11 @@
 //! to `Ready`: a broadcast to every listener an event has, such as a connection announcing that it
 //! has closed.
 //!
-//! Each iteration of `wake-one` and `wake-all/100` notifies an event of its own, made and listened
-//! to before the timing starts. The listeners it polls are then the only ones its notification can
-//! reach, however many iterations a harness sets up before it runs them: CodSpeed's CPU simulation
-//! sets up two for the one it measures.
+//! Every event that `wake-one` and `wake-all/100` notify is one of their own, made and listened to
+//! before the timing starts: a call of `wake-one` notifies [`LISTENERS_PER_BATCH`] events with a
+//! listener each, and one of `wake-all/100` an event with a hundred. The listeners a call polls are
+//! then the only ones its notifications can reach, however many calls a harness sets up before it
+//! runs them: CodSpeed's CPU simulation sets up two for the one it measures.
 
 use std::{
     future::Future,
@@ -58,51 +68,84 @@ fn event_benches(c: &mut Criterion) {
     let listen = Event::new();
     // Allocates the event's shared state up front, so the timed batches below never pay for that.
     listen.notify(0);
+    group.throughput(Throughput::Elements(LISTENERS_PER_BATCH as u64));
     group.bench_function("listen", |b| {
-        // The listeners each batch takes are dropped once it has been timed.
+        // The listeners each call takes are handed back, to be dropped once it has been timed.
         b.iter_batched(
-            || (),
-            |()| listen.listen(),
-            BatchSize::NumIterations(LISTENERS_PER_BATCH),
+            || Vec::with_capacity(LISTENERS_PER_BATCH),
+            |mut listeners| {
+                for _ in 0..LISTENERS_PER_BATCH {
+                    listeners.push(listen.listen());
+                }
+
+                listeners
+            },
+            BatchSize::PerIteration,
         );
     });
 
     let listen_drop = Event::new();
     // Allocates the event's shared state up front, so the timed loop below never pays for that.
     listen_drop.notify(0);
+    // For `listen-drop` and the three ids after it, which repeat what they time as many times.
+    group.throughput(Throughput::Elements(OPS));
     group.bench_function("listen-drop", |b| {
-        b.iter(|| drop(black_box(listen_drop.listen())));
+        b.iter(|| {
+            for _ in 0..OPS {
+                drop(black_box(listen_drop.listen()));
+            }
+        });
     });
 
     let notify_none = Event::new();
     notify_none.notify(0);
     group.bench_function("notify-none", |b| {
-        b.iter(|| black_box(notify_none.notify(1)));
+        b.iter(|| {
+            for _ in 0..OPS {
+                black_box(notify_none.notify(1));
+            }
+        });
     });
 
     let uncontended = Mutex::new(());
     group.bench_function("mutex/uncontended", |b| {
         // The guard is dropped at once: the mutex is taken and released.
-        b.iter(|| drop(black_box(uncontended.try_lock())));
+        b.iter(|| {
+            for _ in 0..OPS {
+                drop(black_box(uncontended.try_lock()));
+            }
+        });
     });
 
     let semaphore = Semaphore::new(1);
     group.bench_function("semaphore/uncontended", |b| {
         // The guard is dropped at once: the permit is taken and given back.
-        b.iter(|| drop(black_box(semaphore.try_acquire())));
+        b.iter(|| {
+            for _ in 0..OPS {
+                drop(black_box(semaphore.try_acquire()));
+            }
+        });
     });
 
+    group.throughput(Throughput::Elements(LISTENERS_PER_BATCH as u64));
     group.bench_function("wake-one", |b| {
-        // The event and its listener are handed back, to be dropped once the batch has been timed.
+        // The events and their listeners are handed back, to be dropped once the call has been
+        // timed.
         b.iter_batched(
-            || listened_to(1),
-            |(event, mut listeners)| {
-                assert_eq!(event.notify(1), 1);
-                assert!(poll_once(&mut listeners[0]).is_ready());
-
-                (event, listeners)
+            || {
+                (0..LISTENERS_PER_BATCH)
+                    .map(|_| listened_to(1))
+                    .collect::<Vec<_>>()
             },
-            BatchSize::NumIterations(LISTENERS_PER_BATCH),
+            |mut events| {
+                for (event, listeners) in &mut events {
+                    assert_eq!(event.notify(1), 1);
+                    assert!(poll_once(&mut listeners[0]).is_ready());
+                }
+
+                events
+            },
+            BatchSize::PerIteration,
         );
     });
 
@@ -138,10 +181,16 @@ fn poll_once(listener: &mut EventListener) -> Poll<()> {
     Pin::new(listener).poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// How many iterations of `listen` and `wake-one` each timed batch runs: few enough to keep the
-/// queue of the event `listen` takes its listeners on short, and enough that reading the clock once
-/// a batch costs little next to them.
-const LISTENERS_PER_BATCH: u64 = 64;
+/// How many times a timed call of `listen-drop`, `notify-none`, `mutex/uncontended` and
+/// `semaphore/uncontended` repeats what it times: enough that the call costs what its instructions
+/// do, rather than the cache lines it touches (see the module documentation).
+const OPS: u64 = 1000;
+
+/// How many listeners a timed call of `listen` takes, and how many events one of `wake-one` wakes:
+/// few enough to keep the queue of the event `listen` takes its listeners on short, and enough that
+/// a call costs what its instructions do, rather than the cache lines it touches, and that reading
+/// the clock once a call costs little next to them.
+const LISTENERS_PER_BATCH: usize = 64;
 
 criterion_group!(benches, event_benches);
 criterion_main!(benches);
