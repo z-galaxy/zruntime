@@ -115,9 +115,10 @@ pub(super) use windows::Poller;
     )
 )))]
 mod list;
-// The channel that breaks the wait of every unix poller.
+// The channel that breaks the wait of every unix poller, whose pipe the signals of the `signal`
+// module are woken through as well.
 #[cfg(unix)]
-mod pipe;
+pub(crate) mod pipe;
 
 /// Which directions of a source are watched, or were found ready.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

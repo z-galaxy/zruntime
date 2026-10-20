@@ -48,6 +48,8 @@ mod reactor;
 mod runtime;
 #[cfg(feature = "runtime")]
 mod scheduler;
+#[cfg(all(feature = "signal", any(unix, windows)))]
+pub mod signal;
 #[cfg(feature = "runtime")]
 mod time;
 #[cfg(all(feature = "unblock", not(target_os = "wasi")))]

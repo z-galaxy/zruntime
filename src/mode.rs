@@ -170,16 +170,18 @@ pub(crate) mod sealed {
 
         /// A source pointer to what `ptr` points to, sharing it with whoever holds `ptr`.
         ///
-        /// What a socket of the `net` module, or a pipe or exit descriptor of the `process` module,
-        /// hands its runtime to watch: the socket or pipe itself, which that module goes on doing
-        /// its I/O through, or the descriptor that tells of a process's exit, which it only waits
-        /// on. The bound is `Send + Sync` in either flavour, which every socket, pipe and
-        /// descriptor they build on is, so that one function serves both.
+        /// What a socket of the `net` module, a pipe or exit descriptor of the `process` module, or
+        /// the pipe of the `signal` module, hands its runtime to watch: the socket or pipe itself,
+        /// which that module goes on doing its I/O through, or the descriptor that tells of a
+        /// process's exit, which it only waits on. The bound is `Send + Sync` in either flavour,
+        /// which every socket, pipe and descriptor they build on is, so that one function serves
+        /// both.
         #[cfg(any(
             feature = "tcp",
             feature = "udp",
             all(feature = "unix", unix),
-            all(feature = "process", unix)
+            all(feature = "process", unix),
+            all(feature = "signal", unix)
         ))]
         fn source_ptr<T>(ptr: Self::Ptr<T>) -> Self::SourcePtr
         where
@@ -321,7 +323,8 @@ pub(crate) mod sealed {
             feature = "tcp",
             feature = "udp",
             all(feature = "unix", unix),
-            all(feature = "process", unix)
+            all(feature = "process", unix),
+            all(feature = "signal", unix)
         ))]
         fn source_ptr<T>(ptr: Rc<T>) -> Rc<dyn AsSource>
         where
@@ -399,7 +402,8 @@ pub(crate) mod sealed {
             feature = "tcp",
             feature = "udp",
             all(feature = "unix", unix),
-            all(feature = "process", unix)
+            all(feature = "process", unix),
+            all(feature = "signal", unix)
         ))]
         fn source_ptr<T>(ptr: Arc<T>) -> Arc<dyn AsSource + Send + Sync>
         where

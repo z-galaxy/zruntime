@@ -1,7 +1,7 @@
 //! Tests of a runtime as a whole, of the event that tasks wait for, of the broadcast and MPMC
 //! channels and the locks built on that event, of blocking work run on a pool of threads, of the
-//! filesystem access that runs on the thread that polls it, of the sockets a runtime watches, and
-//! of the child processes it spawns.
+//! filesystem access that runs on the thread that polls it, of the sockets a runtime watches, of
+//! the child processes it spawns, and of the signals it listens for.
 //!
 //! What a runtime does on its own — spawn, join, cancel, time, watch and drive — is tested in the
 //! `core` module, in both flavours wherever the test means the same in each. The budget of I/O
@@ -24,7 +24,11 @@
 //! sockets of the `net` module are tested in the `net` module, one family of them to a module
 //! there, in both flavours wherever the test means the same in each. The child processes of the
 //! `process` module, built on a runtime and on blocking work, are tested in the `process` module,
-//! in both flavours wherever the test means the same in each.
+//! in both flavours wherever the test means the same in each. The signals of the `signal` module
+//! are tested in the `signal` module where the tests call the handler themselves, as the OS would.
+//! The tests that send the process real signals, on unix, are a binary of their own,
+//! `tests/signal.rs`: what handles a signal is set for the process as a whole, and would reach
+//! every test of this one.
 //!
 //! The runtime and the event are features of their own, and a build may have either without the
 //! other. A test of the runtime that uses an event to know that something happened is built only
@@ -56,6 +60,8 @@ mod mpmc;
 mod net;
 #[cfg(all(test, feature = "process", not(target_os = "wasi")))]
 mod process;
+#[cfg(all(test, feature = "signal", any(unix, windows)))]
+mod signal;
 #[cfg(all(test, feature = "unblock"))]
 mod unblock;
 
@@ -1339,6 +1345,59 @@ struct LocalUnixSocketsStayOnTheirThread;
 /// ```
 #[cfg(all(doctest, feature = "process", not(target_os = "wasi")))]
 struct LocalChildrenStayOnTheirThread;
+
+/// A listener of signals built on a local runtime stays on its thread, as everything built on one
+/// does, on Windows too, where no runtime watches for the signals: it is not `Send`...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::signal::Signals<zruntime::Local>>();
+/// ```
+///
+/// ...nor `Sync`...
+///
+/// ```compile_fail
+/// fn shared<T>()
+/// where
+///     T: Sync,
+/// {
+/// }
+///
+/// shared::<zruntime::signal::Signals<zruntime::Local>>();
+/// ```
+///
+/// ...while one built on a shared runtime may go anywhere, and so may the future that waits for its
+/// next signal, which is what a task on a shared runtime needs of them: which says the checks above
+/// fail for the reason they were written for and no other.
+///
+/// ```
+/// use zruntime::{Shared, signal::Signals};
+///
+/// fn sent_and_shared<T>()
+/// where
+///     T: Send + Sync,
+/// {
+/// }
+///
+/// fn sent_future<T>(_: T)
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// fn future_of(signals: &mut Signals<Shared>) {
+///     sent_future(signals.recv());
+/// }
+///
+/// sent_and_shared::<Signals<Shared>>();
+/// ```
+#[cfg(all(doctest, feature = "signal", any(unix, windows)))]
+struct LocalSignalsStayOnTheirThread;
 
 /// Yields to the executor once: the first poll wakes the task and returns `Pending`, so that the
 /// executor runs whatever else it has to before the task goes on.

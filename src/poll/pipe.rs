@@ -45,19 +45,21 @@ impl Pipe {
     }
 }
 
-/// The two ends of a new pipe, set up as [`Pipe`] wants them.
+/// The two ends of a new pipe, both non-blocking and close-on-exec, as [`Pipe`] wants them, and as
+/// the pipe that the signals of the `signal` module come through wants them too.
 #[cfg(not(target_vendor = "apple"))]
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     use rustix::pipe::{PipeFlags, pipe_with};
 
     Ok(pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?)
 }
 
-/// The two ends of a new pipe, set up as [`Pipe`] wants them.
+/// The two ends of a new pipe, both non-blocking and close-on-exec, as [`Pipe`] wants them, and as
+/// the pipe that the signals of the `signal` module come through wants them too.
 ///
 /// Darwin has no `pipe2`, so both settings are made on the descriptors once the pipe exists.
 #[cfg(target_vendor = "apple")]
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     use rustix::{
         io::{FdFlags, fcntl_setfd, ioctl_fionbio},
         pipe::pipe,
