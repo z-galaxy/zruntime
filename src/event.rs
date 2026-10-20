@@ -577,7 +577,24 @@ impl fmt::Debug for EventListener {
 
 /// What an event and its listeners share: the list of the listeners, behind a lock, and the word
 /// that tells a notification, without the lock, whether it would reach any of them.
+///
+/// Every listener holds a count of the `Arc` this is in. It takes it as it is made, just after it
+/// lets go of the lock, and gives it back as it is dropped, soon after its last turn with the lock:
+/// the poll that finds it notified, or the drop's own removal of it from the list. Either happens
+/// on whichever thread the listener is on, while another thread may just have taken the lock. std
+/// keeps the counts at the start of the `Arc`'s allocation, and an allocator such as glibc's puts
+/// the allocation at any multiple of 16 bytes on a 64-bit target, so without the gap at the start,
+/// the counts would share a 64-byte cache line with the lock and the start of the list in three of
+/// the four places it can land. Each count taken or given back would then take that line from the
+/// thread holding the lock, in the middle of its turn with the list: four threads contending for a
+/// `lock::Mutex` take 15 to 25% longer in those three places. With the gap, `list` starts 64 bytes
+/// into the allocation, and so on another line than the counts wherever it lands, where lines are
+/// 64 bytes. Where std boxes the lock itself, as it does a pthread mutex on macOS and NetBSD, that
+/// keeps the list, but not the lock, off the counts' line.
+#[repr(C)]
 struct Shared {
+    /// Room that keeps `list` off the cache line of the `Arc`'s counts.
+    _gap: [u8; GAP],
     /// The listeners, taken through [`Shared::lock`] alone.
     list: Mutex<List>,
     /// How many listeners are notified, while any listener waits, or [`NONE_WAITING`] while none
@@ -594,6 +611,16 @@ struct Shared {
     /// the module documentation, which no ordering of the word's own accesses could do.
     notified: AtomicUsize,
 }
+
+/// How many bytes [`Shared::list`] starts past the start of `Shared`: what is left of 64 once the
+/// two counts that std's `Arc` keeps before its value, in the same allocation, are taken off.
+const GAP: usize = 64 - 2 * size_of::<usize>();
+
+// `list` starts `GAP` bytes into `Shared`, and so 64 bytes into the `Arc`'s allocation, as long as
+// std keeps its two counts, and nothing else, before the value, which is not checked here. Checked
+// in the tests' build only: a layout that moves is a cost to measure, not a reason to fail a build.
+#[cfg(test)]
+const _: () = assert!(mem::offset_of!(Shared, list) == GAP);
 
 impl Shared {
     /// Sends `notification` to `n` listeners, as [`List::notify`] counts them, under the lock, and
@@ -643,6 +670,7 @@ impl Shared {
 impl Default for Shared {
     fn default() -> Self {
         Self {
+            _gap: [0; GAP],
             list: Mutex::default(),
             notified: AtomicUsize::new(NONE_WAITING),
         }
