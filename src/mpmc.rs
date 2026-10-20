@@ -1314,6 +1314,18 @@ fn channel<T>(capacity: Option<NonZeroUsize>) -> (Sender<T>, Receiver<T>) {
 /// again, and not after: a listener that completes has taken its notification, where one dropped
 /// as the try succeeds would pass it on to the next operation waiting, for a wakeup it has no use
 /// for.
+///
+/// Every send and every receive writes the word of `state`'s lock and the length of its queue, a
+/// receive its head too, from whichever thread it runs on, so the cache line that holds them moves
+/// between the cores of the senders and the receivers with each message. The channel is aligned to
+/// 64 bytes, with `state` first and the queue first in it, so that those words lie in its first 64
+/// bytes, and so in one line, of 64 bytes or of 128, wherever the allocator puts the channel. Left
+/// to the compiler and to the allocator's 16-byte alignment, they crossed into a second line in two
+/// of the four places a channel could land, and how fast messages went between threads depended on
+/// where each one did. Where the standard library boxes the lock instead, as it does a pthread
+/// mutex on macOS and NetBSD, the mutex holds only a pointer to it, and only the queue's words are
+/// kept in the line.
+#[repr(C, align(64))]
 struct Channel<T> {
     state: Mutex<State<T>>,
     /// Send operations waiting for room, in a bounded channel.
@@ -1437,7 +1449,9 @@ impl<T> Channel<T> {
     }
 }
 
-/// What a channel's lock keeps.
+/// What a channel's lock keeps, `queue` first, so that its head and length share a cache line with
+/// the lock's word, whatever order the compiler would choose (see [`Channel`]).
+#[repr(C)]
 struct State<T> {
     /// The messages in the channel, the oldest first.
     queue: VecDeque<T>,
@@ -1450,6 +1464,22 @@ struct State<T> {
     /// Whether the channel is closed.
     closed: bool,
 }
+
+// What every send and every receive writes lies in the first 64 bytes of a channel, which start a
+// cache line: the lock's own words, which `Mutex` keeps ahead of what it keeps, as it takes a
+// value of any size, and the whole header of the queue, wherever in it the head and the length
+// are. Checked in the tests' build, on every target it is made for, rather than in every build:
+// a lock that grows is a cost to measure, not a reason to fail a build.
+#[cfg(test)]
+const _: () = {
+    assert!(align_of::<Channel<u64>>() == 64);
+    assert!(mem::offset_of!(Channel<u64>, state) == 0);
+    assert!(mem::offset_of!(State<u64>, queue) == 0);
+    assert!(
+        size_of::<Mutex<State<u64>>>() - size_of::<State<u64>>() + size_of::<VecDeque<u64>>() <= 64,
+        "what every message writes spans more than one cache line of a channel",
+    );
+};
 
 impl<T> State<T> {
     /// Whether the channel holds as many messages as it may.
