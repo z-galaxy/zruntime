@@ -49,6 +49,7 @@ The runtime, and what runs on it:
   unix-domain sockets in its `unix` module, on unix only.
 * **Other I/O sources**: [`AsyncIo`], the async handle of a file descriptor or socket.
 * **Child processes**: the [`process`] module.
+* **Signals**: the [`signal`] module, for Ctrl-C, `SIGTERM`, `SIGHUP` and the like.
 
 What needs no runtime, and works under any executor:
 
@@ -280,6 +281,17 @@ Reading or writing a pipe, and waiting for the child to exit, never block the th
 `Child` leaves the process running, unless `kill_on_drop(true)` was set on its `Command`. The
 [`process`] module documentation has the details.
 
+## Signals
+
+The [`signal`] module listens for the signals of the OS, like `tokio::signal`. Its `Signals` is a
+stream of the signals of a set, which a program waits on alongside its work: Ctrl-C or `SIGTERM` to
+shut down gracefully, say, or `SIGHUP` to reload its configuration. On Windows, it has the
+console's Ctrl-C and Ctrl-Break.
+
+A signal goes to the process as a whole. The first `Signals` that listens for one takes it over
+from the OS, for every runtime and thread of the process, and the signal is handled as it was
+before once the last one is dropped. The [`signal`] module documentation has the details.
+
 ## Events, locks and channels
 
 These work under any executor, not only zruntime's. Tasks on different runtimes and threads can
@@ -429,6 +441,7 @@ To race a future against a timer, use [`Runtime::timeout`].
 * `udp`: `UdpSocket` in the [`net`] module. Implies `runtime`.
 * `unix`: the `net::unix` module, on unix only. Implies `runtime`.
 * `process`: the [`process`] module, except on WASI. Implies `runtime` and `unblock`.
+* `signal`: the [`signal`] module, except on WASI. Implies `runtime`.
 
 `runtime` and `event` do not depend on each other. A crate that only needs `Event`, or the locks
 and channels built on it, can turn off the default features. It then enables only what it uses,
@@ -508,6 +521,7 @@ default. It was split into a separate project so non-zbus users can use it too.
 [`fs`]: https://docs.rs/zruntime/latest/zruntime/fs/index.html
 [`net`]: https://docs.rs/zruntime/latest/zruntime/net/index.html
 [`process`]: https://docs.rs/zruntime/latest/zruntime/process/index.html
+[`signal`]: https://docs.rs/zruntime/latest/zruntime/signal/index.html
 [`futures`]: https://docs.rs/futures
 [`futures::future`]: https://docs.rs/futures/latest/futures/future/index.html
 [`futures::stream`]: https://docs.rs/futures/latest/futures/stream/index.html

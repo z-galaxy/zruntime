@@ -70,6 +70,16 @@ process = [
     "windows-sys?/Win32_Foundation",
     "windows-sys?/Win32_System_Threading",
 ]
+# The `signal` module: a stream of the signals of the OS, such as Ctrl-C, `SIGTERM` and `SIGHUP`
+# on unix, and the console's Ctrl-C and Ctrl-Break on Windows. It builds nothing on WASI, which has
+# no signals.
+signal = [
+    "runtime",
+    "dep:errno",
+    "dep:libc",
+    "windows-sys?/Win32_Foundation",
+    "windows-sys?/Win32_System_Console",
+]
 
 [lints.rust]
 # `--cfg zruntime_poll` has the runtime wait on `poll(2)` on every unix, and `--cfg zruntime_kqueue`
@@ -96,6 +106,13 @@ default-features = false
 features = ["event", "pipe", "std", "time"]
 optional = true
 
+# The handlers of the signals of the `signal` module: `libc` sets them, with `sigaction`, which
+# rustix has no call for, and `errno` reaches the C library's `errno` on each platform, which a
+# handler puts back as it found it.
+[target."cfg(unix)".dependencies]
+errno = { version = "0.3.14", default-features = false, optional = true }
+libc = { version = "0.2.191", optional = true }
+
 [target."cfg(windows)".dependencies.windows-sys]
 version = "0.61.2"
 features = ["Win32_Networking_WinSock"]
@@ -107,6 +124,10 @@ uds_windows = "1.2.1"
 # Pins the threads of the benchmarks to CPUs of their own (see `benches/common/cpus.rs`).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1.1.5", features = ["thread"] }
+
+# Sends the process the signals that the tests and examples of the `signal` module listen for.
+[target."cfg(unix)".dev-dependencies]
+rustix = { version = "1.1.5", features = ["process"] }
 
 [dev-dependencies]
 criterion = { version = "5.0.2", package = "codspeed-criterion-compat", features = ["async"] }

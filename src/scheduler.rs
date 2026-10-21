@@ -848,8 +848,9 @@ where
 /// Drops `value` with every panic its destructor raises contained.
 ///
 /// A task's panic is contained per task: the destructor of its payload, and of that payload's
-/// own payload should it have one, is part of that same task rather than of whoever polls it.
-fn dispose<T>(value: T) {
+/// own payload should it have one, is part of that same task rather than of whoever polls it. The
+/// `signal` module disposes with it of the panics of the wakers it wakes that are to go no further.
+pub(crate) fn dispose<T>(value: T) {
     let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) else {
         return;
     };

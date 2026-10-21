@@ -3,7 +3,7 @@
 
 #[cfg(any(
     all(any(unix, target_os = "wasi"), any(feature = "tcp", feature = "udp")),
-    all(unix, any(feature = "unix", feature = "process"))
+    all(unix, any(feature = "unix", feature = "process", feature = "signal"))
 ))]
 use std::os::fd::AsFd as AsSource;
 #[cfg(any(unix, target_os = "wasi"))]
@@ -321,8 +321,8 @@ where
     }
 
     /// An `AsyncIo` on `runtime` that does its I/O on `io`, as it is: the constructor the sockets
-    /// of the `net` module and the pipes and exit descriptors of the `process` module are built
-    /// with.
+    /// of the `net` module, the pipes and exit descriptors of the `process` module and the pipe of
+    /// the `signal` module are built with.
     ///
     /// Those are generic over the flavour, and a [`Source<M>`](Source) bound cannot be met for an
     /// abstract `M`, so this takes what both flavours need of a source instead, `Send` and `Sync`
@@ -333,7 +333,8 @@ where
         feature = "tcp",
         feature = "udp",
         all(feature = "unix", unix),
-        all(feature = "process", unix)
+        all(feature = "process", unix),
+        all(feature = "signal", unix)
     ))]
     pub(crate) fn from_nonblocking(runtime: &Runtime<M>, io: T) -> io::Result<Self>
     where
