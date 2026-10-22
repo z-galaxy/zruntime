@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.1 - 2026-10-22
+
+### ✨ Added
+- Add async signal handling. #20
+
+### 📝 Documentation
+- Document async signal handling.
+- Document busy polling for contributors.
+
+### ⚡️ Performance
+- Keep an event's lock off the cache line of its Arc's counts.
+- Keep what each message writes in one cache line of a channel.
+- Let a runtime busy-poll before it sleeps.
+
+### ✅ Testing
+- Run a hundred pings within each call of the mpmc benchmarks.
+- Send a hundred messages within each call of the broadcast benchmarks.
+- Repeat what the small event benchmarks time within each call.
+
 ## 0.2.0 - 2026-10-14
 
 ### ✨ Added
