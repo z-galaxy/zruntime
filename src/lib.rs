@@ -472,11 +472,14 @@ where
     /// The returned future resolves to `Ok` with the output of `future` if it completes in time,
     /// and to `Err` with [`TimedOut`] otherwise. Dropping it drops `future` and cancels the timer.
     ///
-    /// The clock starts at this call, not at the first poll. A `duration` too long for the clock to
-    /// represent, such as `Duration::MAX`, never times out. Each poll polls `future` before it
-    /// checks the clock, so a future that completes on the poll in which its time runs out still
-    /// returns its output. A future that times out is not dropped: [`Timeout::into_inner`] returns
-    /// it, to retry it or keep driving it.
+    /// The clock starts at the first poll that leaves `future` waiting, not at this call: neither
+    /// the time before the first poll nor that poll itself counts toward `duration`. So a future
+    /// that completes on its first poll never reads the clock. Use
+    /// [`timeout_at`](Self::timeout_at) for a limit that counts from a moment of your choosing. A
+    /// `duration` too long for the clock to represent, such as `Duration::MAX`, never times out.
+    /// Each poll polls `future` before it checks the clock, so a future that completes on the poll
+    /// in which its time runs out still returns its output. A future that times out is not
+    /// dropped: [`Timeout::into_inner`] returns it, to retry it or keep driving it.
     ///
     /// # Example
     ///
@@ -507,7 +510,10 @@ where
     where
         F: IntoFuture,
     {
-        Timeout::new(future.into_future(), self.sleep(duration))
+        // A timer with no deadline yet, which the timeout gives one once `future` has to wait.
+        let sleep = Sleep(reactor::sleep::<M>(&self.core, None));
+
+        Timeout::new(future.into_future(), sleep, Some(duration))
     }
 
     /// Puts a deadline on `future`, as [`timeout`](Self::timeout) puts a time limit on it.
@@ -544,7 +550,7 @@ where
     where
         F: IntoFuture,
     {
-        Timeout::new(future.into_future(), self.sleep_until(deadline))
+        Timeout::new(future.into_future(), self.sleep_until(deadline), None)
     }
 
     /// A timer that ticks once every `period`, starting one period from now.
