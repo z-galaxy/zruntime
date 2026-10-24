@@ -28,7 +28,8 @@ use crate::{Local, Mode, reactor};
 /// Each poll polls the future first, and only checks the deadline if the future is still pending.
 /// So a future that completes on the poll in which the deadline passes still returns its output.
 /// Like a [`Sleep`], a timeout costs nothing until a poll leaves it pending: if its future
-/// completes on the first poll, it never starts its timer.
+/// completes on the first poll, it never starts its timer, and one with a time limit, from
+/// [`Runtime::timeout`](crate::Runtime::timeout), never even reads the clock.
 ///
 /// The future is not dropped when the deadline passes. It stays inside the timeout until the
 /// timeout is dropped, or until [`into_inner`](Self::into_inner) returns it, to retry it or to keep
@@ -40,6 +41,10 @@ where
 {
     future: F,
     sleep: Sleep<M>,
+    /// The time limit whose clock is still to start, which the first poll that leaves the future
+    /// waiting turns into the deadline of `sleep`. Nothing once it has, and nothing for a timeout
+    /// made with a deadline.
+    limit: Option<Duration>,
 }
 
 impl<F, M> Timeout<F, M>
@@ -82,9 +87,14 @@ where
         self.future
     }
 
-    /// A timeout running `future` against the deadline of `sleep`.
-    pub(crate) fn new(future: F, sleep: Sleep<M>) -> Self {
-        Self { future, sleep }
+    /// A timeout running `future` against the deadline of `sleep`, or, with a `limit`, against
+    /// one `limit` after the first poll that leaves `future` waiting, which `sleep` takes then.
+    pub(crate) fn new(future: F, sleep: Sleep<M>, limit: Option<Duration>) -> Self {
+        Self {
+            future,
+            sleep,
+            limit,
+        }
     }
 }
 
@@ -93,8 +103,11 @@ where
     M: Mode,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Until its clock starts, a time limit's timer has no deadline, which would read as one
+        // that never comes due without the limit beside it.
         f.debug_struct("Timeout")
             .field("deadline", &self.sleep.deadline())
+            .field("limit", &self.limit)
             .finish_non_exhaustive()
     }
 }
@@ -113,13 +126,24 @@ where
         // is never moved to be aligned. And the only methods that hand out `&mut F` or `F` itself,
         // `get_mut` and `into_inner`, take `&mut self` and `self`, which a pinned `Timeout` gives
         // only where it is `Unpin`, and `F` with it. `sleep` is not pinned structurally: it is
-        // `Unpin`, as `Pin::new` below checks, and is only ever reached through a plain `&mut`.
-        let (future, sleep) = unsafe {
+        // `Unpin`, as `Pin::new` below checks, and is only ever reached through a plain `&mut`, as
+        // `limit` is.
+        let (future, sleep, limit) = unsafe {
             let this = self.get_unchecked_mut();
-            (Pin::new_unchecked(&mut this.future), &mut this.sleep)
+            (
+                Pin::new_unchecked(&mut this.future),
+                &mut this.sleep,
+                &mut this.limit,
+            )
         };
         if let Poll::Ready(output) = future.poll(cx) {
             return Poll::Ready(Ok(output));
+        }
+        // A time limit's clock starts here rather than where the timeout was made, so that a
+        // future that completes on its first poll never reads the clock, which is slow on some
+        // systems. A reset of a timer never polled only sets its deadline.
+        if let Some(limit) = limit.take() {
+            sleep.reset_after(limit);
         }
         // Polled only for a future still waiting, and through `Sleep`'s own poll, which asks for
         // a thread to fire the deadline as a bare timer's does.

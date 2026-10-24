@@ -867,6 +867,28 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// The clock of a time limit starts at the first poll that leaves the future waiting, not
+    /// where the timeout is made, so a timeout first polled long after it was made still gives
+    /// its future the whole limit.
+    fn a_timeout_starts_its_clock_once_its_future_waits<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let limit = Duration::from_millis(50);
+        // A timer made on the first poll, which so leaves the future waiting on that poll
+        // whenever it comes.
+        let timeout = runtime.timeout(limit, async {
+            runtime.sleep(limit / 5).await;
+
+            7
+        });
+
+        thread::sleep(limit * 2);
+        let output = runtime.block_on(timeout);
+
+        assert_eq!(output, Ok(7));
+    }
+}
+
+in_both_modes! {
     /// A deadline that has passed by the first poll times a waiting future out on that poll,
     /// with no wait for the reactor to fire it.
     fn a_timeout_at_a_passed_deadline_times_out_on_its_first_poll<M>() {
