@@ -1,10 +1,10 @@
 //! What watches a runtime's sockets and keeps its timers.
 //!
 //! A reactor holds every source registered on it and every timer taken from it, and the thread
-//! driving the runtime hands it that thread through [`Reactor::wait`]: one wait on the platform's
-//! poller, bounded by the nearest deadline, and then the wakes for whatever that wait found ready
-//! and for whatever timer has come due. Where the runtime was asked to busy-poll, the wait is
-//! preceded by a spin (see [`BusyPoll`]).
+//! driving the runtime hands it that thread through [`Reactor::wait_after`]: one wait on the
+//! platform's poller, bounded by the nearest deadline, and then the wakes for whatever that wait
+//! found ready and for whatever timer has come due. Where the runtime was asked to busy-poll, the
+//! wait is preceded by a spin (see [`BusyPoll`]).
 //!
 //! The poller watches each source in the directions the reactor last told it to, and is told of a
 //! change rather than handed every source on each wait, so that a wait costs what the sources
@@ -13,10 +13,18 @@
 //! direction is watched from the moment somebody waits in it: the waiter that stores the first
 //! waker of a direction has the poller told there and then, and breaks the wait under way where
 //! the platform's poller sees the change only in the wait after it. A direction nobody waits in
-//! any more is let go of later, before the next wait, and only where nobody has come back to wait
-//! in it again by then: a task woken by readiness usually stores its waker again as it runs out
-//! of what to read, and that costs the poller nothing. A source a wait found ready, or one a
-//! waiter gave up on, is listed for that look before the next wait.
+//! any more is let go of later, and only where nobody has come back to wait in it again by then:
+//! a task woken by readiness usually stores its waker again as it runs out of what to read, and
+//! that costs the poller nothing. A source a wait found ready, or one a waiter gave up on, is
+//! listed for that look. One a waiter gave up on is looked at before the next wait, unless a wake
+//! has it listed already; one whose waiters a wait woke, only once the tasks those wakes queued
+//! have been polled, which may be some waits later where a wait wakes more tasks than a batch
+//! polls, unless those tasks are queued so far back that the waits until then would cost more in
+//! reports of the source than letting it go would (see [`HOLD`]). Before a wait with no task
+//! queued, every source listed is looked at, so that one that is ready, and that nobody waits
+//! for, does not keep that wait from sleeping. A poller that
+//! keeps its list in user space has every source listed looked at before every wait: a change
+//! costs it no system call, and every wait would copy a source held back, and report it.
 //!
 //! Two locks guard the sources and the timers, and neither is taken while the other is held. A
 //! source's wakers live in its entry in the map, under the map's lock, and every change the poller
@@ -33,7 +41,7 @@
 //! held, so that a limit can be set while the driving thread is in the middle of a wait.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     io, mem,
@@ -48,7 +56,7 @@ use crate::{
     log::error,
     mode::sealed::Lock,
     poll::{self, Directions, Poller, RawSource},
-    runtime::{Core, Remote},
+    runtime::{BATCH, Batch, Core, Remote},
 };
 
 /// The sockets one runtime watches and the timers it keeps.
@@ -76,7 +84,8 @@ where
                 descriptors: HashSet::new(),
                 next_key: 0,
                 next_waiter: 0,
-                stale: Vec::new(),
+                stale: StaleList::default(),
+                taken: 0,
                 waiting: false,
                 retired: Vec::new(),
             }),
@@ -86,13 +95,37 @@ where
         }
     }
 
+    /// [`Reactor::wait_after`] as the tests call it, where no batch of polls ran before it: as
+    /// after a batch that took nothing from what was queued.
+    #[cfg(test)]
+    pub(crate) fn wait(&self, at_most: Option<Duration>) -> io::Result<()> {
+        let queued = self.remote.ready_len();
+        let batch = Batch {
+            ahead: queued,
+            taken: 0,
+        };
+
+        self.wait_after(at_most, batch, queued)
+    }
+
     /// One wait on the poller, bounded by `at_most` and by the nearest deadline, and preceded by a
     /// spin where the runtime busy-polls and the spin is likely to pay; then the wakes for what it
     /// found ready and for the timers that are due.
-    pub(crate) fn wait(&self, at_most: Option<Duration>) -> io::Result<()> {
+    ///
+    /// `batch` is the batch of polls that ran since the wait before, and `queued` how many tasks
+    /// were queued as this wait began: together, they tell which of the sources that earlier waits
+    /// found ready have had the tasks their wakes queued polled, and are due a look (see
+    /// [`Sources::reconcile`]), and how far back in the queue the tasks this wait wakes go (see
+    /// [`HOLD`]).
+    pub(crate) fn wait_after(
+        &self,
+        at_most: Option<Duration>,
+        batch: Batch,
+        queued: usize,
+    ) -> io::Result<()> {
         {
             let mut sources = self.sources.lock();
-            sources.reconcile(&self.remote.poller)?;
+            sources.reconcile(&self.remote.poller, batch, queued == 0)?;
             // A poller that copies its list as a wait starts watches, until the wait returns,
             // descriptors whose registrations may go in the meantime: those are kept open until
             // then, which `Registration::drop` reads this for.
@@ -131,19 +164,20 @@ where
                 let Some(state) = states.get_mut(&event.key) else {
                     continue;
                 };
-                if event.directions.readable {
-                    state.wakers.readable.take_into(&mut woken);
-                }
-                if event.directions.writable {
-                    state.wakers.writable.take_into(&mut woken);
-                }
+                let woke = state.wakers.take_into(event.directions, &mut woken);
                 // A direction the poller let go of by itself is watched no more: the next waiter
                 // in it has the poller watch it again.
                 state.armed.readable &= !event.dropped.readable;
                 state.armed.writable &= !event.dropped.writable;
                 // Watched still in what it was found ready in, which nobody may wait in any
-                // more: looked at again before the next wait.
-                state.mark_stale(event.key, stale);
+                // more: looked at again once the waiters woken have had their turn, where they
+                // are queued near enough the front, and at the next look where they are not.
+                let held = if queued + woken.len() <= HOLD {
+                    woke
+                } else {
+                    Directions::NONE
+                };
+                state.mark_stale(event.key, stale, held);
             }
 
             (woken, mem::take(retired))
@@ -253,7 +287,7 @@ where
     /// the time ran out first.
     ///
     /// Each pass is a system call, so the loop needs no pause or hint of its own. Nor does it
-    /// reconcile the sources between passes, as `wait` did before it began: this thread runs
+    /// reconcile the sources between passes, as `wait_after` did before it began: this thread runs
     /// nothing meanwhile, so nothing here goes stale, and what other threads change reaches the
     /// poller all the same. A poller that keeps what it watches in the kernel sees a change at
     /// once. One that copies its list as a wait starts copies it afresh on every pass, and the
@@ -264,12 +298,12 @@ where
     /// every reason to break a sleep is a `notify`: a task queued, the future of `block_on` woken,
     /// a source armed where the poller sees the change only in the wait after the one under way,
     /// the seat asked for. A pass that finds the wake-up written takes it out of the channel and
-    /// reports nothing for it, but the flag stays up until `wait` lowers it, which is after the
-    /// spin, so the check that follows the pass sees it. A check that sees the flag before the
+    /// reports nothing for it, but the flag stays up until `wait_after` lowers it, which is after
+    /// the spin, so the check that follows the pass sees it. A check that sees the flag before the
     /// write has landed ends the spin with the byte still on its way, which ends the next wait at
-    /// once, as it does after a wait that ended some other way (see the end of `wait`). Nothing is
-    /// lost by that: what the caller of `notify` had to say it said before it raised the flag, and
-    /// the driving thread looks at all of it afresh in the rounds that follow.
+    /// once, as it does after a wait that ended some other way (see the end of `wait_after`).
+    /// Nothing is lost by that: what the caller of `notify` had to say it said before it raised
+    /// the flag, and the driving thread looks at all of it afresh in the rounds that follow.
     fn spin(&self, started: Instant, spin: Duration) -> io::Result<Option<Vec<poll::Ready>>> {
         loop {
             let ready = self.remote.poller.wait(Some(Duration::ZERO))?;
@@ -306,10 +340,13 @@ where
             let mut sources = self.sources.lock();
             let Sources { states, stale, .. } = &mut *sources;
             for (&key, state) in states.iter_mut() {
-                state.wakers.readable.take_into(&mut woken);
-                state.wakers.writable.take_into(&mut woken);
+                let every = Directions {
+                    readable: true,
+                    writable: true,
+                };
+                let woke = state.wakers.take_into(every, &mut woken);
                 // Watched still for the waiters just woken, who may not wait again.
-                state.mark_stale(key, stale);
+                state.mark_stale(key, stale, woke);
             }
         }
         woken.extend(mem::take(&mut self.timers.lock().pending).into_values());
@@ -333,6 +370,18 @@ where
         !self.busy_poll.lock().spin_for(None).is_zero()
     }
 }
+
+/// How far back in the queue of ready tasks a task that a wait wakes may be, at most, for the
+/// source that woke it to be held back for it, watched until it is polled, rather than looked at
+/// before the next wait.
+///
+/// A source held back is reported again by every wait until its task is polled, while it is ready,
+/// and a batch polls [`BATCH`] tasks between two waits: held for a task queued thousands deep, a
+/// source would cost more in reports than the two system calls that holding it back saves, and the
+/// reports of many such sources would fill what a wait reads its events into. Sixteen batches keep
+/// most of what holding back gains where a few hundred tasks are woken at once, and lose nothing
+/// to letting every source go where thousands are, which holding every source back slows down.
+const HOLD: usize = 16 * BATCH;
 
 /// Puts `source` under the watch of `core`'s reactor, with a key of its own to report it by.
 pub(crate) fn register<M>(
@@ -374,6 +423,7 @@ where
                 wakers: Wakers::default(),
                 armed: Directions::NONE,
                 stale: false,
+                woken_again: Directions::NONE,
             },
         );
 
@@ -725,16 +775,17 @@ where
                 unreachable!("a source stays in the map for as long as its registration lives");
             };
             // Watched still for this waiter, who may have been the last in its direction: looked
-            // at again before the next wait.
-            state.mark_stale(key, stale);
+            // at again before the next wait, or, where a wake has it listed already, once the
+            // task that wake queued has been polled.
+            state.mark_stale(key, stale, Directions::NONE);
 
             state.wakers.get_mut(self.interest).readiness.remove(&id)
         };
         // Clear of the lock: dropping a waker can drop a task, and the future of that task may
         // hold a registration or a timer of this reactor, each of which takes a lock as it goes.
         // No wake-up for the wait under way, which may still watch the source for this waiter:
-        // it costs that wait no more than one early return, and the source is let go of before
-        // the wait after it unless somebody else waits on it by then.
+        // it costs that wait no more than one early return, and the source is let go of when it
+        // is next looked at, unless somebody else waits on it by then.
         drop(removed);
     }
 }
@@ -918,9 +969,11 @@ where
     /// The id the next [`Readiness`] to store itself takes.
     next_waiter: u64,
     /// The keys of the sources that may be watched in a direction nobody waits in any more, each
-    /// once: those a wait found ready, and those a waiter gave up on, to be looked at before the
-    /// next wait.
-    stale: Vec<usize>,
+    /// once: those a wait found ready, and those a waiter gave up on, to be looked at before a
+    /// later wait, once the tasks their wakes queued have been polled.
+    stale: StaleList,
+    /// How many ids the batches of polls have taken from the queue of ready tasks, all told.
+    taken: u64,
     /// Whether a wait is under way on a poller that copied its list as it started, which watches
     /// every descriptor it copied until it returns.
     waiting: bool,
@@ -933,21 +986,76 @@ impl<M> Sources<M>
 where
     M: Mode,
 {
-    /// Has `poller` stop watching each stale source in the directions nobody waits in any more.
+    /// Has `poller` stop watching each stale source in the directions nobody waits in any more,
+    /// once the tasks that its wake queued, if any, have been polled: `batch` is the batch that
+    /// ran since the last look, and `idle` says that no task is queued now.
+    ///
+    /// A source a wait found ready woke the task waiting on it, which waits on it again only once
+    /// it is polled and its operation finds the source empty. Looked at before that, the source
+    /// would be let go of by the poller and then taken in again, two system calls on epoll, for
+    /// every task woken that a batch leaves queued. A poller that is not [`Poller::LIVE`] keeps
+    /// its list in user space, and has every stale source looked at all the same: a change costs
+    /// it no system call, and a source held back would be copied, and reported while it is ready,
+    /// by every wait.
     ///
     /// A source that fails to be told keeps being watched as it was, and is looked at again once a
-    /// wait reports it; the first failure is what this returns, once every source has been looked
-    /// at.
-    fn reconcile(&mut self, poller: &Poller) -> io::Result<()> {
-        let Self { states, stale, .. } = self;
+    /// wait reports it; the first failure is what this returns, once every source due has been
+    /// looked at.
+    fn reconcile(&mut self, poller: &Poller, batch: Batch, idle: bool) -> io::Result<()> {
+        let Self {
+            states,
+            stale,
+            taken,
+            ..
+        } = self;
+        // The sources listed since the last look, by the wait before the batch, are due once the
+        // ids queued as the batch began have all been taken, those their wakes queued among them.
+        let after = *taken + batch.ahead as u64;
+        for entry in stale.entries.iter_mut().rev().take(stale.unplaced) {
+            entry.after = after;
+        }
+        stale.unplaced = 0;
+        *taken += batch.taken as u64;
+        // With no task queued, every task that a wake queued has been polled, those of the
+        // sources woken again since they were listed among them, which the count would leave to
+        // the look after this one. A poller that keeps its list in user space is told of a change
+        // with no system call, so that holding a source back saves nothing there, while every
+        // wait would copy the source and report it for as long as it is ready: there, every entry
+        // is due at every look. Otherwise, the entries are due from the front: those due at
+        // the next look are there, and the rest are in the order they were given their counts,
+        // which rise with it, but where a batch went uncounted (see `Batch`): one that it put
+        // behind an earlier one waits for that one, later than its own count but never too early.
+        let all_due = idle || !Poller::LIVE;
+        let due = if all_due {
+            stale.entries.len()
+        } else {
+            stale
+                .entries
+                .iter()
+                .take_while(|entry| entry.after <= *taken)
+                .count()
+        };
         let mut result = Ok(());
-        for key in stale.drain(..) {
+        for _ in 0..due {
+            let Some(StaleEntry { key, .. }) = stale.entries.pop_front() else {
+                break;
+            };
             // A source let go of since has been let go of by the poller as well.
             let Some(state) = states.get_mut(&key) else {
                 continue;
             };
-            state.stale = false;
-            let wanted = state.wakers.directions();
+            let mut wanted = state.wakers.directions();
+            // Woken again since it was listed, by a wait whose task may still be queued: watched
+            // still in the directions of those wakes, and due once that task has been polled too.
+            // The other directions are let go of all the same where nobody waits in them.
+            let again = mem::take(&mut state.woken_again);
+            if !all_due && !again.is_empty() {
+                wanted.readable |= again.readable && state.armed.readable;
+                wanted.writable |= again.writable && state.armed.writable;
+                stale.push(key);
+            } else {
+                state.stale = false;
+            }
             if wanted == state.armed {
                 continue;
             }
@@ -981,6 +1089,9 @@ where
     armed: Directions,
     /// Whether the source's key is in [`Sources::stale`].
     stale: bool,
+    /// The directions a waiter of the source was woken in again while its key was in
+    /// [`Sources::stale`].
+    woken_again: Directions,
 }
 
 impl<M> SourceState<M>
@@ -1004,13 +1115,57 @@ where
         Ok(true)
     }
 
-    /// Lists this source, whose key is `key`, in `stale`, unless it is there already.
-    fn mark_stale(&mut self, key: usize, stale: &mut Vec<usize>) {
-        if !self.stale {
+    /// Lists this source, whose key is `key`, in `stale`, unless it is there already, where
+    /// `woke` says in which directions a waiter of it was woken. A wake has the source looked at
+    /// once the task it queued has been polled, the entry already there included, and watched
+    /// in the directions of the wake until then; with no wake, nothing is waited for, and the
+    /// source is due at the next look.
+    fn mark_stale(&mut self, key: usize, stale: &mut StaleList, woke: Directions) {
+        if self.stale {
+            self.woken_again.readable |= woke.readable;
+            self.woken_again.writable |= woke.writable;
+        } else {
             self.stale = true;
-            stale.push(key);
+            if woke.is_empty() {
+                stale.push_due(key);
+            } else {
+                stale.push(key);
+            }
         }
     }
+}
+
+/// The sources to look at before a wait, in the order they are looked at, each with how far the
+/// queue of ready tasks has to have got before it is looked at: those due at the next look at the
+/// front, then those that wait for their count, in the order they were given it.
+#[derive(Default)]
+struct StaleList {
+    entries: VecDeque<StaleEntry>,
+    /// How many of the entries at the back were listed since the last look, and wait for the
+    /// count the next look gives them.
+    unplaced: usize,
+}
+
+impl StaleList {
+    /// Lists the source `key`, to be given its count at the next look.
+    fn push(&mut self, key: usize) {
+        self.entries.push_back(StaleEntry { key, after: 0 });
+        self.unplaced += 1;
+    }
+
+    /// Lists the source `key` as due at the next look: at the front, which keeps the entries in
+    /// the order they are due, and away from those at the back that wait for their count.
+    fn push_due(&mut self, key: usize) {
+        self.entries.push_front(StaleEntry { key, after: 0 });
+    }
+}
+
+/// A source listed in [`StaleList`].
+struct StaleEntry {
+    key: usize,
+    /// How many ids the batches have to have taken from the queue, all told, before the source
+    /// is due: what [`Sources::taken`] has to reach.
+    after: u64,
 }
 
 /// Who waits for each direction of one source.
@@ -1036,6 +1191,15 @@ impl Wakers {
             writable: self.writable.any(),
         }
     }
+
+    /// Takes every waker of `directions` out, into `woken`, and says in which of them somebody
+    /// waited.
+    fn take_into(&mut self, directions: Directions, woken: &mut Vec<Waker>) -> Directions {
+        Directions {
+            readable: directions.readable && self.readable.take_into(woken),
+            writable: directions.writable && self.writable.take_into(woken),
+        }
+    }
 }
 
 /// Who waits for one direction of one source.
@@ -1056,11 +1220,15 @@ impl Waiters {
         self.operation.is_some() || !self.readiness.is_empty()
     }
 
-    /// Takes every waker out, into `woken`: the direction is ready, or a failed wait has every
-    /// waiter try again. A [`Readiness`] that finds itself gone on its next poll completes.
-    fn take_into(&mut self, woken: &mut Vec<Waker>) {
+    /// Takes every waker out, into `woken`, and says whether there was any: the direction is
+    /// ready, or a failed wait has every waiter try again. A [`Readiness`] that finds itself gone
+    /// on its next poll completes.
+    fn take_into(&mut self, woken: &mut Vec<Waker>) -> bool {
+        let before = woken.len();
         woken.extend(self.operation.take());
         woken.extend(self.readiness.drain().map(|(_, waker)| waker));
+
+        woken.len() > before
     }
 }
 
@@ -2022,7 +2190,8 @@ mod tests {
     }
 
     /// A direction the poller watches for a waiter is watched still once a wait has woken that
-    /// waiter, and let go of before the next wait, where nobody waits in it again by then.
+    /// waiter, and let go of before the next wait with no task queued, where nobody waits in it
+    /// again by then.
     #[test]
     #[timeout(15000)]
     fn a_direction_nobody_waits_in_again_is_let_go_of_before_the_next_wait() {
@@ -2042,6 +2211,335 @@ mod tests {
         assert_eq!(armed(&registration), READABLE);
 
         reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A source a wait found ready stays watched for as long as the task it woke is queued,
+    /// through the waits that cannot sleep, which a batch that leaves tasks queued has come
+    /// before them: let go of, it would be taken in again as soon as the task read it empty and
+    /// waited on it again. A poller that keeps a list lets go of it all the same (see `held`).
+    #[test]
+    #[timeout(15000)]
+    fn a_source_stays_watched_while_the_task_it_woke_is_queued() {
+        let runtime = runtime();
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads twice", async move {
+                for _ in 0..2 {
+                    std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        // The first poll finds nothing to read, and waits.
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(armed(&registration), READABLE);
+
+        // Queued ahead of the reader when the wait wakes it, and never done, so that no wait
+        // finds the queue empty.
+        let _busy = runtime.spawn("a task always ready", always_ready());
+        peer.write_all(&[7]).unwrap();
+        round_of_one(&runtime, Duration::from_secs(1));
+        assert_eq!(runtime.core.remote.ready_len(), 2);
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(armed(&registration), held(READABLE));
+
+        // Polled, the task reads the byte and waits again, and the source stays watched.
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(armed(&registration), READABLE);
+        drop(reader);
+    }
+
+    /// A source whose woken task, once polled, does not wait on it again is let go of before the
+    /// next wait, other tasks queued or not, and before that on a poller that keeps a list (see
+    /// `held`).
+    #[test]
+    #[timeout(15000)]
+    fn a_source_is_let_go_of_once_the_task_it_woke_was_polled_and_left_it() {
+        let runtime = runtime();
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads once", async move {
+                std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                    .await
+                    .unwrap();
+            })
+        };
+        round_of_one(&runtime, Duration::ZERO);
+        let _busy = runtime.spawn("a task always ready", always_ready());
+        peer.write_all(&[7]).unwrap();
+        round_of_one(&runtime, Duration::from_secs(1));
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(armed(&registration), held(READABLE));
+
+        round_of_one(&runtime, Duration::ZERO);
+        assert!(reader.is_finished());
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A wait for readiness given up lets its direction go before the next wait, tasks queued or
+    /// not: no task was queued for it to wait for.
+    #[test]
+    #[timeout(15000)]
+    fn a_dropped_readiness_wait_lets_its_direction_go_with_tasks_queued() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, _peer) = pair();
+        let registration = runtime.register(source).unwrap();
+        let _queued = runtime.spawn("a task never polled", std::future::pending::<()>());
+        let (_counter, waker) = counting_waker();
+        let mut ready = registration.ready(Interest::Readable);
+        assert!(poll_with(&mut ready, &waker).is_pending());
+        assert_eq!(armed(&registration), READABLE);
+
+        drop(ready);
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(runtime.core.remote.ready_len(), 1);
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A source whose waiter a wait wakes again while it is listed waits for that waiter's task
+    /// too: once the task the first wake queued has been polled and has left the source, the one
+    /// woken again is queued still, and may come back to wait on it. A poller that keeps a list
+    /// lets go of it all the same, and takes it in again as the task waits (see `held`).
+    #[test]
+    #[timeout(15000)]
+    fn a_source_woken_again_while_listed_waits_for_that_task_too() {
+        let runtime = runtime();
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads once", async move {
+                std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                    .await
+                    .unwrap();
+            })
+        };
+        round_of_one(&runtime, Duration::ZERO);
+        let watcher = {
+            let registration = registration.clone();
+            runtime.spawn("a task that waits for readiness twice", async move {
+                for _ in 0..2 {
+                    registration.ready(Interest::Readable).await.unwrap();
+                }
+            })
+        };
+        // Wakes the reader, behind the watcher, which is not polled yet.
+        peer.write_all(&[7]).unwrap();
+        runtime
+            .core
+            .reactor
+            .wait(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(runtime.core.remote.ready_len(), 2);
+        // The watcher waits, and the wait after it wakes it: the source is listed already.
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(runtime.core.remote.ready_len(), 2);
+
+        // The reader reads the byte and is done, and the watcher, queued still, keeps the source
+        // watched.
+        round_of_one(&runtime, Duration::ZERO);
+        assert!(reader.is_finished());
+        assert_eq!(armed(&registration), held(READABLE));
+
+        // The watcher's first wait is over, and its second waits on the source as it is watched.
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(armed(&registration), READABLE);
+        drop(watcher);
+    }
+
+    /// A wait with no task queued looks at every source listed, those woken again since they were
+    /// listed among them, as every task a wake queued has been polled: a source that is ready,
+    /// and that nobody waits for any more, does not keep that wait from sleeping.
+    #[test]
+    #[timeout(15000)]
+    fn a_wait_with_no_task_queued_looks_at_every_listed_source() {
+        let runtime = runtime();
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source).unwrap());
+        let waits_once = |name| {
+            let registration = registration.clone();
+            runtime.spawn(name, async move {
+                registration.ready(Interest::Readable).await.unwrap();
+            })
+        };
+        let first = waits_once("a task that waits for readiness once");
+        round_of_one(&runtime, Duration::ZERO);
+        let second = waits_once("another task that waits for readiness once");
+        peer.write_all(&[7]).unwrap();
+        runtime
+            .core
+            .reactor
+            .wait(Some(Duration::from_secs(1)))
+            .unwrap();
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(runtime.core.remote.ready_len(), 2);
+
+        // One batch polls both, and leaves nothing queued. The byte is never read.
+        let batch = runtime.core.run_batch();
+        assert!(first.is_finished());
+        assert!(second.is_finished());
+        runtime.core.wait(true, &mut 0, batch);
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A source whose waiter a wait wakes again while it is listed is watched still in the
+    /// direction of that wake, for the task it queued, but not in a direction that nobody waits
+    /// in any more: that one is let go of as the source comes due, with tasks queued all along.
+    /// A poller that keeps a list lets go of both (see `held`).
+    #[test]
+    #[timeout(15000)]
+    fn a_source_woken_again_lets_go_of_the_direction_nobody_waits_in() {
+        let runtime = runtime();
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads for good", async move {
+                loop {
+                    std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        round_of_one(&runtime, Duration::ZERO);
+        let writer = {
+            let registration = registration.clone();
+            runtime.spawn("a task that waits once to write", async move {
+                registration.ready(Interest::Writable).await.unwrap();
+            })
+        };
+        // The writer waits, and the wait after it finds the source writable and wakes it.
+        round_of_one(&runtime, Duration::ZERO);
+        let both = Directions {
+            readable: true,
+            writable: true,
+        };
+        assert_eq!(armed(&registration), both);
+        assert_eq!(runtime.core.remote.ready_len(), 1);
+
+        // The writer is done, and the wait after it wakes the reader, behind a task that is
+        // never done.
+        let _busy = runtime.spawn("a task always ready", always_ready());
+        peer.write_all(&[7]).unwrap();
+        round_of_one(&runtime, Duration::from_secs(1));
+        assert!(writer.is_finished());
+        assert_eq!(runtime.core.remote.ready_len(), 2);
+
+        // Due, with the reader queued still: watched for it, and no more for the writer.
+        round_of_one(&runtime, Duration::ZERO);
+        assert_eq!(armed(&registration), held(READABLE));
+        drop(reader);
+    }
+
+    /// A source whose woken task is queued more than [`HOLD`] deep is not held back for it, but
+    /// looked at before the next wait: every wait until that task is polled would report the
+    /// source again.
+    #[test]
+    #[timeout(15000)]
+    fn a_source_whose_task_is_queued_far_back_is_let_go_of_at_the_next_look() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads once", async move {
+                std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                    .await
+                    .unwrap();
+            })
+        };
+        round_of_one(&runtime, Duration::ZERO);
+        // Ahead of the reader once the wait wakes it, and never polled.
+        let _ahead: Vec<_> = (0..HOLD)
+            .map(|_| runtime.spawn("a task queued for good", std::future::pending::<()>()))
+            .collect();
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(runtime.core.remote.ready_len(), HOLD + 1);
+
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(armed(&registration), Directions::NONE);
+        drop(reader);
+    }
+
+    /// A batch whose count goes missing, as that of one that unwinds or whose thread gives the
+    /// seat up before its wait does, holds no source watched past the first wait with no task
+    /// queued, where the poller holds one at all (see `held`).
+    #[test]
+    #[timeout(15000)]
+    fn an_uncounted_batch_holds_no_source_past_a_wait_with_no_task_queued() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads once", async move {
+                std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                    .await
+                    .unwrap();
+            })
+        };
+        round_of_one(&runtime, Duration::ZERO);
+        peer.write_all(&[7]).unwrap();
+        reactor.wait(Some(Duration::from_secs(1))).unwrap();
+        // Gives the source its count, which the reader, queued, takes up.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        assert_eq!(armed(&registration), held(READABLE));
+
+        let _uncounted = runtime.core.run_batch();
+        assert!(reader.is_finished());
+        runtime.core.wait(true, &mut 0, Batch::default());
+        assert_eq!(armed(&registration), Directions::NONE);
+    }
+
+    /// A source that one wait finds ready in both directions, waking a waiter in each, is listed
+    /// once, for the tasks of both wakes, and is let go of once both have been polled and left
+    /// it, tasks queued or not: the second direction is not taken for a wake that came after the
+    /// source was listed, as it would be where a poller reports each direction on its own.
+    #[test]
+    #[timeout(15000)]
+    fn a_source_found_ready_both_ways_by_one_wait_is_let_go_of_once_its_tasks_ran() {
+        let runtime = runtime();
+        let (source, mut peer) = pair();
+        let registration = Arc::new(runtime.register(source.clone()).unwrap());
+        let reader = {
+            let registration = registration.clone();
+            runtime.spawn("a reader that reads once", async move {
+                std::future::poll_fn(|cx| read_one(&registration, &source, cx))
+                    .await
+                    .unwrap();
+            })
+        };
+        round_of_one(&runtime, Duration::ZERO);
+        let writer = {
+            let registration = registration.clone();
+            runtime.spawn("a task that waits once to write", async move {
+                registration.ready(Interest::Writable).await.unwrap();
+            })
+        };
+        let _busy = runtime.spawn("a task always ready", always_ready());
+        peer.write_all(&[7]).unwrap();
+        // The writer waits, and the wait after it wakes the reader and the writer both.
+        round_of_one(&runtime, Duration::from_secs(1));
+        assert_eq!(runtime.core.remote.ready_len(), 3);
+
+        // The task always ready, the reader, which reads and is done, and the writer, which is
+        // done too, in turn.
+        for _ in 0..3 {
+            round_of_one(&runtime, Duration::ZERO);
+        }
+        assert!(reader.is_finished());
+        assert!(writer.is_finished());
         assert_eq!(armed(&registration), Directions::NONE);
     }
 
@@ -2514,6 +3012,29 @@ mod tests {
         SharedRuntime::new().unwrap()
     }
 
+    /// One round of the thread driving `runtime`, as `Core::round` makes one, but with a batch of
+    /// one task, so that the test says which task is polled when, and with a wait bounded by
+    /// `at_most` rather than by whether a task is queued.
+    fn round_of_one(runtime: &SharedRuntime, at_most: Duration) {
+        let core = &runtime.core;
+        let batch = core.scheduler.run_batch(&mut [0; 1]);
+        let queued = core.remote.ready_len();
+
+        core.reactor
+            .wait_after(Some(at_most), batch, queued)
+            .unwrap();
+    }
+
+    /// A future that is never done and wakes its task at every poll: the future of a task that is
+    /// ready at every turn, so that the queue is never empty.
+    fn always_ready() -> impl Future<Output = ()> + Send {
+        std::future::poll_fn(|cx| {
+            cx.waker().wake_by_ref();
+
+            Poll::Pending
+        })
+    }
+
     /// A counter and the waker that counts into it.
     fn counting_waker() -> (Arc<Counter>, Waker) {
         let counter = Arc::new(Counter::default());
@@ -2636,6 +3157,18 @@ mod tests {
         };
 
         state.armed
+    }
+
+    /// What a source that a wait found ready is watched for while the task that the wait woke is
+    /// queued: still `directions` on a poller that keeps what it watches in the kernel, and
+    /// nothing on one that keeps a list, which has every listed source looked at before every
+    /// wait (see `Sources::reconcile`).
+    fn held(directions: Directions) -> Directions {
+        if Poller::LIVE {
+            directions
+        } else {
+            Directions::NONE
+        }
     }
 
     /// The history of `reactor`'s waits, a bit for each of the latest eight that could sleep.
