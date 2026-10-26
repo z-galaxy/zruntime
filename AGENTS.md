@@ -381,12 +381,34 @@ what a source is watched for, under the map's lock, rather than handing it every
 wait: `add` as a source is registered, `modify` as the directions it is watched in change, and
 `delete` as its registration goes. A direction is armed as soon as a waiter is stored in it, and
 disarmed lazily: a source a wait found ready, or a `Readiness` gave up on, is listed in
-`Sources::stale` and looked at before the next wait, so that a task that stores its waker again
-before then costs the poller nothing. `Poller::LIVE` says whether a change reaches a wait under
-way (a poller that keeps what it watches in the kernel) or only the next one (one that keeps a
-`poll/list.rs` list and copies it as a wait starts). For the latter, arming breaks the wait under
-way, and a source whose registration goes while a wait runs is kept in `Sources::retired`, so
-that its descriptor stays open, until that wait returns.
+`Sources::stale` and looked at later, so that a task that stores its waker again before then costs
+the poller nothing. One a `Readiness` gave up on, or a wait found ready with nobody to wake, is
+looked at before the next wait, unless a wake has it listed already. One whose waiters a wait woke
+is looked at only once the tasks those wakes queued have been polled: a wait that wakes more tasks
+than a batch polls (`BATCH`) leaves some queued past the next wait, and a source looked at before
+its task ran would be let go of and taken in again, two system calls on epoll for every message such
+a task handles. The ready queue keeps no count for that: the first take of each batch says how many
+ids it left, so that the batch tells how many were queued as it began and how many it took
+(`runtime::Batch`), and the reactor adds up what the batches take (`Sources::taken`), so that a
+source listed by a wait is due once the batches have taken all that the batch after that wait found
+queued. A source whose waiter a wait wakes again while it is listed waits for that task too, and is
+watched still in the directions of those wakes (`SourceState::woken_again`), though not in the
+others nobody waits in, which are let go of as it comes due. Before a wait with no task queued,
+every task a wake queued has been polled, so every listed source is looked at, and one that is
+ready, and that nobody waits for, cannot keep that wait from sleeping. Until its entry comes due,
+each wait that cannot sleep reports such a source again, which costs less than the two system calls
+only while its task is near the front of the queue: a batch polls `BATCH` tasks between two waits,
+so a source held for a task queued thousands deep would be reported by hundreds of waits, and the
+reports of many such sources would fill what a wait reads its events into. So a wait holds a source
+back only for a task it wakes no more than `HOLD` deep in the queue (`Reactor::wait_after` is told
+how many tasks are queued as it begins), and has one whose task is further back looked at before the
+next wait. `Poller::LIVE` says whether a change reaches a wait under way (a poller that keeps what
+it watches in the kernel) or only the next one (one that keeps a `poll/list.rs` list and copies it
+as a wait starts). The latter holds no source back: a change costs it no system call, and a source
+held back would only be copied, and reported while it is ready, by every wait, so every listed
+source is looked at before every wait, tasks queued or not. For the latter too, arming breaks the
+wait under way, and a source whose registration goes while a wait runs is kept in
+`Sources::retired`, so that its descriptor stays open, until that wait returns.
 
 **Busy polling (opt-in)**: `Runtime::set_busy_poll(limit)` has the thread driving a runtime ask
 the poller for what is ready, again and again and without sleeping, for up to `limit` before a
@@ -401,19 +423,19 @@ sleep (a timeout other than `Some(Duration::ZERO)`, which is what a ready task o
 `Poller::wait(Some(Duration::ZERO))` in a loop, each pass a system call. The loop ends when a pass
 reports a source ready, when `Remote::wake_pending` is up, or when `limit`, cut to the wait's own
 timeout, has passed since it began. Only in the last case does the wait go on, as `Poller::wait`
-with what is left of its timeout (`None` stays `None`). Every other step of `Reactor::wait` stays
-around it: the reconcile and `Sources::waiting` before, `end_wait` on an error, the flag lowered
-after, then the wakes and the timers. `wake_pending` is the signal because it is exactly what
-would have ended a sleep that no source ended: every `notify` that reaches the poller raises it
+with what is left of its timeout (`None` stays `None`). Every other step of `Reactor::wait_after`
+stays around it: the reconcile and `Sources::waiting` before, `end_wait` on an error, the flag
+lowered after, then the wakes and the timers. `wake_pending` is the signal because it is exactly
+what would have ended a sleep that no source ended: every `notify` that reaches the poller raises it
 first, and every reason to break a wait — a task queued, the `block_on` future woken, a source
 armed where the poller is not `LIVE`, the seat wanted — is a `notify`. A pass that finds the
 wake-up written takes it out of the channel and reports nothing for it, but the flag stays up
-until `wait` lowers it, after the spin. A flag read before the write has landed ends the spin with
-the byte still on its way, which ends the next wait at once, as it does after a wait that ended
-some other way. No reconcile runs between the passes, as nothing on the driving thread changes the
-sources meanwhile: what other threads change reaches a `LIVE` poller at once, and one that is not
-copies its list afresh on every pass and has the change break a sleep through the same `notify`,
-which raises the flag.
+until `wait_after` lowers it, after the spin. A flag read before the write has landed ends the
+spin with the byte still on its way, which ends the next wait at once, as it does after a wait that
+ended some other way. No reconcile runs between the passes, as nothing on the driving thread
+changes the sources meanwhile: what other threads change reaches a `LIVE` poller at once, and one
+that is not copies its list afresh on every pass and has the change break a sleep through the same
+`notify`, which raises the flag.
 
 The rule is `BusyPoll`: a `u8` history with one bit for each of the last eight waits that could
 sleep, the spin and the sleep after it together, set where the wait lasted no longer than the
