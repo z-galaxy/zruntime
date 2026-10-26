@@ -15,6 +15,15 @@
 //! nothing is sent on, each with a task waiting to read from it: what a wait costs per watched
 //! socket, which a poller that keeps what it watches in the kernel leaves out.
 //!
+//! `io/roundtrip-among-128-unread-busy` is `io/roundtrip` again, while a task is ready at every
+//! turn, so that no wait can sleep, and 128 sockets are readable that nobody reads: what a source
+//! that is ready, and that nobody waits for, costs a busy runtime, which lets go of it rather than
+//! have every wait report it.
+//!
+//! `io/128-ready-at-once` makes a round trip on each of 128 pairs at once, so that a wait wakes
+//! more echo tasks than a batch polls: what a server that many clients keep busy sees, and what
+//! the reactor costs where it keeps watching the sockets of the tasks left queued.
+//!
 //! The `timer` ids need nothing but the reactor's timers, so they run on every platform. The `io`
 //! and `cross-thread` ids need a unix socket pair to give the reactor's readiness path something to
 //! watch, so they are unix-only.
@@ -86,6 +95,7 @@ mod unix {
         io::{Read, Write},
         os::unix::net::UnixStream,
         sync::Arc,
+        task::Poll,
         thread,
     };
 
@@ -107,6 +117,13 @@ mod unix {
     /// How many idle sockets `io/roundtrip-among-256-idle` watches beside the round trip: a pair
     /// each, which keeps all of them within a default limit of 1024 open descriptors.
     const IDLE: usize = 256;
+    /// How many readable sockets that nobody reads `io/roundtrip-among-128-unread-busy` watches
+    /// beside the round trip: a pair each, as for `IDLE`.
+    const UNREAD: usize = 128;
+    /// How many pairs `io/128-ready-at-once` makes a round trip on, all at once: four times what a
+    /// batch polls, and four descriptors each, as `register` clones both ends, which keeps them
+    /// within a default limit of 1024 open descriptors.
+    const READY_AT_ONCE: usize = 128;
 
     pub(super) fn io_benches(c: &mut Criterion) {
         let runtime = runtime_handle();
@@ -167,6 +184,74 @@ mod unix {
                     let mut response = [0u8; 1];
                     read_exact(&registration, &local, &mut response).await;
                     black_box(response);
+                });
+            });
+        }
+        {
+            // The round trip above, while a task is ready at every turn, so that no wait of the
+            // runtime can sleep, and as many sockets are readable that nobody reads: each had a
+            // task wait for it to be readable, which then went on to wait for something else.
+            // What a source that is ready, and that nobody waits for, costs a busy runtime.
+            let _busy = runtime.spawn("bench busy", async {
+                loop {
+                    yield_now().await;
+                }
+            });
+            let _unread: Vec<_> = (0..UNREAD)
+                .map(|_| {
+                    let (near, mut far) = pair();
+                    let registration = runtime.register(near).unwrap();
+                    let waiting = runtime.spawn("bench unread", async move {
+                        registration.ready(Interest::Readable).await.unwrap();
+                        // Holds on to the registration, and so to the socket, without reading.
+                        future::pending::<()>().await;
+                        drop(registration);
+                    });
+                    far.write_all(&[7]).unwrap();
+
+                    (waiting, far)
+                })
+                .collect();
+            let (local, far) = pair();
+            let registration = register(&runtime, &local);
+            let far_registration = register(&runtime, &far);
+            let _echo = runtime.spawn("bench echo", echo_forever(far_registration, far));
+            group.bench_function("roundtrip-among-128-unread-busy", |b| {
+                b.to_async(ZruntimeExecutor).iter(|| async {
+                    write_all(&registration, &local, &[7]).await;
+                    let mut response = [0u8; 1];
+                    read_exact(&registration, &local, &mut response).await;
+                    black_box(response);
+                });
+            });
+        }
+        {
+            // A round trip on each of as many pairs, every request written before any reply is
+            // read, so that a wait finds most of the far ends ready at once (the budget of I/O
+            // operations a poll may complete can split the writes over two polls), and more echo
+            // tasks are woken than a batch polls: what a server that many clients keep busy, such
+            // as a D-Bus broker, sees.
+            let pairs: Vec<_> = (0..READY_AT_ONCE)
+                .map(|_| {
+                    let (local, far) = pair();
+                    let far_registration = register(&runtime, &far);
+                    let echo = runtime.spawn("bench echo", echo_forever(far_registration, far));
+
+                    (register(&runtime, &local), local, echo)
+                })
+                .collect();
+            group.throughput(Throughput::Elements(READY_AT_ONCE as u64));
+            group.bench_function("128-ready-at-once", |b| {
+                b.to_async(ZruntimeExecutor).iter(|| async {
+                    for (registration, local, _) in &pairs {
+                        write_all(registration, local, &[7]).await;
+                    }
+                    future::join_all(pairs.iter().map(|(registration, local, _)| async move {
+                        let mut response = [0u8; 1];
+                        read_exact(registration, local, &mut response).await;
+                        black_box(response);
+                    }))
+                    .await;
                 });
             });
         }
@@ -294,6 +379,22 @@ mod unix {
             }
             write_all(&registration, &far, &chunk[..read]).await;
         }
+    }
+
+    /// Gives the other tasks, and then the reactor, a turn: wakes the task and returns `Pending`
+    /// once.
+    async fn yield_now() {
+        let mut yielded = false;
+        poll_fn(|cx| {
+            if yielded {
+                return Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+
+            Poll::Pending
+        })
+        .await
     }
 
     /// Reads at least one byte from `stream` into `buf`, or `0` once the peer's side has closed.
