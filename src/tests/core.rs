@@ -35,7 +35,7 @@ use super::{or, yield_now};
 use crate::Event;
 use crate::{
     Interest, Interval, Local, LocalRuntime, MissedTickBehavior, Mode, Registration, Runtime,
-    Shared, SharedRuntime, Sleep, Task, TimedOut, Timeout,
+    Shared, SharedRuntime, Sleep, Task, TimedOut, Timeout, runtime::BATCH,
 };
 
 /// Writes the test that follows once per flavour: a module named after it, holding a `local`
@@ -671,6 +671,36 @@ in_both_modes! {
 }
 
 in_both_modes! {
+    /// The future passed to `block_on` is polled again only once it has been woken, however many
+    /// rounds of the runtime's tasks go by meanwhile.
+    fn block_on_polls_its_future_only_once_woken<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let mut polls = 0;
+
+        runtime
+            .block_on(async {
+                // More yields than a batch polls, so that the task keeps the call busy for rounds
+                // on end.
+                let mut task = M::spawn(&runtime, "a task that yields", async {
+                    for _ in 0..BATCH * 10 {
+                        yield_now().await;
+                    }
+                });
+
+                poll_fn(|cx| {
+                    polls += 1;
+                    Pin::new(&mut task).poll(cx)
+                })
+                .await
+            })
+            .unwrap();
+
+        // Once to start waiting for the task, and once more as its end woke the call.
+        assert_eq!(polls, 2);
+    }
+}
+
+in_both_modes! {
     fn sleep_resolves_once_the_duration_has_passed<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let started = Instant::now();
@@ -807,39 +837,33 @@ in_both_modes! {
     /// A task waiting on a timer is woken at the deadline the timer is reset to, though nothing
     /// polls the timer after the reset: the waker it was polled with moves with the deadline.
     ///
-    /// That waker is one the test counts the wakes of, rather than the `block_on` call's own,
-    /// which would show nothing: the call polls its future again after every wait, whatever
-    /// ended it.
+    /// That waker is the `block_on` call's own, and the call polls its future again only once
+    /// woken, so the future stands for the task.
     fn a_reset_wakes_the_waiting_task_at_the_new_deadline<M>() {
         let runtime = Runtime::<M>::new().unwrap();
         let mut sleep = runtime.sleep(Duration::from_secs(10));
-        let (counter, waker) = counting_waker();
-        let mut polled = false;
+        let mut polls = 0;
         let started = Instant::now();
 
-        runtime.block_on(poll_fn(|_| {
-            if !polled {
-                polled = true;
-                let first = Pin::new(&mut sleep).poll(&mut Context::from_waker(&waker));
-                assert!(first.is_pending());
+        runtime.block_on(poll_fn(|cx| {
+            polls += 1;
+            if polls == 1 {
+                assert!(Pin::new(&mut sleep).poll(cx).is_pending());
                 sleep.reset_after(Duration::from_millis(20));
 
                 return Poll::Pending;
             }
-            // The timer is never polled again, so what ends the call is the counted waker, woken
-            // at the new deadline by the wake that moved with it. Had the reset let that waker
-            // go instead, nothing would ever count, and once the new deadline had passed, no
-            // deadline would be left to bound the wait: the call would never end.
-            if counter.count() > 0 {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
+            // The timer is never polled again, so what has the call poll again is the wake that
+            // moved with the deadline. Had the reset let that waker go instead, nothing would
+            // ever wake the call, and once the new deadline had passed, no deadline would be left
+            // to bound the wait: the call would never end.
+            Poll::Ready(())
         }));
 
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(counter.count(), 1);
+        // Woken once, at the new deadline.
+        assert_eq!(polls, 2);
     }
 }
 

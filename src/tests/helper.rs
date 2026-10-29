@@ -32,7 +32,7 @@ use crate::{
     AsyncIo, Interest, Interval, LocalRuntime, Registration, Shared, SharedRuntime, Sleep, Task,
     Timeout, driver,
     mode::sealed::Sealed as _,
-    runtime::{Core, lock},
+    runtime::{BATCH, Core, lock},
 };
 #[cfg(feature = "event")]
 use crate::{Event, EventListener};
@@ -858,6 +858,79 @@ fn a_wake_from_another_thread_ends_the_wait_block_on_is_in() {
     assert!(started.elapsed() >= Duration::from_millis(50));
     assert!(started.elapsed() < Duration::from_secs(5));
     waker_thread.join().unwrap();
+}
+
+/// The future of a `block_on` that sits in the seat is polled again only once it has been woken,
+/// however many rounds of the runtime's tasks go by meanwhile.
+#[test]
+#[timeout(15000)]
+fn block_on_polls_its_future_only_once_woken() {
+    let runtime = runtime();
+    let mut polls = 0;
+
+    drive(&runtime, async {
+        // Spawned from inside, so that the thread in the seat runs the whole task itself rather
+        // than a helper that the first piece of work from outside would start. More yields than a
+        // batch polls, so that the task keeps the call busy for rounds on end.
+        let mut task = runtime.spawn("a task that yields", async {
+            for _ in 0..BATCH * 10 {
+                yield_now().await;
+            }
+        });
+
+        poll_fn(|cx| {
+            polls += 1;
+            Pin::new(&mut task).poll(cx)
+        })
+        .await
+    })
+    .unwrap();
+
+    // Once to start waiting for the task, and once more as its end woke the call.
+    assert_eq!(polls, 2);
+}
+
+/// A `block_on` with no runtime to drive, which parks between the polls of its future, polls it
+/// again only once it has been woken, and not each time the park ends for something else.
+#[test]
+#[timeout(15000)]
+fn a_block_on_with_no_runtime_polls_its_future_only_once_woken() {
+    let (send_waker, receive_waker) = mpsc::channel::<Waker>();
+    let done = Arc::new(AtomicBool::new(false));
+    let waker_thread = {
+        let parked = thread::current();
+        let done = done.clone();
+        thread::spawn(move || {
+            let waker = receive_waker.recv().unwrap();
+            // Each ends the park without waking the future, as a park that ends of its own accord
+            // does, or one ended by a seat being freed.
+            for _ in 0..10 {
+                parked.unpark();
+                thread::sleep(Duration::from_millis(1));
+            }
+            done.store(true, Ordering::Release);
+            waker.wake();
+        })
+    };
+    let mut polls = 0;
+
+    // On a thread that has no runtime of its own alive, and a future that brings none into being,
+    // so that the call has none to drive and parks.
+    crate::block_on(poll_fn(|cx| {
+        polls += 1;
+        if done.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        if polls == 1 {
+            send_waker.send(cx.waker().clone()).unwrap();
+        }
+
+        Poll::Pending
+    }));
+
+    waker_thread.join().unwrap();
+    // Once to hand the waker over, and once more as it was woken.
+    assert_eq!(polls, 2);
 }
 
 /// A wake from another thread ends the wait that spins in the seat of `block_on`, as it ends one
