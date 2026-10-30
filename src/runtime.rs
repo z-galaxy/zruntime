@@ -121,34 +121,30 @@ where
     /// where the future this thread is polling has been woken in the meantime, so that the poll
     /// of it comes next and what a source has for the tasks is reported all the same.
     pub(crate) fn round(&self, woken: &AtomicBool, failed_waits: &mut u32) {
-        let batch = self.run_batch();
+        self.run_batch();
         // Read before the wait, so a wake that already landed is passed on as `at_once`.
         let woken = woken.load(Ordering::Acquire);
 
-        self.wait(woken, failed_waits, batch);
+        self.wait(woken, failed_waits);
     }
 
-    /// Polls up to `BATCH` ready tasks, and says what the batch found queued and took.
-    pub(crate) fn run_batch(&self) -> Batch {
-        self.scheduler.run_batch(&mut [0; BATCH])
+    /// Polls up to `BATCH` ready tasks.
+    pub(crate) fn run_batch(&self) {
+        self.scheduler.run_batch(&mut [0; BATCH]);
     }
 
     /// One wait on the reactor: bounded by no time at all where a task is ready or `at_once`
     /// says the caller has something of its own to get back to, so that the round after it polls
     /// what is ready, and by nothing where neither holds, so that the thread sleeps until a
     /// source, a deadline or a notification has something for it: after a spin, where the runtime
-    /// busy-polls and the reactor finds it likely to pay (see [`Reactor::wait_after`]).
+    /// busy-polls and the reactor finds it likely to pay (see [`Reactor::wait`]).
     ///
     /// `failed_waits` counts the failures in a row, for the pause that keeps a wait which fails
     /// every time from becoming a spin; every waiter retries its own operation and sees its own
     /// error.
-    ///
-    /// `batch` is the batch that ran before the wait, which tells the reactor which of the
-    /// sources it found ready before are due a look (see [`Batch`]).
-    pub(crate) fn wait(&self, at_once: bool, failed_waits: &mut u32, batch: Batch) {
-        let queued = self.remote.ready_len();
-        let at_most = (at_once || queued > 0).then_some(Duration::ZERO);
-        match self.reactor.wait_after(at_most, batch, queued) {
+    pub(crate) fn wait(&self, at_once: bool, failed_waits: &mut u32) {
+        let at_most = (at_once || self.remote.has_ready()).then_some(Duration::ZERO);
+        match self.reactor.wait(at_most) {
             Ok(()) => *failed_waits = 0,
             Err(e) => {
                 *failed_waits += 1;
@@ -245,16 +241,15 @@ impl Remote {
         self.notify();
     }
 
-    /// Takes up to `ids.len()` of the ids queued, oldest first, into `ids`, and says how many,
-    /// and how many it left in the queue.
-    pub(crate) fn take_ready(&self, ids: &mut [u64]) -> (usize, usize) {
+    /// Takes up to `ids.len()` of the ids queued, oldest first, into `ids`, and says how many.
+    pub(crate) fn take_ready(&self, ids: &mut [u64]) -> usize {
         let mut ready = lock(&self.ready);
         let taken = ready.len().min(ids.len());
         for (slot, id) in ids.iter_mut().zip(ready.drain(..taken)) {
             *slot = id;
         }
 
-        (taken, ready.len())
+        taken
     }
 
     /// Puts `ids`, taken off the queue and not polled, back at its head, in the order given.
@@ -272,12 +267,12 @@ impl Remote {
     }
 
     /// Whether a task is waiting to be polled.
-    #[cfg(any(test, feature = "helper"))]
     pub(crate) fn has_ready(&self) -> bool {
         !lock(&self.ready).is_empty()
     }
 
     /// How many ids are queued, stale ones included.
+    #[cfg(test)]
     pub(crate) fn ready_len(&self) -> usize {
         lock(&self.ready).len()
     }
@@ -321,25 +316,6 @@ impl Remote {
             wake_pending: AtomicBool::new(false),
         })
     }
-}
-
-/// What a batch of polls found in the queue of ready tasks as it began, and how many it took.
-///
-/// The queue hands its ids out in the order they came in, so once batches have taken as many ids
-/// as a batch found queued as it began, every task queued by then has been polled: the tasks that
-/// the wait before that batch woke among them. The reactor counts what the batches take, and so
-/// knows when a source a wait found ready has had the task it woke polled, without the queue
-/// keeping any count of its own for the threads that queue tasks to update.
-///
-/// A batch that unwinds, or one whose thread gives the seat up before its wait, has its ids go
-/// uncounted: the sources waiting for the count are then looked at that many ids later, or before
-/// the first wait with no task queued, whichever comes first, and never too early.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Batch {
-    /// How many ids were queued as the batch began.
-    pub(crate) ahead: usize,
-    /// How many ids the batch took.
-    pub(crate) taken: usize,
 }
 
 /// A thread's time driving a runtime: marked here, unmarked when this is dropped, whether
@@ -455,6 +431,10 @@ where
 }
 
 /// Whether the calling thread drives the runtime `remote` belongs to.
+///
+/// Inlined, into the crate of the caller too, as an I/O operation asks this before it runs (see
+/// [`Registration::reports`](crate::reactor::Registration::reports)).
+#[inline]
 pub(crate) fn drives(remote: &Remote) -> bool {
     DRIVING.with(Cell::get) == Some(NonNull::from(remote))
 }

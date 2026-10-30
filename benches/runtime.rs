@@ -17,12 +17,14 @@
 //!
 //! `io/roundtrip-among-128-unread-busy` is `io/roundtrip` again, while a task is ready at every
 //! turn, so that no wait can sleep, and 128 sockets are readable that nobody reads: what a source
-//! that is ready, and that nobody waits for, costs a busy runtime, which lets go of it rather than
-//! have every wait report it.
+//! that is ready, and that nobody waits for, costs a busy runtime, which no wait after the first
+//! should report, whether the poller reports a source as it turns ready alone, or the runtime lets
+//! go of it.
 //!
 //! `io/128-ready-at-once` makes a round trip on each of 128 pairs at once, so that a wait wakes
 //! more echo tasks than a batch polls: what a server that many clients keep busy sees, and what
-//! the reactor costs where it keeps watching the sockets of the tasks left queued.
+//! the reactor costs while the tasks it woke are left queued, whose sockets the waits until they
+//! are polled should neither let go of nor report again.
 //!
 //! The `timer` ids need nothing but the reactor's timers, so they run on every platform. The `io`
 //! and `cross-thread` ids need a unix socket pair to give the reactor's readiness path something to

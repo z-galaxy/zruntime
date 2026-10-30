@@ -392,33 +392,55 @@ wait: `add` as a source is registered, `modify` as the directions it is watched 
 `delete` as its registration goes. A direction is armed as soon as a waiter is stored in it, and
 disarmed lazily: a source a wait found ready, or a `Readiness` gave up on, is listed in
 `Sources::stale` and looked at later, so that a task that stores its waker again before then costs
-the poller nothing. One a `Readiness` gave up on, or a wait found ready with nobody to wake, is
-looked at before the next wait, unless a wake has it listed already. One whose waiters a wait woke
-is looked at only once the tasks those wakes queued have been polled: a wait that wakes more tasks
-than a batch polls (`BATCH`) leaves some queued past the next wait, and a source looked at before
-its task ran would be let go of and taken in again, two system calls on epoll for every message such
-a task handles. The ready queue keeps no count for that: the first take of each batch says how many
-ids it left, so that the batch tells how many were queued as it began and how many it took
-(`runtime::Batch`), and the reactor adds up what the batches take (`Sources::taken`), so that a
-source listed by a wait is due once the batches have taken all that the batch after that wait found
-queued. A source whose waiter a wait wakes again while it is listed waits for that task too, and is
-watched still in the directions of those wakes (`SourceState::woken_again`), though not in the
-others nobody waits in, which are let go of as it comes due. Before a wait with no task queued,
-every task a wake queued has been polled, so every listed source is looked at, and one that is
-ready, and that nobody waits for, cannot keep that wait from sleeping. Until its entry comes due,
-each wait that cannot sleep reports such a source again, which costs less than the two system calls
-only while its task is near the front of the queue: a batch polls `BATCH` tasks between two waits,
-so a source held for a task queued thousands deep would be reported by hundreds of waits, and the
-reports of many such sources would fill what a wait reads its events into. So a wait holds a source
-back only for a task it wakes no more than `HOLD` deep in the queue (`Reactor::wait_after` is told
-how many tasks are queued as it begins), and has one whose task is further back looked at before the
-next wait. `Poller::LIVE` says whether a change reaches a wait under way (a poller that keeps what
-it watches in the kernel) or only the next one (one that keeps a `poll/list.rs` list and copies it
-as a wait starts). The latter holds no source back: a change costs it no system call, and a source
-held back would only be copied, and reported while it is ready, by every wait, so every listed
-source is looked at before every wait, tasks queued or not. For the latter too, arming breaks the
-wait under way, and a source whose registration goes while a wait runs is kept in
-`Sources::retired`, so that its descriptor stays open, until that wait returns.
+the poller nothing. When it is looked at depends on how the poller reports a source, which
+`Poller::EDGE` says. The pollers that keep a `poll/list.rs` list (`poll(2)`, both `select`s) are
+level-triggered: every wait reports a source in each direction it is watched in and ready in, so
+every listed source is looked at before every wait, which costs them no system call. epoll and
+kqueue watch the sources edge-triggered (`EPOLLET`, `EV_CLEAR`; their wake-up channels, and epoll's
+timer, stay level-triggered): a wait reports a source as it turns ready in a direction, or as more
+comes in there, and not again while it only stays ready, so a source whose task a wait woke costs
+the waits after it nothing while that task is queued, however deep. Before a wait that cannot sleep
+(`Reactor::wait`'s `at_most` is zero: a task is queued, or the `block_on` future was woken) they
+leave the listed sources as they are, as letting go of a direction that a task is about to come back
+to would cost two system calls, and before one that may sleep, which follows the polls of every task
+there was, they look at all of them: news that nobody waits for would wake the sleeping thread for
+nothing, as the peer of a socket that nobody waits to write to any more makes room in it with each
+read, an `EPOLLOUT` edge each time. A source that is ready, and that nobody waits for, so costs a
+busy runtime nothing at every wait on either kind of poller: an edge-triggered one reports it once,
+and a level-triggered one lets go of it before the next wait. As a runtime whose waits never sleep
+looks at no listed source there, `Registration::drop` takes the keys of the sources let go of out of
+`Sources::stale` once they may outnumber the sources there are, so that they do not pile up.
+
+An edge-triggered poller leaves the reactor to keep what it was told: `SourceState::reports` counts
+the reports the waits made of a source in each direction, and `SourceState::spent` keeps that count
+as of the latest operation in it that found the source not ready, so a direction whose counts differ
+is one a wait reported since. `Registration::poll_io` takes such an operation in on `WouldBlock`,
+and so does `Registration::ready_again` on its first poll, the wait that `AsyncIo::run_with`
+(`read_with` and `write_with`) makes after its own operation. The first poll of any other
+`Readiness`, whose caller may have run an operation the reactor did not hear of, has the poller look
+at the source afresh where the counts differ (`Poller::recheck`: an `EPOLL_CTL_MOD`, or an `EV_ADD`,
+of what it watches already, which the kernel answers by reporting the source to the next wait where
+it is ready), so that `ready` completes on a source that is ready, as on a level-triggered poller,
+rather than wait for news that may never come, and does not complete again and again on one that is
+not. That is a system call for each such wait after a report, the one thing an edge-triggered poller
+costs per wait that a level-triggered one does not, and one that `poll_io`, `read_with` and
+`write_with` never make, as they take in what their own operation finds. The poller looks at a
+source as it is first armed in a direction too, so a direction whose counts are the same is one the
+source is not ready in, or one a report is on its way for, and a waiter stored in it needs no system
+call. A wait on another thread may report a source between an operation that found it not ready and
+the storing of its waiter, and report it no more: off the thread that drives the runtime
+(`runtime::drives`), an operation notes the count of its direction before it runs
+(`Registration::reports`, under the map's lock), and where the count has moved by the time its
+waiter would be stored, `poll_io` runs the operation again and `ready_again` completes at once so
+that `run_with` does. Each operation compares the count with what it noted itself, so where several
+wait in one direction at once, a report that one of them takes in is not lost to the others, and one
+that runs again leaves `spent` as it is, as what it then finds may be part of what the report was
+for only. On the driving thread no wait runs in between, so whatever a wait found came before the
+operation, which found it spent: there an operation notes nothing and takes no lock for it.
+`Poller::LIVE` says whether a change reaches a wait under way (a poller that keeps what it watches
+in the kernel) or only the next one (one that keeps a list and copies it as a wait starts). For the
+latter, arming breaks the wait under way, and a source whose registration goes while a wait runs is
+kept in `Sources::retired`, so that its descriptor stays open, until that wait returns.
 
 **Busy polling (opt-in)**: `Runtime::set_busy_poll(limit)` has the thread driving a runtime ask
 the poller for what is ready, again and again and without sleeping, for up to `limit` before a
@@ -433,14 +455,14 @@ sleep (a timeout other than `Some(Duration::ZERO)`, which is what a ready task o
 `Poller::wait(Some(Duration::ZERO))` in a loop, each pass a system call. The loop ends when a pass
 reports a source ready, when `Remote::wake_pending` is up, or when `limit`, cut to the wait's own
 timeout, has passed since it began. Only in the last case does the wait go on, as `Poller::wait`
-with what is left of its timeout (`None` stays `None`). Every other step of `Reactor::wait_after`
+with what is left of its timeout (`None` stays `None`). Every other step of `Reactor::wait`
 stays around it: the reconcile and `Sources::waiting` before, `end_wait` on an error, the flag
 lowered after, then the wakes and the timers. `wake_pending` is the signal because it is exactly
 what would have ended a sleep that no source ended: every `notify` that reaches the poller raises it
 first, and every reason to break a wait — a task queued, the `block_on` future woken, a source
 armed where the poller is not `LIVE`, the seat wanted — is a `notify`. A pass that finds the
 wake-up written takes it out of the channel and reports nothing for it, but the flag stays up
-until `wait_after` lowers it, after the spin. A flag read before the write has landed ends the
+until `wait` lowers it, after the spin. A flag read before the write has landed ends the
 spin with the byte still on its way, which ends the next wait at once, as it does after a wait that
 ended some other way. No reconcile runs between the passes, as nothing on the driving thread
 changes the sources meanwhile: what other threads change reaches a `LIVE` poller at once, and one

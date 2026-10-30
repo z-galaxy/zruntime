@@ -40,6 +40,10 @@ impl Poller {
     /// starts.
     pub(crate) const LIVE: bool = false;
 
+    /// Whether a wait reports a source only as it turns ready, or as more comes in: it does not, as
+    /// `select` reports every socket that is ready in a direction it is watched in, at every wait.
+    pub(crate) const EDGE: bool = false;
+
     pub(crate) fn new() -> io::Result<Self> {
         // Winsock has no socket pair, so the pair is a connection a listener of our own accepts
         // from the loopback address and then has no further use for.
@@ -101,6 +105,17 @@ impl Poller {
     ) -> io::Result<()> {
         self.list.modify(key, descriptor, to);
 
+        Ok(())
+    }
+
+    /// Has the source `key`, watched for `armed`, looked at afresh: there is nothing to do, as
+    /// every wait looks at every source in the list.
+    pub(crate) fn recheck(
+        &self,
+        _key: usize,
+        _descriptor: RawSource,
+        _armed: Directions,
+    ) -> io::Result<()> {
         Ok(())
     }
 
