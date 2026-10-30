@@ -380,6 +380,9 @@ where
             // Asked before the operation, not after it: a yield here costs nothing, while one
             // after an operation that completed would hold its result back.
             poll_fn(coop::poll_proceed).await;
+            // Noted before the operation, for the wait after it to tell whether a wait reported
+            // the source while it ran.
+            let since = self.registration.reports(interest);
             match operation(&self.io) {
                 // A call the kernel interrupted is made again straight away: that is not a
                 // readiness question, so it never reaches the reactor, and it spends nothing.
@@ -391,7 +394,8 @@ where
                     return result;
                 }
             }
-            self.registration.ready(interest).await?;
+            // After the operation that found the source not ready, which the wait takes in.
+            self.registration.ready_again(interest, since).await?;
         }
     }
 

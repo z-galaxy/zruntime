@@ -17,6 +17,12 @@
 //! every wait, which it keeps for itself and copies as a wait starts: a change reaches only the
 //! waits that start after it, and a descriptor a wait under way copied has to stay open until that
 //! wait returns.
+//!
+//! The two report a source differently too, and [`Poller::EDGE`] says how. The first kind, epoll
+//! and kqueue, is edge-triggered: a wait reports a source in a direction as it turns ready in it,
+//! and again as more comes in, but not while it only stays ready, so that whoever is told keeps
+//! track of what it was told. The second kind is level-triggered: a wait reports a source in every
+//! direction it is watched in and ready in, whatever earlier waits reported.
 
 // Which poller a platform waits on: epoll on Linux and Android, kqueue on the BSDs, `select(2)` on
 // Apple's platforms, where neither `poll(2)` nor kqueue can watch a terminal, `poll(2)` on any

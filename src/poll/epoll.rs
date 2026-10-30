@@ -6,10 +6,16 @@
 //! the sources the kernel found ready, so that it costs what those cost, however many more are
 //! watched. The read end of the pipe is watched beside them, under a token of its own.
 //!
+//! The sources are watched edge-triggered (`EPOLLET`): a wait reports a source as the kernel finds
+//! it turn ready in a direction it is watched in, or finds more come in there, and not again while
+//! it only stays ready. The kernel looks as the source's own state changes, and also as the source
+//! is added or its directions are changed, which is how [`Poller::recheck`] has it look afresh.
+//! The pipe and the timer are level-triggered, and reported by every wait until one drains them.
+//!
 //! A source is added to the epoll instance as it gains its first direction, and deleted from it as
 //! it loses its last. epoll reports an error or a hang-up of a descriptor whatever it watches it
-//! for, so a source watched for nothing that hung up would end every wait at once if it were in
-//! there; and a source nobody ever waits on costs no system call.
+//! for, so a source watched for nothing would still end a wait as it hung up if it were in there;
+//! and a source nobody ever waits on costs no system call.
 //!
 //! epoll takes its own timeout in whole milliseconds, rounded up, which would have a timer fire up
 //! to a millisecond late. A wait with a timeout sets a timerfd, which takes nanoseconds and which
@@ -50,10 +56,14 @@ impl Poller {
     /// kernel, and a descriptor deleted from it can close at once.
     pub(crate) const LIVE: bool = true;
 
+    /// Whether a wait reports a source only as it turns ready, or as more comes in: it does, as
+    /// every source is watched edge-triggered.
+    pub(crate) const EDGE: bool = true;
+
     pub(crate) fn new() -> io::Result<Self> {
         let epoll = epoll::create(CreateFlags::CLOEXEC)?;
         let wake = Pipe::new()?;
-        // Level-triggered, as every source is: a wake-up is reported by each wait until one
+        // Level-triggered, unlike the sources: a wake-up is reported by each wait until one
         // drains it.
         epoll::add(
             &epoll,
@@ -90,8 +100,9 @@ impl Poller {
     /// the change.
     ///
     /// A source that gains its first direction is added to the instance, and one that loses its
-    /// last is deleted from it. Level-triggered, as the reactor's poll is: a source is reported by
-    /// every wait for as long as it is ready in a direction it is watched in.
+    /// last is deleted from it. Edge-triggered: a wait reports the source as it turns ready in a
+    /// direction of `to`, and as it is found ready in one by the look the kernel takes at it as
+    /// it is added or modified.
     pub(crate) fn modify(
         &self,
         key: usize,
@@ -113,19 +124,38 @@ impl Poller {
             return Ok(epoll::delete(&self.epoll, fd)?);
         }
 
-        let mut flags = EventFlags::empty();
-        if to.readable {
-            flags |= EventFlags::IN;
-        }
-        if to.writable {
-            flags |= EventFlags::OUT;
-        }
         let data = EventData::new_u64(key as u64);
         if from.is_empty() {
-            Ok(epoll::add(&self.epoll, fd, data, flags)?)
+            Ok(epoll::add(&self.epoll, fd, data, flags(to))?)
         } else {
-            Ok(epoll::modify(&self.epoll, fd, data, flags)?)
+            Ok(epoll::modify(&self.epoll, fd, data, flags(to))?)
         }
+    }
+
+    /// Has the kernel look afresh at the source `key`, watched for `armed`, which it does as the
+    /// source is modified, even to what it is watched for already: the next wait reports the
+    /// source in each direction of `armed` it is ready in, as though it had just turned ready
+    /// there, though an earlier wait reported that already.
+    pub(crate) fn recheck(
+        &self,
+        key: usize,
+        descriptor: RawSource,
+        armed: Directions,
+    ) -> io::Result<()> {
+        // A source watched for nothing is not in the instance, and is reported by nothing.
+        if armed.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the descriptor is the one the source `key` lent when it was registered, which
+        // the source keeps open for as long as it lives, as `Source` says and as nothing done
+        // through a shared reference to it can undo in safe code. The reactor calls this under the
+        // lock of its map of sources, with the source in its entry there, which holds the source
+        // across the call: the borrow, which lives no longer than this call, is of an open
+        // descriptor throughout.
+        let fd = unsafe { BorrowedFd::borrow_raw(descriptor) };
+        let data = EventData::new_u64(key as u64);
+
+        Ok(epoll::modify(&self.epoll, fd, data, flags(armed))?)
     }
 
     /// Lets go of the source `key`, watched for `from`, at once, for a wait under way as well: its
@@ -242,6 +272,20 @@ const TIMER: u64 = u64::MAX - 1;
 
 /// How many ready sources one wait reports at most.
 ///
-/// Those ready beyond this many are left for the next wait, which reports them: the poll is
-/// level-triggered.
+/// Those ready beyond this many are left for the next wait, which reports them: the kernel keeps
+/// each source it found ready on a list until a wait takes it off, which a wait with no room left
+/// does not.
 const EVENTS: usize = 256;
+
+/// What epoll is told to watch a source for, to watch it in `directions`, edge-triggered.
+fn flags(directions: Directions) -> EventFlags {
+    let mut flags = EventFlags::ET;
+    if directions.readable {
+        flags |= EventFlags::IN;
+    }
+    if directions.writable {
+        flags |= EventFlags::OUT;
+    }
+
+    flags
+}

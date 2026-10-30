@@ -64,7 +64,7 @@ use crate::{
     Local, Mode, Shared, coop,
     log::error,
     mode::sealed::Lock,
-    runtime::{Batch, Core, Remote},
+    runtime::{Core, Remote},
 };
 
 /// The tasks of one runtime: what has been spawned on it and has not ended yet.
@@ -93,8 +93,7 @@ where
     }
 
     /// Polls up to `ids.len()` ready tasks, whose ids are taken off the queue into `ids` under one
-    /// lock rather than one apiece, and says how many ids were queued as the batch began and how
-    /// many it took (see [`Batch`]).
+    /// lock rather than one apiece.
     ///
     /// An id whose task has gone since it was queued counts as one polled: it took its place in
     /// the queue, and the batch it was taken in is that much closer to its end.
@@ -105,24 +104,16 @@ where
     /// queue: the thread driving the runtime looks at it between batches, not during one, and
     /// whether a runtime has work left counts the tasks that are alive as well as the ids that
     /// are queued.
-    pub(crate) fn run_batch(&self, ids: &mut [u64]) -> Batch {
+    pub(crate) fn run_batch(&self, ids: &mut [u64]) {
         let mut budget = ids.len();
-        let mut batch = None;
         // Taken again once those in hand are polled, so that a task those polls woke runs in this
         // batch, as it would where ids were taken one at a time, rather than after a wait.
         while budget > 0 {
-            let (taken, remaining) = self.remote.take_ready(&mut ids[..budget]);
-            // The first take, under the lock that it takes anyway, tells what was queued as the
-            // batch began.
-            let batch = batch.get_or_insert(Batch {
-                ahead: taken + remaining,
-                taken: 0,
-            });
+            let taken = self.remote.take_ready(&mut ids[..budget]);
             if taken == 0 {
                 break;
             }
             budget -= taken;
-            batch.taken += taken;
             let mut left = Requeue {
                 remote: &self.remote,
                 ids: &ids[..taken],
@@ -132,8 +123,6 @@ where
                 self.run(id);
             }
         }
-
-        batch.unwrap_or_default()
     }
 
     /// Polls one ready task. `false` when the queue was empty.

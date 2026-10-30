@@ -54,7 +54,7 @@ use std::{
 use crate::{
     Shared, coop,
     mode::sealed::Sealed as _,
-    runtime::{Batch, Core, drives, drives_a_runtime, lock, set_driving},
+    runtime::{Core, drives, drives_a_runtime, lock, set_driving},
 };
 
 /// The runtime for what the calling thread builds, made here if none is alive: the one it is in
@@ -569,14 +569,14 @@ fn helper(inner: Arc<Core<Shared>>) {
     loop {
         if let Some(driving) = driving {
             loop {
-                let batch = driving.run_batch();
+                driving.run_batch();
                 if driving.leave_if_idle() {
                     return;
                 }
                 if driving.yield_if_wanted() {
                     break;
                 }
-                driving.wait(false, &mut failed_waits, batch);
+                driving.wait(false, &mut failed_waits);
             }
         }
         // Both ways of getting here put this thread down as parked, with the seat a
@@ -661,9 +661,9 @@ impl Driving {
         }
     }
 
-    /// Polls up to a batch of ready tasks, and says what the batch found queued and took.
-    fn run_batch(&self) -> Batch {
-        self.inner.run_batch()
+    /// Polls up to a batch of ready tasks.
+    fn run_batch(&self) {
+        self.inner.run_batch();
     }
 
     /// One round for `block_on`: a batch, then one wait on the reactor, which waits for nothing
@@ -672,11 +672,11 @@ impl Driving {
         self.inner.round(woken, failed_waits);
     }
 
-    /// One wait on the reactor, after `batch`: bounded by no time at all where a task is ready or
-    /// `at_once` says the caller has something of its own to get back to, and by nothing where
-    /// neither holds.
-    fn wait(&self, at_once: bool, failed_waits: &mut u32, batch: Batch) {
-        self.inner.wait(at_once, failed_waits, batch);
+    /// One wait on the reactor: bounded by no time at all where a task is ready or `at_once`
+    /// says the caller has something of its own to get back to, and by nothing where neither
+    /// holds.
+    fn wait(&self, at_once: bool, failed_waits: &mut u32) {
+        self.inner.wait(at_once, failed_waits);
     }
 
     /// Gives the seat up if nothing is left to run, watch or time; what the helper does before

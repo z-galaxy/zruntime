@@ -4,10 +4,12 @@
 //! wait hands it nothing and costs what the sources it finds ready cost. It watches each direction
 //! of a descriptor as a filter of its own, `EVFILT_READ` and `EVFILT_WRITE`, which a source gains
 //! as somebody first waits in that direction and loses once nobody does, or once the kernel drops
-//! it, which a wait reports. Both are level-triggered: a filter whose direction is ready is
-//! reported by every wait until it is not. The read end of a pipe is watched beside them, which no
-//! source can lend while the poller owns it, and a `notify` writes to the other end to break the
-//! wait.
+//! it, which a wait reports. Both are edge-triggered (`EV_CLEAR`): a wait reports a filter as its
+//! direction turns ready, or as more comes in there, and not again while it only stays ready. The
+//! queue looks at a filter as the descriptor's state changes, and also as the filter is added,
+//! even where it is there already, which is how [`Poller::recheck`] has it look afresh. The read
+//! end of a pipe is watched beside them, level-triggered, which no source can lend while the
+//! poller owns it, and a `notify` writes to the other end to break the wait.
 //!
 //! This is not the poller of Apple's platforms, although they have kqueue as well: theirs turns a
 //! terminal device away (`EINVAL`), which is why those wait with `select(2)`. A build there with
@@ -41,6 +43,10 @@ impl Poller {
     /// the kernel, and a descriptor deleted from it can close at once.
     pub(crate) const LIVE: bool = true;
 
+    /// Whether a wait reports a source only as it turns ready, or as more comes in: it does, as
+    /// every filter of a source is added with `EV_CLEAR`.
+    pub(crate) const EDGE: bool = true;
+
     pub(crate) fn new() -> io::Result<Self> {
         let queue = kqueue()?;
         // rustix makes the queue with a plain `kqueue()`, which leaves close-on-exec unset.
@@ -50,7 +56,14 @@ impl Poller {
             wake: Pipe::new()?,
         };
         let read_end = poller.wake.read_end().as_raw_fd();
-        poller.apply([change(EventFilter::Read(read_end), true, WAKE)])?;
+        // Level-triggered, unlike the sources: a wake-up is reported by each wait until one
+        // drains it.
+        let wake = Event::new(
+            EventFilter::Read(read_end),
+            EventFlags::ADD | EventFlags::RECEIPT,
+            ptr::without_provenance_mut(WAKE),
+        );
+        poller.apply([wake])?;
 
         Ok(poller)
     }
@@ -91,6 +104,29 @@ impl Poller {
             .then(|| change(EventFilter::Read(descriptor), to.readable, key));
         let write = (from.writable != to.writable)
             .then(|| change(EventFilter::Write(descriptor), to.writable, key));
+        match (read, write) {
+            (Some(read), Some(write)) => self.apply([read, write]),
+            (Some(only), None) | (None, Some(only)) => self.apply([only]),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Has the queue look afresh at the source `key`, watched for `armed`, which it does as each
+    /// of its filters is added again: the next wait reports the source in each direction of
+    /// `armed` it is ready in, as though it had just turned ready there, though an earlier wait
+    /// reported that already.
+    pub(crate) fn recheck(
+        &self,
+        key: usize,
+        descriptor: RawSource,
+        armed: Directions,
+    ) -> io::Result<()> {
+        let read = armed
+            .readable
+            .then(|| change(EventFilter::Read(descriptor), true, key));
+        let write = armed
+            .writable
+            .then(|| change(EventFilter::Write(descriptor), true, key));
         match (read, write) {
             (Some(read), Some(write)) => self.apply([read, write]),
             (Some(only), None) | (None, Some(only)) => self.apply([only]),
@@ -245,12 +281,12 @@ impl Poller {
 /// The change that has the queue watch `filter`, reported under `key`, where `watched`, and that
 /// deletes it from the queue otherwise, with a receipt asked for either way.
 ///
-/// Neither `EV_CLEAR` nor `EV_ONESHOT` is set, so a filter added is level-triggered: every wait
-/// reports it for as long as its direction is ready, which is what the reactor expects of a
-/// poller.
+/// A filter is added with `EV_CLEAR`, which makes it edge-triggered: the queue clears the state
+/// of the filter as a wait reports it, so that no later wait reports it until its direction turns
+/// ready again, or more comes in there. `EV_ONESHOT` is not set, so that the filter stays.
 fn change(filter: EventFilter, watched: bool, key: usize) -> Event {
     let action = if watched {
-        EventFlags::ADD
+        EventFlags::ADD | EventFlags::CLEAR
     } else {
         EventFlags::DELETE
     };
@@ -266,6 +302,6 @@ const WAKE: usize = usize::MAX;
 
 /// The most events one wait reads.
 ///
-/// Those past it stay ready in the queue, whose filters are level-triggered, and the next wait
-/// reports them.
+/// Those past it stay in the queue, which keeps each filter it found ready until a wait reads it,
+/// and the next wait reports them.
 const EVENTS: usize = 256;
