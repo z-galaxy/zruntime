@@ -490,15 +490,19 @@ where
         }
         match &*driving {
             Some(driving) => driving.round(&signal.woken, &mut failed_waits),
-            // On WASI without threads, a park returns at once, and the next turn looks for the seat
-            // again, and polls the future where it has been woken, as any turn does. No seat is
-            // ever found taken there: no helper is up, and the one thread there is would have been
-            // turned away on entering this call, had it been in the seat. So this is reached only
-            // while `resolve` names no runtime, and the turn after the poll that brings one into
-            // being takes its seat. A future that waits meanwhile for what no poll of it and no
-            // runtime this thread drives can bring, such as a task of a runtime nobody is inside
-            // `block_on` on, waits for good, as a park would have it wait with nobody to wake it,
-            // though it spins rather than sleeps.
+            // This thread has no seat: `resolve` names no runtime, or another thread is in the
+            // seat. It parks until the future is woken or the seat is freed, unless the future was
+            // woken already.
+            //
+            // On WASI without threads, a park returns at once, so the loop spins instead, each turn
+            // looking for the seat again and polling the future only if it has been woken. The seat
+            // is never taken there: no helper is ever started, there is no other thread, and this
+            // thread, had it been in a seat, would have been turned away on entering the call. So
+            // the loop spins only while `resolve` names no runtime. Once a poll of the future
+            // brings one into being, the look for a seat right after that poll takes its seat.
+            // Until then, nothing else runs on the thread, so only the future can wake itself, from
+            // inside a poll. One that waits for anything else, such as a task of a runtime that
+            // nobody is inside `block_on` on, waits for good, spinning where a park would sleep.
             None => {
                 if !signal.woken.load(Ordering::Acquire) {
                     thread::park();
