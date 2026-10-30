@@ -153,8 +153,7 @@ impl Poller {
     /// Waits until a watched source is ready, `notify` is called or `timeout` passes; `None`
     /// waits without limit.
     ///
-    /// A source comes back once, in every direction it was found ready in, as with the other
-    /// pollers, although the queue reports each of its filters as an event of its own. One whose
+    /// A source found ready in both directions comes back twice, once for each filter. One whose
     /// filter reports the end of its descriptor (`EV_EOF`) comes back as ready like any other:
     /// its reader or writer retries its operation, and sees the end or the error for itself.
     ///
@@ -216,20 +215,6 @@ impl Poller {
                 dropped,
             });
         }
-        // The reactor takes each report as all that the wait found of its source, so the events
-        // of the two filters of one source are merged into one.
-        ready.sort_unstable_by_key(|ready| ready.key);
-        ready.dedup_by(|later, earlier| {
-            if later.key != earlier.key {
-                return false;
-            }
-            earlier.directions.readable |= later.directions.readable;
-            earlier.directions.writable |= later.directions.writable;
-            earlier.dropped.readable |= later.dropped.readable;
-            earlier.dropped.writable |= later.dropped.writable;
-
-            true
-        });
 
         Ok(ready)
     }
