@@ -346,6 +346,16 @@ ready queue and the poller's notify half). This is the one place a `Local` runti
 atomics; everywhere else it is a plain `Rc`/`RefCell`/`Cell` structure. On a `Shared` runtime the
 waker lives inside the task's join state instead, saving an allocation per task.
 
+**The loop of `block_on`**: `Core::block_on`, and `driver::drive` under the free `block_on` and a
+`block_on` on a runtime with a seat, go round after round, each round a batch of ready tasks and
+then one wait on the reactor (`Core::round`), or a park for a thread out of the seat, and poll the
+future passed to them between two rounds only where it has been woken since its last poll. Its
+waker, a `Signal`, raises `Signal::woken`, which starts raised, for the first poll, and which each
+turn of the loop swaps down whether it polls or not: the ordering argument in the field's
+documentation relies on that swap at every turn. A round that ends for the tasks alone, as most do
+on a runtime they keep busy, so costs no poll of the future, and a future that returns `Pending`
+without arranging a wake is not polled again, however busy the runtime.
+
 **Single-threaded, seat-based driving (the `helper` feature)**: on top of `Runtime<Shared>`,
 `driver.rs` gives a runtime made through the per-thread registries (`SharedRuntime::current()`,
 the free `block_on`) a seat: only one thread at a time runs its scheduler and reactor. A thread

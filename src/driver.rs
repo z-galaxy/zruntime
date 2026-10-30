@@ -5,10 +5,11 @@
 //! built on by the free `block_on`, comes out of one of the registries below, and has a seat. The
 //! scheduler and the reactor are run by one thread at a time, the one in the driver's seat.
 //! A thread that enters `block_on` takes the seat if it is free and keeps it until its future is
-//! done: between two polls of that future it runs a batch of ready tasks and then waits on the
-//! reactor, so a program that drives its work through `block_on` runs it on its own thread and
-//! starts none. A thread that finds the seat taken parks instead, to be polled again when its
-//! future is woken or the seat is freed.
+//! done: round after round, it runs a batch of ready tasks and then waits on the reactor, and it
+//! polls that future between two rounds where the future has been woken since its last poll, so a
+//! program that drives its work through `block_on` runs it on its own thread and starts none. A
+//! thread that finds the seat taken parks instead, until its future is woken, to poll it, or the
+//! seat is freed, to take it.
 //!
 //! Work that outlives every `block_on` — a task, a registered source or a timer polled from some
 //! other executor, or a task left running once `block_on` has returned — is run by a helper
@@ -374,9 +375,8 @@ impl Seat {
         self.waiting.remove(&thread::current().id());
     }
 
-    /// Frees the seat, and unparks every thread waiting for it: to take it, or to find its
-    /// future done. A helper that parked for want of it is roused too, a freed seat being the
-    /// very thing it parked for.
+    /// Frees the seat, and unparks every thread waiting for it, to take it. A helper that parked
+    /// for want of it is roused too, a freed seat being the very thing it parked for.
     fn free(&mut self) {
         let parked_helper = match &mut self.holder {
             Holder::Nobody { parked_helper } | Holder::BlockOn { parked_helper } => {
@@ -452,7 +452,8 @@ where
     let mut future = pin!(future);
     let signal = Arc::new(Signal {
         thread: thread::current(),
-        woken: AtomicBool::new(false),
+        // Up, as the future is due its first poll.
+        woken: AtomicBool::new(true),
         runtime: Mutex::new(Weak::new()),
     });
     let waker = Waker::from(signal.clone());
@@ -470,31 +471,34 @@ where
         if driving.is_none() {
             take_seat(driving);
         }
-        // Lowered before the poll, so that a wake during it is seen by the round or the park
-        // that follows, and with a swap, so that the poll sees what the wakes before it were
-        // for.
-        signal.woken.swap(false, Ordering::AcqRel);
-        // Budgeted like a task, because the tasks run only between its polls: see
-        // `Core::block_on`.
-        if let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx)) {
-            return output;
+        // Polled only where it has been woken since its last poll, as in `Core::block_on`. Lowered
+        // at every turn, polled or not, and before the poll, so that a wake during it is seen by
+        // the round or the park that follows, and with a swap, so that the poll sees what the wakes
+        // before it were for.
+        if signal.woken.swap(false, Ordering::AcqRel) {
+            // Budgeted like a task, because the tasks run only between its polls: see
+            // `Core::block_on`.
+            if let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx)) {
+                return output;
+            }
         }
-        // Looked for again, because the poll may have been what brought the runtime into being,
-        // and a thread inside `block_on` asks for no helper: where nobody else is in the seat,
-        // the work that poll left behind is this thread's to run.
+        // Looked for again, because the poll, where there was one, may have been what brought the
+        // runtime into being, and a thread inside `block_on` asks for no helper: where nobody else
+        // is in the seat, the work that poll left behind is this thread's to run.
         if driving.is_none() {
             take_seat(driving);
         }
         match &*driving {
             Some(driving) => driving.round(&signal.woken, &mut failed_waits),
-            // On WASI without threads, a park returns at once, and the next turn polls again. No
-            // seat is ever found taken there: no helper is up, and the one thread there is would
-            // have been turned away on entering this call, had it been in the seat. So this is
-            // reached only while `resolve` names no runtime, and the turn after the poll that
-            // brings one into being takes its seat. A future that waits meanwhile for what no
-            // poll of it and no runtime this thread drives can bring, such as a task of a runtime
-            // nobody is inside `block_on` on, waits for good, as a park would have it wait with
-            // nobody to wake it, though it spins rather than sleeps.
+            // On WASI without threads, a park returns at once, and the next turn looks for the seat
+            // again, and polls the future where it has been woken, as any turn does. No seat is
+            // ever found taken there: no helper is up, and the one thread there is would have been
+            // turned away on entering this call, had it been in the seat. So this is reached only
+            // while `resolve` names no runtime, and the turn after the poll that brings one into
+            // being takes its seat. A future that waits meanwhile for what no poll of it and no
+            // runtime this thread drives can bring, such as a task of a runtime nobody is inside
+            // `block_on` on, waits for good, as a park would have it wait with nobody to wake it,
+            // though it spins rather than sleeps.
             None => {
                 if !signal.woken.load(Ordering::Acquire) {
                     thread::park();
@@ -734,14 +738,16 @@ impl Drop for Driving {
 /// The waker of the future a `block_on` polls.
 struct Signal {
     thread: Thread,
-    /// Whether the future has been woken since it was last polled.
+    /// Whether the future is due a poll: up from the start, for the first poll, and raised by each
+    /// wake after it, for the poll that follows.
     ///
-    /// Raised by each wake and lowered before each poll, both with `AcqRel` swaps rather than
-    /// stores. The lowering acquires every wake since the one before it, so that the poll sees
-    /// what they were for: a store reads nothing, and a store that raised the flag would cut the
-    /// wakes before it off from the lowering. A wake that comes after a lowering acquires it in
-    /// turn, and with it the end of the reactor wait before it, so that the `notify` the wake
-    /// makes cannot take the wake-up that wait took out for one still to come.
+    /// Raised by each wake and lowered at each turn of the loop, which polls the future only where
+    /// it found the flag up, both with `AcqRel` swaps rather than stores. The lowering acquires
+    /// every wake since the one before it, so that the poll sees what they were for: a store reads
+    /// nothing, and a store that raised the flag would cut the wakes before it off from the
+    /// lowering. A wake that comes after a lowering acquires it in turn, and with it the end of
+    /// the reactor wait before it, so that the `notify` the wake makes cannot take the wake-up
+    /// that wait took out for one still to come.
     woken: AtomicBool,
     /// The runtime the thread is in the seat of, set by that thread as it takes the seat: a wake
     /// may come from any thread, and only the driving thread knows which runtime's wait it is in.

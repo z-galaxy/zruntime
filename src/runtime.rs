@@ -7,13 +7,14 @@
 //! thread, and so is always of the second kind whatever the runtime's flavour.
 //!
 //! A runtime has no thread of its own. The thread inside [`Core::block_on`] drives it for as long
-//! as it is inside the call: between two polls of its future it runs a batch of ready tasks and
-//! then waits on the reactor, so what the runtime has to do is done on that thread. One thread at
-//! a time drives a runtime, and a thread drives one runtime at a time; a thread-local marker of
-//! which runtime a thread drives is what the two rules are checked against, and what spares a
-//! wake on that very thread the write that would break a wait it is not in. Beside the marker,
-//! each flavour keeps a record of the runtime itself, for what is spawned on the thread without a
-//! handle to spawn it on (see [`set_driving`]).
+//! as it is inside the call: round after round, it runs a batch of ready tasks and then waits on
+//! the reactor, and it polls its future between two rounds where the future has been woken since
+//! its last poll, so what the runtime has to do is done on that thread. One thread at a time drives
+//! a runtime, and a thread drives one runtime at a time; a thread-local marker of which runtime a
+//! thread drives is what the two rules are checked against, and what spares a wake on that very
+//! thread the write that would break a wait it is not in. Beside the marker, each flavour keeps a
+//! record of the runtime itself, for what is spawned on the thread without a handle to spawn it on
+//! (see [`set_driving`]).
 //!
 //! A shared runtime with a seat, which the `helper` feature's registries hand out, is driven
 //! through that seat instead (see the `driver` module), and writes the same marker and record as
@@ -90,20 +91,27 @@ where
         let _driving = Driving::<M>::enter(this);
         let mut future = pin!(future);
         let signal = Arc::new(Signal {
-            woken: AtomicBool::new(false),
+            // Up, as the future is due its first poll.
+            woken: AtomicBool::new(true),
             remote: this.remote.clone(),
         });
         let waker = Waker::from(signal.clone());
         let mut cx = Context::from_waker(&waker);
         let mut failed_waits = 0u32;
         loop {
-            // Lowered before the poll, so that a wake during it is seen by the round that
-            // follows, and with a swap, so that the poll sees what the wakes before it were for.
-            signal.woken.swap(false, Ordering::AcqRel);
-            // Budgeted like a task, because the tasks run only between its polls: with a lot of
-            // ready I/O in it, it would hold them up for as long as a task would hold up the rest.
-            if let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx)) {
-                return output;
+            // Polled only where it has been woken since its last poll: a round that ended for the
+            // tasks alone, as most do on a runtime they keep busy, leaves the future waiting
+            // still, and a poll would only cost what the future does to find that out. Lowered at
+            // every turn, polled or not, and before the poll, so that a wake during it is seen by
+            // the round that follows, and with a swap, so that the poll sees what the wakes before
+            // it were for.
+            if signal.woken.swap(false, Ordering::AcqRel) {
+                // Budgeted like a task, because the tasks run only between its polls: with a lot
+                // of ready I/O in it, it would hold them up for as long as a task would hold up
+                // the rest.
+                if let Poll::Ready(output) = coop::budgeted(|| future.as_mut().poll(&mut cx)) {
+                    return output;
+                }
             }
             this.round(&signal.woken, &mut failed_waits);
         }
@@ -395,14 +403,16 @@ where
 
 /// The waker of the future a `block_on` polls.
 struct Signal {
-    /// Whether the future has been woken since it was last polled.
+    /// Whether the future is due a poll: up from the start, for the first poll, and raised by each
+    /// wake after it, for the poll that follows.
     ///
-    /// Raised by each wake and lowered before each poll, both with `AcqRel` swaps rather than
-    /// stores. The lowering acquires every wake since the one before it, so that the poll sees
-    /// what they were for: a store reads nothing, and a store that raised the flag would cut the
-    /// wakes before it off from the lowering. A wake that comes after a lowering acquires it in
-    /// turn, and with it the end of the reactor wait before it, so that the `notify` the wake
-    /// makes cannot take the wake-up that wait took out for one still to come.
+    /// Raised by each wake and lowered at each turn of the loop, which polls the future only where
+    /// it found the flag up, both with `AcqRel` swaps rather than stores. The lowering acquires
+    /// every wake since the one before it, so that the poll sees what they were for: a store reads
+    /// nothing, and a store that raised the flag would cut the wakes before it off from the
+    /// lowering. A wake that comes after a lowering acquires it in turn, and with it the end of
+    /// the reactor wait before it, so that the `notify` the wake makes cannot take the wake-up
+    /// that wait took out for one still to come.
     woken: AtomicBool,
     /// The runtime the future's thread drives, whose wait a wake from another thread breaks.
     remote: Arc<Remote>,
