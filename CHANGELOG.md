@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.2 - 2026-10-31
+
+### 👷 CI
+- Update the lockfiles of the CI crates in the release PR.
+- Add a workflow to release with release-plz.
+
+### ♻️ Changed
+- Hand on the events of a kqueue wait as they come.
+
+### 📝 Documentation
+- Document the edge-triggered pollers.
+- Correct and clarify the comment on the park of block_on.
+- Document when a source a wait found ready is let go of.
+
+### ⚡️ Performance
+- Watch sources edge-triggered on epoll and kqueue. #61
+- Poll the future of block_on only once it has been woken. #62
+- Keep a ready source watched until the task it woke has been polled. #59
+- Start a time limit's clock once its future has to wait.
+
+### ✅ Testing
+- Benchmark many sockets ready at once, and unread ones when busy.
+
 ## 0.2.1 - 2026-10-22
 
 ### ✨ Added
