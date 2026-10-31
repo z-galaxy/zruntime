@@ -2,7 +2,8 @@
 #
 # - Running this workflow manually opens the release PR, so that its changelog entries can be
 #   edited, and the packages that need no release dropped, before it's merged. Running it again
-#   regenerates the PR, without the edits made to it.
+#   regenerates the PR, without the edits made to it. Its commit also records the new version in
+#   the lockfiles of the CI crates, which release-plz leaves alone.
 # - Merging the release PR publishes the packages whose version isn't on crates.io yet, and tags
 #   them and creates their GitHub releases. The merge is told apart from the other pushes to `main`
 #   by the changelogs it changes, which only release PRs do, and by the 🔖 of its commits. Running
@@ -104,6 +105,72 @@ jobs:
         with:
           tool: cargo-semver-checks
       - name: Open the release PR
+        id: release-pr
         env:
           GIT_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-        run: release-plz release-pr
+        run: |
+          output=$(release-plz release-pr --output json)
+          echo "$output"
+          echo "branch=$(jq -r '.prs[0].head_branch // empty' <<< "$output")" >> "$GITHUB_OUTPUT"
+      # The ci/wasi and ci/wasm crates aren't in a workspace with zruntime, so release-plz leaves
+      # their lockfiles alone, but CI builds them with `--locked`, which fails until they record the
+      # new version. Their update goes into the release commit, as a commit of its own would be
+      # taken for a contributor's: release-plz closes such a PR on its next run, rather than update
+      # it. The commit is made again through the API, as release-plz makes it, so that GitHub signs
+      # it: on a temporary branch at the commit that release-plz built on, which the PR's branch is
+      # then forced to.
+      - name: Record the new version in the lockfiles of the CI crates
+        if: steps.release-pr.outputs.branch != ''
+        shell: bash
+        env:
+          BRANCH: ${{ steps.release-pr.outputs.branch }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          # The commit that release-plz built the release commit on.
+          base=$(git rev-parse HEAD)
+          git fetch origin "$BRANCH"
+          git checkout --detach FETCH_HEAD
+          for crate in ci/wasi ci/wasm; do
+            cargo update -p zruntime --manifest-path "$crate/Cargo.toml"
+          done
+          if git diff --quiet; then
+            exit 0
+          fi
+
+          # Every file that the release changes. release-plz removes none, and a removed one would
+          # fail the step here rather than be left out of the commit.
+          git diff -z --name-only "$base" > "$RUNNER_TEMP/paths"
+          while IFS= read -r -d '' path; do
+            jq -n --arg path "$path" --rawfile contents "$path" \
+              '{$path, contents: $contents | @base64}'
+          done < "$RUNNER_TEMP/paths" > "$RUNNER_TEMP/additions"
+
+          tmp="$BRANCH-lockfiles-$GITHUB_RUN_ID"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$tmp" -f sha="$base" \
+            > /dev/null
+          trap 'gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$tmp"' EXIT
+          commit=$(
+            jq -s \
+              --arg repo "$GITHUB_REPOSITORY" \
+              --arg branch "$tmp" \
+              --arg head "$base" \
+              --arg headline "$(git log -1 --format=%s)" \
+              '{
+                query: "mutation($input: CreateCommitOnBranchInput!) {
+                  createCommitOnBranch(input: $input) { commit { oid } }
+                }",
+                variables: {input: {
+                  branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                  message: {headline: $headline},
+                  expectedHeadOid: $head,
+                  fileChanges: {additions: .}
+                }}
+              }' "$RUNNER_TEMP/additions" |
+              gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid
+          )
+          if [ -z "$commit" ] || [ "$commit" = null ]; then
+            echo "::error::No commit was made on $tmp."
+            exit 1
+          fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" -f sha="$commit" \
+            -F force=true > /dev/null
