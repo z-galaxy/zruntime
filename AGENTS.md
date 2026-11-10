@@ -611,8 +611,12 @@ and each a `UnixStream` of its own, which shares the source and the registration
 for the source in its own direction (`Registration::holds`), and the entry, which keeps the
 directions that are still held (`SourceState::held`), goes with the last of them. So splitting
 allocates nothing and takes no lock: only the drop of a half takes the reactor's, as that of any
-registration does. Dropping the write half shuts nothing down, unlike tokio's, and closing it
-shuts down the socket's write half, as closing the stream does.
+registration does. `ReadHalf::reunite` and `WriteHalf::reunite` join the halves back into the
+stream, whose registration holds both directions again while the other goes holding none, which
+takes no lock either, and give the halves back in a `ReuniteError` where they are of two different
+streams, or of two runtimes, whose keys can be the same. Dropping the write half shuts nothing
+down, unlike tokio's, and closing it shuts down the socket's write half, as closing the stream
+does.
 
 **Signals (the `signal` feature)**: what handles a signal is set for the process as a whole, so one
 registry serves every runtime and every listener: `REGISTRY` in `src/signal/mod.rs`, a `Mutex` of

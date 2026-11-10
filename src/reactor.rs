@@ -668,6 +668,26 @@ where
         (read, self)
     }
 
+    /// The registration that `self` and `other` were split from ([`Registration::split`]), which
+    /// holds the entry in both directions again, or the two back as they are where they are not of
+    /// one entry.
+    #[cfg(all(feature = "unix", unix))]
+    pub(crate) fn reunite(mut self, mut other: Self) -> Result<Self, (Self, Self)> {
+        // Keys are unique to a runtime only, so the runtimes have to be the same too.
+        if self.key != other.key || !std::ptr::eq(&*self.core, &*other.core) {
+            return Err((self, other));
+        }
+        self.holds = Directions {
+            readable: self.holds.readable || other.holds.readable,
+            writable: self.holds.writable || other.holds.writable,
+        };
+        // `other` goes holding nothing, so that the entry stays as it is: held in both directions,
+        // by `self` alone now.
+        other.holds = Directions::NONE;
+
+        Ok(self)
+    }
+
     /// [`Registration::reports`] off the thread that drives the runtime, under the lock of the
     /// sources.
     ///
@@ -689,6 +709,10 @@ where
     M: Mode,
 {
     fn drop(&mut self) {
+        // One of two halves that reunited holds nothing, and leaves the entry to the other.
+        if self.holds.is_empty() {
+            return;
+        }
         // The entry goes with the last registration that holds it, and with it the reactor's
         // clone of the source.
         let (removed, deleted) = {

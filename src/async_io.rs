@@ -389,6 +389,29 @@ where
         )
     }
 
+    /// The handle that `self` and `other` were split from ([`AsyncIo::split`]), or the two back as
+    /// they are where they were not split from one.
+    #[cfg(all(feature = "unix", unix))]
+    pub(crate) fn reunite(self, other: Self) -> Result<Self, (Self, Self)> {
+        match self.registration.reunite(other.registration) {
+            // What is left of `other`, its share of the source, goes as this returns.
+            Ok(registration) => Ok(Self {
+                registration,
+                io: self.io,
+            }),
+            Err((first, second)) => Err((
+                Self {
+                    registration: first,
+                    io: self.io,
+                },
+                Self {
+                    registration: second,
+                    io: other.io,
+                },
+            )),
+        }
+    }
+
     /// Runs `operation` on the source until it no longer fails with `WouldBlock`, waiting for the
     /// source to be ready for `interest` in between: [`read_with`](AsyncIo::read_with) and
     /// [`write_with`](AsyncIo::write_with).

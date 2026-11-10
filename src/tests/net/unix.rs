@@ -55,7 +55,9 @@ use super::{DELAY, after, counting_polls, in_both_modes, pattern};
 use crate::{
     Local, Mode, Runtime, Shared, SharedRuntime,
     coop::{self, budgeted, spend},
-    net::unix::{Incoming, ReadHalf, UnixDatagram, UnixListener, UnixStream, WriteHalf},
+    net::unix::{
+        Incoming, ReadHalf, ReuniteError, UnixDatagram, UnixListener, UnixStream, WriteHalf,
+    },
     tests::core::counting_waker,
 };
 
@@ -1724,6 +1726,91 @@ in_both_modes! {
     }
 }
 
+in_both_modes! {
+    /// The halves of a split stream reunite into the stream, whichever of the two the reunion
+    /// starts from, and the stream reads and writes as it did. Its socket is watched as it was
+    /// before the split: once the stream gives it up, the runtime takes it again.
+    fn the_halves_of_a_stream_reunite<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+        let fd = client.as_raw_fd();
+        let (reader, writer) = client.into_split();
+        let client = reader.reunite(writer).unwrap();
+        assert_eq!(client.as_raw_fd(), fd);
+        let (reader, writer) = client.into_split();
+        let mut client = writer.reunite(reader).unwrap();
+
+        runtime.block_on(async {
+            client.write_all(b"ping").await.unwrap();
+            let mut message = [0; 4];
+            server.read_exact(&mut message).await.unwrap();
+            assert_eq!(&message, b"ping");
+            server.write_all(b"pong").await.unwrap();
+            client.read_exact(&mut message).await.unwrap();
+            assert_eq!(&message, b"pong");
+        });
+
+        // The stream that the runtime takes the socket again for closes it as it goes.
+        UnixStream::from_std(&runtime, client.into_std()).unwrap();
+        runtime.block_on(async {
+            let mut byte = [0; 1];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+    }
+}
+
+in_both_modes! {
+    /// The halves that a reunited stream is split into again keep its watch as the first ones
+    /// did: once the read half is gone, a write too large for the socket waits for room, and the
+    /// runtime's report of the room wakes it.
+    fn the_halves_of_a_reunited_stream_keep_its_watch<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+        let (reader, writer) = client.into_split();
+        let (_, mut writer) = reader.reunite(writer).unwrap().into_split();
+        let message = vec![7; 4 << 20];
+
+        runtime.block_on(async {
+            let mut received = Vec::new();
+            let (written, read) = join(
+                async {
+                    writer.write_all(&message).await?;
+                    writer.close().await
+                },
+                server.read_to_end(&mut received),
+            )
+            .await;
+            written.unwrap();
+            read.unwrap();
+            assert!(received == message);
+        });
+    }
+}
+
+in_both_modes! {
+    /// The halves of two streams do not reunite with each other.
+    fn the_halves_of_two_streams_do_not_reunite<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (first, _first_peer) = UnixStream::pair(&runtime).unwrap();
+        let (second, _second_peer) = UnixStream::pair(&runtime).unwrap();
+
+        reunite_with_their_own([(first, &runtime), (second, &runtime)]);
+    }
+}
+
+in_both_modes! {
+    /// Nor do the halves of streams on two runtimes, though each runtime watches its stream under
+    /// the same key, as the stream is the first that it watches.
+    fn the_halves_of_streams_on_two_runtimes_do_not_reunite<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let other = Runtime::<M>::new().unwrap();
+        let (first, _first_peer) = UnixStream::pair(&runtime).unwrap();
+        let (second, _second_peer) = UnixStream::pair(&other).unwrap();
+
+        reunite_with_their_own([(first, &runtime), (second, &other)]);
+    }
+}
+
 /// The halves of a shared stream move to threads other than the one that split it, each of which
 /// uses its half there. Each drives the runtime with a `block_on` of its own, one after the other,
 /// since a runtime made by `new` is driven by one thread at a time.
@@ -1782,6 +1869,7 @@ fn shared_sockets_are_send_sync_and_unpin() {
     sent_and_shared::<Incoming<'static, Shared>>();
     sent_and_shared::<ReadHalf<Shared>>();
     sent_and_shared::<WriteHalf<Shared>>();
+    sent_and_shared::<ReuniteError<Shared>>();
 }
 
 /// A local runtime's sockets are `Unpin` too. That they are neither `Send` nor `Sync` is shown by
@@ -1801,6 +1889,7 @@ fn local_sockets_are_unpin() {
     unpin::<Incoming<'static, Local>>();
     unpin::<ReadHalf<Local>>();
     unpin::<WriteHalf<Local>>();
+    unpin::<ReuniteError<Local>>();
 }
 
 /// A connected pair: the end that connected, and the end the listener accepted.
@@ -1816,6 +1905,31 @@ where
     let (server, _) = listener.accept().await.unwrap();
 
     (client, server)
+}
+
+/// Check that the halves of the two streams of `streams` do not reunite with each other, which
+/// gives them back as they were, each the half of its stream: each two then reunite into their
+/// stream, whose socket its runtime, beside it in `streams`, watches no more once given up.
+fn reunite_with_their_own<M>(streams: [(UnixStream<M>, &Runtime<M>); 2])
+where
+    M: Mode,
+{
+    let [(first, first_runtime), (second, second_runtime)] = streams;
+    let (first_reader, first_writer) = first.into_split();
+    let (second_reader, second_writer) = second.into_split();
+
+    let ReuniteError(first_reader, second_writer) =
+        first_reader.reunite(second_writer).unwrap_err();
+    let ReuniteError(second_reader, first_writer) =
+        first_writer.reunite(second_reader).unwrap_err();
+
+    for (reader, writer, runtime) in [
+        (first_reader, first_writer, first_runtime),
+        (second_reader, second_writer, second_runtime),
+    ] {
+        let stream = reader.reunite(writer).unwrap();
+        UnixStream::from_std(runtime, stream.into_std()).unwrap();
+    }
 }
 
 /// Sends datagrams to the socket bound to `path` until its queue is full, so that the next one is
