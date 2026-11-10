@@ -25,6 +25,7 @@ use std::{
     io,
     mem::MaybeUninit,
     os::fd::{BorrowedFd, OwnedFd},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -49,6 +50,9 @@ pub(crate) struct Poller {
     wake: Pipe,
     /// The timer a wait with a timeout sets, which the instance watches under [`TIMER`].
     timer: OwnedFd,
+    /// Whether the timer is set and has not been seen to go off: a wait that ended sooner for
+    /// something else leaves it so, and the next wait without a timeout disarms it.
+    armed: AtomicBool,
 }
 
 impl Poller {
@@ -79,7 +83,12 @@ impl Poller {
         )?;
         epoll::add(&epoll, &timer, EventData::new_u64(TIMER), EventFlags::IN)?;
 
-        Ok(Self { epoll, wake, timer })
+        Ok(Self {
+            epoll,
+            wake,
+            timer,
+            armed: AtomicBool::new(false),
+        })
     }
 
     /// Breaks a `wait` in progress or the next one; callable from any thread.
@@ -189,18 +198,30 @@ impl Poller {
         // ready than it holds leaves the rest to the next, as `EVENTS` says.
         let mut events = [MaybeUninit::<Event>::uninit(); EVENTS];
         // A timeout other than zero is the timer's to keep, which ends the wait on time: epoll's
-        // own would round it up to whole milliseconds. A zero one needs no timer, and would
-        // disarm it. The timer is left set where the wait ends sooner for something else, and a
-        // later wait without a timeout returns once, with nothing due, as it goes off: disarming
-        // it would cost every such wait a call.
+        // own would round it up to whole milliseconds. A zero one needs no timer, and leaves it as
+        // it is. The timer is left set where the wait ends sooner for something else: a later wait
+        // with a timeout sets it afresh, and one without disarms it, or it would return once, with
+        // nothing due, at a deadline that may have gone with the timer that set it. Only such a
+        // wait pays the call, which costs less than the wake-up it saves.
         let timeout = match timeout {
             Some(Duration::ZERO) => Some(Timespec::default()),
             Some(timeout) => {
                 self.set_timer(timeout)?;
+                self.armed.store(true, Ordering::Relaxed);
 
                 None
             }
-            None => None,
+            None => {
+                // A load, then a store only where the timer is armed, rather than a swap: only
+                // the driving thread waits, and on the common path, with the timer not armed,
+                // this costs a plain load and no atomic read-modify-write.
+                if self.armed.load(Ordering::Relaxed) {
+                    self.armed.store(false, Ordering::Relaxed);
+                    self.set_timer(Duration::ZERO)?;
+                }
+
+                None
+            }
         };
         let (events, _) = match epoll::wait(&self.epoll, &mut events, timeout.as_ref()) {
             Ok(filled) => filled,
@@ -221,6 +242,7 @@ impl Poller {
             if data.u64() == TIMER {
                 // Read, so that the timer stops being reported; it can only have gone off.
                 let _ = read(&self.timer, &mut [0u8; 8]);
+                self.armed.store(false, Ordering::Relaxed);
 
                 continue;
             }
@@ -246,8 +268,8 @@ impl Poller {
         Ok(ready)
     }
 
-    /// Sets the timer to go off once, `timeout` from now, which must not be zero: a timer set to
-    /// zero is disarmed instead.
+    /// Sets the timer to go off once, `timeout` from now, or disarms it, with whatever it has
+    /// counted gone off since, where `timeout` is zero.
     fn set_timer(&self, timeout: Duration) -> io::Result<()> {
         // The reactor bounds every timeout to `MAX_TIMEOUT`, which a `Timespec` holds.
         let it_value = Timespec::try_from(timeout).map_err(|_| io::ErrorKind::InvalidInput)?;

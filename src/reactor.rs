@@ -1454,6 +1454,49 @@ mod tests {
         breaker.join().unwrap();
     }
 
+    /// A timer dropped while a wait it bounded was cut short ends no later wait.
+    ///
+    /// The first wait is bounded by the timer's deadline and ended at once by a wake-up. With the
+    /// timer gone, the next wait has no deadline and may only end on the wake-up written well after
+    /// the old one: a wait that returned at it would wake the thread for nothing.
+    #[test]
+    #[timeout(15000)]
+    fn a_timer_dropped_after_a_cut_short_wait_ends_no_later_wait() {
+        let runtime = runtime();
+        let reactor = &runtime.core.reactor;
+        let (_, waker) = counting_waker();
+        {
+            let mut sleep = pin!(runtime.sleep(Duration::from_millis(100)));
+            assert!(
+                sleep
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            runtime.core.remote.notify();
+            reactor.wait(None).unwrap();
+        }
+        // Takes out any wake-up the drop wrote, and leaves the timer as it is.
+        reactor.wait(Some(Duration::ZERO)).unwrap();
+        let breaker = {
+            let runtime = runtime.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(400));
+                runtime.core.remote.notify();
+            })
+        };
+
+        let started = Instant::now();
+        reactor.wait(None).unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the wait ended at the dropped timer's deadline, after {:?}",
+            started.elapsed()
+        );
+        breaker.join().unwrap();
+    }
+
     /// A burst of wakes with no wait between them puts one wake-up in the channel, not ten.
     ///
     /// The wait that follows is unbounded, so it can only end on the wake-up the first of them
