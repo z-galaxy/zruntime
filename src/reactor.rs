@@ -397,6 +397,7 @@ where
             key,
             SourceState {
                 source,
+                held: Directions::BOTH,
                 descriptor,
                 wakers: Wakers::default(),
                 armed: Directions::NONE,
@@ -412,6 +413,7 @@ where
     Ok(Registration {
         core: core.clone(),
         key,
+        holds: Directions::BOTH,
     })
 }
 
@@ -437,6 +439,9 @@ where
 {
     core: M::Ptr<Core<M>>,
     key: usize,
+    /// The directions this registration holds the entry of its source in: both, but for the
+    /// halves of a split stream, which hold one each.
+    holds: Directions,
 }
 
 impl<M> fmt::Debug for Registration<M>
@@ -641,6 +646,28 @@ where
         }
     }
 
+    /// This registration as two, the first of which holds the entry in the readable direction and
+    /// the second in the writable one, and which the entry goes with the last of: for the halves of
+    /// a split stream, each of which waits in its direction, as each direction keeps one waker for
+    /// [`poll_io`](Registration::poll_io).
+    #[cfg(all(feature = "unix", unix))]
+    pub(crate) fn split(mut self) -> (Self, Self) {
+        let read = Self {
+            core: self.core.clone(),
+            key: self.key,
+            holds: Directions {
+                readable: true,
+                writable: false,
+            },
+        };
+        self.holds = Directions {
+            readable: false,
+            writable: true,
+        };
+
+        (read, self)
+    }
+
     /// [`Registration::reports`] off the thread that drives the runtime, under the lock of the
     /// sources.
     ///
@@ -662,9 +689,20 @@ where
     M: Mode,
 {
     fn drop(&mut self) {
-        // The entry goes with this registration, and with it the reactor's clone of the source.
+        // The entry goes with the last registration that holds it, and with it the reactor's
+        // clone of the source.
         let (removed, deleted) = {
             let mut sources = self.core.reactor.sources.lock();
+            if let Some(state) = sources.states.get_mut(&self.key) {
+                state.held = Directions {
+                    readable: state.held.readable && !self.holds.readable,
+                    writable: state.held.writable && !self.holds.writable,
+                };
+                // The other half of a split stream holds it still.
+                if !state.held.is_empty() {
+                    return;
+                }
+            }
             let removed = sources.states.remove(&self.key);
             let deleted = match &removed {
                 Some(state) => {
@@ -1095,6 +1133,10 @@ where
     M: Mode,
 {
     source: M::SourcePtr,
+    /// The directions that registrations still hold this entry in, which goes with the last of
+    /// them: both, which one registration holds, or, while a stream is split into halves that
+    /// hold one each ([`Registration::split`]), those of the halves that are left.
+    held: Directions,
     /// The descriptor the source lent when it was registered, which is what a wait watches.
     descriptor: RawSource,
     wakers: Wakers,

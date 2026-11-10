@@ -498,13 +498,15 @@ where
     /// # Ok::<_, std::io::Error>(())
     /// ```
     pub fn into_split(self) -> (ReadHalf<M>, WriteHalf<M>) {
-        let stream = M::new_ptr(self);
+        let (read, write) = self.io.split();
 
         (
             ReadHalf {
-                stream: stream.clone(),
+                stream: Self { io: read },
             },
-            WriteHalf { stream },
+            WriteHalf {
+                stream: Self { io: write },
+            },
         )
     }
 
@@ -739,7 +741,7 @@ pub struct ReadHalf<M = Local>
 where
     M: Mode,
 {
-    stream: M::Ptr<UnixStream<M>>,
+    stream: UnixStream<M>,
 }
 
 impl<M> ReadHalf<M>
@@ -789,7 +791,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut &*self.stream).poll_read(cx, buf)
+        Pin::new(&mut &self.stream).poll_read(cx, buf)
     }
 }
 
@@ -798,7 +800,7 @@ where
     M: Mode,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ReadHalf").field(&*self.stream).finish()
+        f.debug_tuple("ReadHalf").field(&self.stream).finish()
     }
 }
 
@@ -837,7 +839,7 @@ pub struct WriteHalf<M = Local>
 where
     M: Mode,
 {
-    stream: M::Ptr<UnixStream<M>>,
+    stream: UnixStream<M>,
 }
 
 impl<M> WriteHalf<M>
@@ -887,15 +889,15 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut &*self.stream).poll_write(cx, buf)
+        Pin::new(&mut &self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut &*self.stream).poll_flush(cx)
+        Pin::new(&mut &self.stream).poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut &*self.stream).poll_close(cx)
+        Pin::new(&mut &self.stream).poll_close(cx)
     }
 }
 
@@ -904,7 +906,7 @@ where
     M: Mode,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("WriteHalf").field(&*self.stream).finish()
+        f.debug_tuple("WriteHalf").field(&self.stream).finish()
     }
 }
 

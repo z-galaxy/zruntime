@@ -604,10 +604,15 @@ neither kind of wait takes the place of the other. A stream implements `futures-
 `&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`. The streams
 and the datagram sockets also hand their `AsyncIo`'s `read_with`, `write_with`, `poll_read_with`
 and `poll_write_with` on, for operations of the caller's on the std socket that none of their own
-methods make, such as passing descriptors with `recvmsg` and `sendmsg`. `UnixStream::into_split` puts
-the stream in the mode's `Ptr` and hands out a `ReadHalf` and a `WriteHalf` that share it, each
-with the traits and the operations of its direction; dropping the write half shuts nothing down,
-unlike tokio's, and closing it shuts down the socket's write half, as closing the stream does.
+methods make, such as passing descriptors with `recvmsg` and `sendmsg`. `UnixStream::into_split`
+hands out a `ReadHalf` and a `WriteHalf`, each with the traits and the operations of its direction,
+and each a `UnixStream` of its own, which shares the source and the registration of the stream
+(`AsyncIo::split`, `Registration::split`): each of the two registrations holds the reactor's entry
+for the source in its own direction (`Registration::holds`), and the entry, which keeps the
+directions that are still held (`SourceState::held`), goes with the last of them. So splitting
+allocates nothing and takes no lock: only the drop of a half takes the reactor's, as that of any
+registration does. Dropping the write half shuts nothing down, unlike tokio's, and closing it
+shuts down the socket's write half, as closing the stream does.
 
 **Signals (the `signal` feature)**: what handles a signal is set for the process as a whole, so one
 registry serves every runtime and every listener: `REGISTRY` in `src/signal/mod.rs`, a `Mutex` of

@@ -368,6 +368,27 @@ where
         self.registration.runtime()
     }
 
+    /// This handle as two of the same source and watch, the first for reading and the second for
+    /// writing, which the watch ends with the last of: for the halves of a split stream, as each
+    /// direction keeps one waiting task for [`poll_read_with`](AsyncIo::poll_read_with) and
+    /// [`poll_write_with`](AsyncIo::poll_write_with).
+    #[cfg(all(feature = "unix", unix))]
+    pub(crate) fn split(self) -> (Self, Self) {
+        let Self { registration, io } = self;
+        let (first, second) = registration.split();
+
+        (
+            Self {
+                registration: first,
+                io: io.clone(),
+            },
+            Self {
+                registration: second,
+                io,
+            },
+        )
+    }
+
     /// Runs `operation` on the source until it no longer fails with `WouldBlock`, waiting for the
     /// source to be ready for `interest` in between: [`read_with`](AsyncIo::read_with) and
     /// [`write_with`](AsyncIo::write_with).

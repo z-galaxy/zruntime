@@ -140,6 +140,12 @@ impl Directions {
         writable: false,
     };
 
+    /// Both directions.
+    pub(super) const BOTH: Self = Self {
+        readable: true,
+        writable: true,
+    };
+
     /// Whether this names neither direction.
     pub(super) fn is_empty(self) -> bool {
         !self.readable && !self.writable

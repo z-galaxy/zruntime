@@ -1702,6 +1702,28 @@ in_both_modes! {
     }
 }
 
+in_both_modes! {
+    /// A half waits on the runtime as it did before the other was dropped: a read that finds
+    /// nothing to read completes once the peer sends, which wakes it.
+    fn a_half_waits_once_the_other_is_dropped<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+        let (mut reader, _) = client.into_split();
+
+        runtime.block_on(async {
+            let mut byte = [0; 1];
+            // The read waits first, and the peer sends only then: nothing but the runtime's
+            // report of the socket polls the read again.
+            let (read, ()) = join(reader.read(&mut byte), async {
+                server.write_all(b"!").await.unwrap();
+            })
+            .await;
+            assert_eq!(read.unwrap(), 1);
+            assert_eq!(&byte, b"!");
+        });
+    }
+}
+
 /// The halves of a shared stream move to threads other than the one that split it, each of which
 /// uses its half there. Each drives the runtime with a `block_on` of its own, one after the other,
 /// since a runtime made by `new` is driven by one thread at a time.
