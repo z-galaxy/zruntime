@@ -456,10 +456,11 @@ where
     /// Splits the stream into a half that reads and a half that writes, which can each be moved on
     /// their own: the reader to one task and the writer to another, say.
     ///
-    /// The halves share the stream, and its socket stays open until both are dropped. Closing the
-    /// write half shuts down the socket's write half, as closing the stream does, and the peer then
-    /// reads the end of the stream. Dropping the write half does not. A reader and a writer that
-    /// need not be moved can share the stream instead, as a `&UnixStream` reads and writes too.
+    /// The halves share the stream, and its socket stays open until both are dropped.
+    /// [`ReadHalf::reunite`] joins them back into the stream. Closing the write half shuts down
+    /// the socket's write half, as closing the stream does, and the peer then reads the end of the
+    /// stream. Dropping the write half does not. A reader and a writer that need not be moved can
+    /// share the stream instead, as a `&UnixStream` reads and writes too.
     ///
     /// The halves run on the stream's runtime, and carry its flavour: those of a
     /// `UnixStream<Shared>` can be sent to and used from any thread, and those of a
@@ -498,13 +499,15 @@ where
     /// # Ok::<_, std::io::Error>(())
     /// ```
     pub fn into_split(self) -> (ReadHalf<M>, WriteHalf<M>) {
-        let stream = M::new_ptr(self);
+        let (read, write) = self.io.split();
 
         (
             ReadHalf {
-                stream: stream.clone(),
+                stream: Self { io: read },
             },
-            WriteHalf { stream },
+            WriteHalf {
+                stream: Self { io: write },
+            },
         )
     }
 
@@ -731,7 +734,7 @@ where
 /// It reads as the stream does: through its `AsyncRead` implementation, and through
 /// [`read_with`](ReadHalf::read_with) and [`poll_read_with`](ReadHalf::poll_read_with) for
 /// operations of the caller's. It shares the stream with the [`WriteHalf`], and the socket stays
-/// open until both are dropped.
+/// open until both are dropped. [`reunite`](ReadHalf::reunite) joins the two back into the stream.
 ///
 /// Only one task at a time can wait to read through the `AsyncRead` implementation and
 /// `poll_read_with`, as for the stream.
@@ -739,13 +742,65 @@ pub struct ReadHalf<M = Local>
 where
     M: Mode,
 {
-    stream: M::Ptr<UnixStream<M>>,
+    stream: UnixStream<M>,
 }
 
 impl<M> ReadHalf<M>
 where
     M: Mode,
 {
+    /// Joins this half and `write` back into the stream that [`UnixStream::into_split`] split into
+    /// them, which goes on as it was.
+    ///
+    /// # Errors
+    ///
+    /// Fails where `write` is the write half of another stream, and gives both halves back in the
+    /// error, as they were.
+    ///
+    /// # Example
+    ///
+    /// A stream is split to write a request from a task of its own, and joined back together to
+    /// read the answer.
+    ///
+    /// ```
+    /// use futures::{AsyncReadExt, AsyncWriteExt};
+    /// use zruntime::{LocalRuntime, net::unix::UnixStream};
+    ///
+    /// let runtime = LocalRuntime::new()?;
+    /// let (client, mut server) = UnixStream::pair(&runtime)?;
+    /// let (reader, mut writer) = client.into_split();
+    ///
+    /// runtime.block_on(async {
+    ///     let writer = runtime
+    ///         .spawn("writer", async move {
+    ///             writer.write_all(b"ping").await.map(|()| writer)
+    ///         })
+    ///         .await??;
+    ///     let mut client = reader.reunite(writer)?;
+    ///
+    ///     let mut message = [0; 4];
+    ///     server.read_exact(&mut message).await?;
+    ///     server.write_all(b"pong").await?;
+    ///     client.read_exact(&mut message).await?;
+    ///     assert_eq!(&message, b"pong");
+    ///     # Ok::<_, Box<dyn std::error::Error>>(())
+    /// })?;
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn reunite(self, write: WriteHalf<M>) -> Result<UnixStream<M>, ReuniteError<M>> {
+        match self.stream.io.reunite(write.stream.io) {
+            Ok(io) => Ok(UnixStream { io }),
+            Err((read, write)) => Err(ReuniteError(
+                Self {
+                    stream: UnixStream { io: read },
+                },
+                WriteHalf {
+                    stream: UnixStream { io: write },
+                },
+            )),
+        }
+    }
+
     /// Runs `operation` on the stream, waiting for it to be readable where it would block, as
     /// [`UnixStream::read_with`] does.
     ///
@@ -789,7 +844,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut &*self.stream).poll_read(cx, buf)
+        Pin::new(&mut &self.stream).poll_read(cx, buf)
     }
 }
 
@@ -798,7 +853,7 @@ where
     M: Mode,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ReadHalf").field(&*self.stream).finish()
+        f.debug_tuple("ReadHalf").field(&self.stream).finish()
     }
 }
 
@@ -825,7 +880,8 @@ where
 /// It writes as the stream does: through its `AsyncWrite` implementation, and through
 /// [`write_with`](WriteHalf::write_with) and [`poll_write_with`](WriteHalf::poll_write_with) for
 /// operations of the caller's. It shares the stream with the [`ReadHalf`], and the socket stays
-/// open until both are dropped.
+/// open until both are dropped. [`reunite`](WriteHalf::reunite) joins the two back into the
+/// stream.
 ///
 /// Closing the half (for example with the `close` method of `AsyncWriteExt`) shuts down the write
 /// half of the socket, as closing the stream does, and the peer then reads the end of the stream.
@@ -837,13 +893,24 @@ pub struct WriteHalf<M = Local>
 where
     M: Mode,
 {
-    stream: M::Ptr<UnixStream<M>>,
+    stream: UnixStream<M>,
 }
 
 impl<M> WriteHalf<M>
 where
     M: Mode,
 {
+    /// Joins `read` and this half back into the stream that [`UnixStream::into_split`] split into
+    /// them, as [`ReadHalf::reunite`] does.
+    ///
+    /// # Errors
+    ///
+    /// Fails where `read` is the read half of another stream, and gives both halves back in the
+    /// error, as they were.
+    pub fn reunite(self, read: ReadHalf<M>) -> Result<UnixStream<M>, ReuniteError<M>> {
+        read.reunite(self)
+    }
+
     /// Runs `operation` on the stream, waiting for it to be writable where it would block, as
     /// [`UnixStream::write_with`] does.
     ///
@@ -887,15 +954,15 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut &*self.stream).poll_write(cx, buf)
+        Pin::new(&mut &self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut &*self.stream).poll_flush(cx)
+        Pin::new(&mut &self.stream).poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut &*self.stream).poll_close(cx)
+        Pin::new(&mut &self.stream).poll_close(cx)
     }
 }
 
@@ -904,7 +971,7 @@ where
     M: Mode,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("WriteHalf").field(&*self.stream).finish()
+        f.debug_tuple("WriteHalf").field(&self.stream).finish()
     }
 }
 
@@ -925,6 +992,35 @@ where
         self.stream.as_raw_fd()
     }
 }
+
+/// The error of [`ReadHalf::reunite`] and [`WriteHalf::reunite`]: the two halves, which are not of
+/// one stream, given back as they were.
+pub struct ReuniteError<M = Local>(pub ReadHalf<M>, pub WriteHalf<M>)
+where
+    M: Mode;
+
+impl<M> fmt::Debug for ReuniteError<M>
+where
+    M: Mode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ReuniteError")
+            .field(&self.0)
+            .field(&self.1)
+            .finish()
+    }
+}
+
+impl<M> fmt::Display for ReuniteError<M>
+where
+    M: Mode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the halves are of two different streams")
+    }
+}
+
+impl<M> std::error::Error for ReuniteError<M> where M: Mode {}
 
 /// A unix-domain datagram socket, to send datagrams from and receive datagrams on.
 ///
