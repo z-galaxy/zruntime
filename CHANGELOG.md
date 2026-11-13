@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.3 - 2026-11-13
+
+### ✨ Added
+- Split a `UnixStream` into halves that are moved on their own.
+- Reunite the halves of a Unix stream.
+- Run operations of the caller's on the sockets.
+- Add `Runtime::running`.
+
+### 👷 CI
+- Build the walltime benchmarks off the macro runner.
+- Skip the walltime benchmarks where they can't measure a change.
+- Spend fewer macro-runner minutes on the benchmarks.
+
+### 🐛 Fixed
+- Disarm the timer a cut-short wait left set.
+
+### ✅ Testing
+- Test that a listener is queued as `listen` returns.
+- Drop the benchmarks of a lone round trip and a lone timer.
+
 ## 0.2.2 - 2026-10-31
 
 ### 👷 CI
