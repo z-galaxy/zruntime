@@ -256,4 +256,51 @@ jobs:
       - name: Check documentation build
         run: cargo --locked doc --all-features
 
-  # No semver-checks job yet: zruntime has no release on crates.io yet to compare against.
+  # The public API differs from one platform to the next: `fs::windows` is there on Windows alone
+  # and `net::unix` on unix alone, and WASI has no `process`, `signal` or `unblock`. So this
+  # compares the API with that of the latest release on crates.io on each platform that the jobs
+  # above build for, and fails on a change that the version in `Cargo.toml` does not allow for.
+  semver-checks:
+    runs-on: ubuntu-latest
+    env:
+      # cargo-semver-checks builds the crate twice on each platform, as it is and as it was
+      # released, and each of those builds in a directory of its own unless it is given one for
+      # them all, where they share what they build of the dependencies.
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-gnu, x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, aarch64-linux-android, wasm32-wasip1, wasm32-wasip2, wasm32-unknown-unknown
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: Check semver
+        run: |
+          for target in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu x86_64-apple-darwin \
+            x86_64-unknown-freebsd x86_64-unknown-netbsd aarch64-linux-android; do
+            echo "::group::$target"
+            cargo semver-checks --target $target
+            echo "::endgroup::"
+          done
+      # cargo-semver-checks appends `--cap-lints=allow` to `RUSTFLAGS`, which keeps rustc from
+      # warning of the crate types that a wasm target lacks. cargo learns of them from those
+      # warnings, and fails without them. The cap here comes first, and the first is the one that
+      # rustc goes by, so the warnings are back. Should cargo-semver-checks or rustc change that,
+      # the step fails, as it would without the cap. On `wasm32-unknown-unknown` only the locks and
+      # the channels are checked, as they are what the clippy job builds there.
+      - name: Check semver on WASI and wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: --cap-lints=warn
+        run: |
+          for target in wasm32-wasip1 wasm32-wasip2; do
+            echo "::group::$target"
+            cargo semver-checks --target $target
+            echo "::endgroup::"
+          done
+          echo "::group::wasm32-unknown-unknown"
+          cargo semver-checks --target wasm32-unknown-unknown --only-explicit-features \
+            --features lock,broadcast,mpmc
+          echo "::endgroup::"
