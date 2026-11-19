@@ -18,7 +18,8 @@
 //! connection. After the tests of `incoming` come those of the datagram sockets, a `send_to` that
 //! finds the receiver's queue full and one that finds the budget of its poll spent among them, of
 //! a shared runtime's sockets crossing threads, serving tasks and having several of them wait at
-//! once, and last, of the sockets' `Debug`, descriptors and auto traits.
+//! once, and last, of the runtime that the sockets hand out, and of their `Debug`, descriptors and
+//! auto traits.
 
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
@@ -58,7 +59,7 @@ use crate::{
     net::unix::{
         Incoming, ReadHalf, ReuniteError, UnixDatagram, UnixListener, UnixStream, WriteHalf,
     },
-    tests::core::counting_waker,
+    tests::{assert_handle_on, core::counting_waker},
 };
 
 in_both_modes! {
@@ -1466,6 +1467,36 @@ fn several_tasks_receive_on_one_datagram_socket() {
         received.sort();
         assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
     });
+}
+
+in_both_modes! {
+    /// A listener, the streams that connect to it and that it accepts, the halves of a stream and a
+    /// datagram socket hand out a handle on the runtime that they run on.
+    fn sockets_hand_out_their_runtime<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("runtime");
+        let path = directory.socket("listener");
+        let listener = UnixListener::bind(&runtime, &path).unwrap();
+        let datagram = UnixDatagram::unbound(&runtime).unwrap();
+        let (client, server) = runtime.block_on(async {
+            let client = UnixStream::connect(&runtime, &path).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            (client, server)
+        });
+        let (read, write) = server.into_split();
+
+        let handles = [
+            listener.runtime(),
+            client.runtime(),
+            read.runtime(),
+            write.runtime(),
+            datagram.runtime(),
+        ];
+        for handle in handles {
+            assert_handle_on(&runtime, &handle);
+        }
+    }
 }
 
 in_both_modes! {

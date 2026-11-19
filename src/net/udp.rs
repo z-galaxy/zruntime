@@ -137,6 +137,12 @@ where
         self.io.get_ref().peer_addr()
     }
 
+    /// A handle on the runtime that the socket runs on: for the timers and the tasks that go with
+    /// its I/O, such as a timeout on a receive.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.io.runtime()
+    }
+
     /// Connects this socket to `addr`.
     ///
     /// `addr` becomes the address that [`send`](UdpSocket::send) sends to. From then on the socket

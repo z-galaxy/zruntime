@@ -172,9 +172,10 @@ where
     /// Some errors leave the connection queued, for example running out of file descriptors
     /// (`EMFILE`) on Linux and the BSDs. The next call then fails again at once, and so on until
     /// the connection leaves the queue, so a loop that keeps accepting after an error spins the
-    /// thread. Back off after an error, for example with [`Runtime::sleep`]. On Apple's platforms
-    /// an accept that finds no descriptor left closes the connection instead: the error does not
-    /// repeat, but the connection is lost.
+    /// thread. Back off after an error, for example with a [`sleep`](Runtime::sleep) on the
+    /// listener's [`runtime`](UnixListener::runtime). On Apple's platforms an accept that finds no
+    /// descriptor left closes the connection instead: the error does not repeat, but the connection
+    /// is lost.
     ///
     /// # Cancel safety
     ///
@@ -200,6 +201,13 @@ where
     /// This is the path the listener was bound to, which [`SocketAddr::as_pathname`] returns.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().local_addr()
+    }
+
+    /// A handle on the runtime that the listener runs on, which the streams that it accepts run on
+    /// too: for the timers and the tasks that go with them, such as a wait before accepting again
+    /// after an error.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.io.runtime()
     }
 }
 
@@ -428,6 +436,12 @@ where
     /// does for this end.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.io.get_ref().peer_addr()
+    }
+
+    /// A handle on the runtime that the stream runs on: for the timers and the tasks that go with
+    /// its I/O, such as a timeout on a read.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.io.runtime()
     }
 
     /// Stops watching the stream, and returns the socket as a std stream, still in non-blocking
@@ -833,6 +847,12 @@ where
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.stream.peer_addr()
     }
+
+    /// A handle on the runtime that the half runs on, the one of the stream that it is a half of:
+    /// for the timers and the tasks that go with its I/O, such as a timeout on a read.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.stream.runtime()
+    }
 }
 
 impl<M> AsyncRead for ReadHalf<M>
@@ -942,6 +962,12 @@ where
     /// The socket address of the peer, as [`UnixStream::peer_addr`] gives it.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.stream.peer_addr()
+    }
+
+    /// A handle on the runtime that the half runs on, the one of the stream that it is a half of:
+    /// for the timers and the tasks that go with its I/O, such as a timeout on a write.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.stream.runtime()
     }
 }
 
@@ -1304,6 +1330,12 @@ where
         self.io.get_ref().peer_addr()
     }
 
+    /// A handle on the runtime that the socket runs on: for the timers and the tasks that go with
+    /// its I/O, such as a timeout on a receive.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.io.runtime()
+    }
+
     /// Shuts down the receiving half, the sending half or both halves of the socket, as `how` says.
     ///
     /// A send after the sending half is shut down fails with
@@ -1451,7 +1483,8 @@ where
 /// arrives: polled again, it accepts again. The errors are those of
 /// [`accept`](UnixListener::accept), which also describes what they leave behind. Some leave the
 /// connection queued, so the next item is the same error at once. A loop that keeps taking items
-/// after an error then spins the thread, so back off first, for example with [`Runtime::sleep`].
+/// after an error then spins the thread, so back off first, for example with a
+/// [`sleep`](Runtime::sleep) on the listener's [`runtime`](UnixListener::runtime).
 ///
 /// Only one task at a time can wait for the next item, counting every `Incoming` of the listener.
 /// If a second task waits as well, it replaces the first, which is then never woken. Tasks that

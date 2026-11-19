@@ -192,6 +192,12 @@ where
         &self.io
     }
 
+    /// A handle on the runtime that watches the source: the one that the handle was created on,
+    /// for the timers and the tasks that go with its I/O, such as a timeout on a read.
+    pub fn runtime(&self) -> Runtime<M> {
+        self.registration.runtime()
+    }
+
     /// Stops watching the source, and returns it, still in non-blocking mode.
     ///
     /// On a shared runtime, this may block for a moment, until a thread running the runtime returns
@@ -347,25 +353,6 @@ where
         M::ensure_progress(&runtime.core);
 
         Ok(Self { registration, io })
-    }
-
-    /// A handle on the runtime the source is registered on.
-    #[cfg(any(
-        feature = "tcp",
-        all(feature = "unix", unix),
-        all(
-            feature = "process",
-            any(
-                target_vendor = "apple",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly"
-            )
-        )
-    ))]
-    pub(crate) fn runtime(&self) -> Runtime<M> {
-        self.registration.runtime()
     }
 
     /// This handle as two of the same source and watch, the first for reading and the second for

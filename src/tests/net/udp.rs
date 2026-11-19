@@ -12,7 +12,8 @@
 //! loses no datagram. After the forms an address may take, and the mode a socket made from std's
 //! is put in, come the tests of the socket options, of a shared runtime's sockets crossing
 //! threads, serving tasks, outliving a task that gave up its receive and having several tasks
-//! receive at once, and last, of the sockets' `Debug`, descriptors and auto traits.
+//! receive at once, and last, of the runtime that the sockets hand out, and of their `Debug`,
+//! descriptors and auto traits.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -36,7 +37,7 @@ use ntest::timeout;
 use socket2::SockRef;
 
 use super::{DELAY, after, counting_polls, in_both_modes, loopback};
-use crate::{Local, Mode, Runtime, Shared, SharedRuntime, net::UdpSocket};
+use crate::{Local, Mode, Runtime, Shared, SharedRuntime, net::UdpSocket, tests::assert_handle_on};
 
 in_both_modes! {
     /// A datagram goes from one socket to another, which names the sender's address as the one it
@@ -566,6 +567,16 @@ fn several_tasks_receive_on_one_socket() {
         received.sort();
         assert_eq!(received, [b"first".to_vec(), b"second".to_vec()]);
     });
+}
+
+in_both_modes! {
+    /// A socket hands out a handle on the runtime that it runs on.
+    fn a_socket_hands_out_its_runtime<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let socket = UdpSocket::bind(&runtime, loopback()).unwrap();
+
+        assert_handle_on(&runtime, &socket.runtime());
+    }
 }
 
 in_both_modes! {
