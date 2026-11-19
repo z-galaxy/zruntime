@@ -15,7 +15,7 @@
 //! and a read for bytes, without spinning, and giving up an `accept` loses no connection. After
 //! them come the tests of `incoming`, `peek` and the socket options, of a shared runtime's sockets
 //! crossing threads, serving tasks and having several of them wait at once, and last, of the
-//! sockets' `Debug`, descriptors and auto traits.
+//! runtime that the sockets hand out, and of their `Debug`, descriptors and auto traits.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -47,6 +47,7 @@ use super::{DELAY, RefusedPort, after, counting_polls, in_both_modes, loopback, 
 use crate::{
     Local, Mode, Runtime, Shared, SharedRuntime,
     net::{Incoming, TcpListener, TcpStream},
+    tests::assert_handle_on,
 };
 
 in_both_modes! {
@@ -911,6 +912,26 @@ fn several_tasks_peek_at_one_stream() {
             assert!(!peeked.is_empty() && b"peeked".starts_with(&peeked));
         }
     });
+}
+
+in_both_modes! {
+    /// A listener, and the streams that connect to it and that it accepts, hand out a handle on the
+    /// runtime that they run on.
+    fn sockets_hand_out_their_runtime<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let listener = TcpListener::bind(&runtime, loopback()).unwrap();
+        let (client, server) = runtime.block_on(async {
+            let address = listener.local_addr().unwrap();
+            let client = TcpStream::connect(&runtime, address).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            (client, server)
+        });
+
+        for handle in [listener.runtime(), client.runtime(), server.runtime()] {
+            assert_handle_on(&runtime, &handle);
+        }
+    }
 }
 
 in_both_modes! {

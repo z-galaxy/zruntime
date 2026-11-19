@@ -22,7 +22,8 @@
 //! polled by something other than a runtime has no budget, while a blocking executor that a task
 //! runs shares the task's, and gets its future done inside `unconstrained`; and that the budget
 //! ends with the poll it was given for. After them come those of `into_inner`, of the kinds of
-//! source a handle takes, and last, of the handle's `Debug`, descriptors and auto traits.
+//! source a handle takes, and last, of the runtime that the handle hands out, and of its `Debug`,
+//! descriptors and auto traits.
 
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, OwnedSocket};
@@ -57,7 +58,7 @@ use futures::{
 use ntest::timeout;
 use socket2::SockRef;
 
-use super::{or, yield_now};
+use super::{assert_handle_on, or, yield_now};
 use crate::{
     AsyncIo, Local, LocalRuntime, Mode, Readiness, Runtime, Shared, SharedRuntime, coop,
     unconstrained,
@@ -1409,6 +1410,18 @@ in_both_modes! {
         written.unwrap();
         assert_eq!(output, b"hello");
         assert!(child.wait().unwrap().success());
+    }
+}
+
+in_both_modes! {
+    /// A handle hands out a handle on the runtime that it was created on.
+    fn an_async_hands_out_its_runtime<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (near, _far) = tcp_pair();
+
+        let near = AsyncIo::new(&runtime, near).unwrap();
+
+        assert_handle_on(&runtime, &near.runtime());
     }
 }
 

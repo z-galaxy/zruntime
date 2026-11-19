@@ -1455,3 +1455,15 @@ where
 
     output
 }
+
+/// Asserts that `handle` is a handle on `runtime`: the two share its core.
+#[cfg(all(test, feature = "runtime"))]
+pub(crate) fn assert_handle_on<M>(runtime: &crate::Runtime<M>, handle: &crate::Runtime<M>)
+where
+    M: crate::Mode,
+{
+    assert!(
+        std::ptr::eq(&*runtime.core, &*handle.core),
+        "the handle is on another runtime"
+    );
+}
